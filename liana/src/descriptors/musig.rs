@@ -2,7 +2,9 @@ use std::{fmt, str::FromStr};
 
 use miniscript::{
     bitcoin::{self, bip32, secp256k1},
-    descriptor::{self, DescriptorPublicKey},
+    descriptor::{
+        self, checksum::desc_checksum, DefiniteDescriptorKey, Descriptor, DescriptorPublicKey,
+    },
     ToPublicKey,
 };
 use musig2::{secp::Point, KeyAggContext};
@@ -10,6 +12,7 @@ use musig2::{secp::Point, KeyAggContext};
 use super::{LianaPolicyError, MuSig2DerivationMode};
 
 const DUMMY_XPUB: &str = "[8c3ffb6e/48'/1'/0'/2']tpubDEMt3bpQMa99W81K9h8f2FJH1C81eSd6bbSkBP8tcqQHAfSKvuGp2fz6xiVpfShzT9sKPx7DVBphChjxvNd15WcbsCca5oVz1AcUTWHxkdS";
+const DUMMY_SHADOW_SUFFIX: &str = "/<0;1>/*";
 const BIP328_SYNTHETIC_CHAINCODE: [u8; 32] = [
     0x86, 0x80, 0x87, 0xca, 0x02, 0xa6, 0xf9, 0x74, 0xc4, 0x59, 0x89, 0x24, 0xc3, 0x6b, 0x57, 0x76,
     0x2d, 0x32, 0xcb, 0x45, 0x71, 0x71, 0x67, 0xe3, 0x00, 0x62, 0x2c, 0x71, 0x67, 0xe3, 0x89, 0x65,
@@ -155,6 +158,116 @@ impl fmt::Display for MuSig2KeyExpr {
             write!(f, "{aggregate_derivation}")?;
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuSig2TaprootDescriptor {
+    expr: MuSig2KeyExpr,
+    shadow_desc: Descriptor<DescriptorPublicKey>,
+}
+
+impl MuSig2TaprootDescriptor {
+    pub fn from_str(descriptor: &str) -> Result<Self, LianaPolicyError> {
+        let body = descriptor_body(descriptor)?;
+        let (primary_expr, tap_tree) = split_tr_descriptor(body)?;
+        let expr = MuSig2KeyExpr::from_str(primary_expr)?;
+        let shadow_desc = Descriptor::<DescriptorPublicKey>::from_str(&with_checksum(
+            &render_tr_descriptor(&format!("{DUMMY_XPUB}{DUMMY_SHADOW_SUFFIX}"), tap_tree),
+        ))
+        .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?;
+
+        Ok(Self { expr, shadow_desc })
+    }
+
+    pub fn from_shadow_descriptor(
+        shadow_desc: Descriptor<DescriptorPublicKey>,
+        expr: MuSig2KeyExpr,
+    ) -> Self {
+        Self { expr, shadow_desc }
+    }
+
+    pub fn expr(&self) -> &MuSig2KeyExpr {
+        &self.expr
+    }
+
+    pub fn shadow_desc(&self) -> &Descriptor<DescriptorPublicKey> {
+        &self.shadow_desc
+    }
+
+    pub fn branch_descriptor(
+        &self,
+        path_index: usize,
+    ) -> Result<MuSig2SinglePathDescriptor, LianaPolicyError> {
+        let shadow_desc = self
+            .shadow_desc
+            .clone()
+            .into_single_descriptors()
+            .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?
+            .into_iter()
+            .nth(path_index)
+            .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+        let expr = branch_expr(&self.expr, path_index)?;
+        Ok(MuSig2SinglePathDescriptor { expr, shadow_desc })
+    }
+}
+
+impl fmt::Display for MuSig2TaprootDescriptor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let shadow_string = self.shadow_desc.to_string();
+        let body = descriptor_body(&shadow_string).map_err(|_| fmt::Error)?;
+        let (_, tap_tree) = split_tr_descriptor(body).map_err(|_| fmt::Error)?;
+        f.write_str(&with_checksum(&render_tr_descriptor(
+            &self.expr.to_string(),
+            tap_tree,
+        )))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuSig2SinglePathDescriptor {
+    expr: MuSig2KeyExpr,
+    shadow_desc: Descriptor<DescriptorPublicKey>,
+}
+
+impl MuSig2SinglePathDescriptor {
+    pub fn expr(&self) -> &MuSig2KeyExpr {
+        &self.expr
+    }
+
+    pub fn shadow_desc(&self) -> &Descriptor<DescriptorPublicKey> {
+        &self.shadow_desc
+    }
+
+    pub fn derive_descriptor(
+        &self,
+        child_index: u32,
+    ) -> Result<Descriptor<DefiniteDescriptorKey>, LianaPolicyError> {
+        let shadow_desc = self
+            .shadow_desc
+            .at_derivation_index(child_index)
+            .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?;
+        let shadow_string = shadow_desc.to_string();
+        let body = descriptor_body(&shadow_string)?;
+        let (_, tap_tree) = split_tr_descriptor(body)?;
+        let aggregate_pubkey = derive_aggregate_pubkey(&self.expr, 0, child_index)?;
+        Descriptor::<DefiniteDescriptorKey>::from_str(&with_checksum(&render_tr_descriptor(
+            &aggregate_pubkey.to_string(),
+            tap_tree,
+        )))
+        .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)
+    }
+}
+
+impl fmt::Display for MuSig2SinglePathDescriptor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let shadow_string = self.shadow_desc.to_string();
+        let body = descriptor_body(&shadow_string).map_err(|_| fmt::Error)?;
+        let (_, tap_tree) = split_tr_descriptor(body).map_err(|_| fmt::Error)?;
+        f.write_str(&with_checksum(&render_tr_descriptor(
+            &self.expr.to_string(),
+            tap_tree,
+        )))
     }
 }
 
@@ -315,6 +428,120 @@ fn split_musig_expression(expr: &str) -> Result<(Vec<&str>, &str), LianaPolicyEr
     ))
 }
 
+fn descriptor_body(descriptor: &str) -> Result<&str, LianaPolicyError> {
+    let descriptor = descriptor.trim();
+    if let Some((body, checksum)) = descriptor.rsplit_once('#') {
+        let expected =
+            desc_checksum(body).map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?;
+        if checksum == expected {
+            Ok(body)
+        } else {
+            Err(LianaPolicyError::InvalidMuSig2Expression)
+        }
+    } else {
+        Ok(descriptor)
+    }
+}
+
+fn split_tr_descriptor(descriptor: &str) -> Result<(&str, Option<&str>), LianaPolicyError> {
+    let inner = descriptor
+        .strip_prefix("tr(")
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+    let mut paren_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut split_at = None;
+    for (idx, ch) in inner.char_indices() {
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            ',' if paren_depth == 0 && brace_depth == 0 => {
+                split_at = Some(idx);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(split_at) = split_at {
+        Ok((&inner[..split_at], Some(&inner[split_at + 1..])))
+    } else {
+        Ok((inner, None))
+    }
+}
+
+fn render_tr_descriptor(primary_expr: &str, tap_tree: Option<&str>) -> String {
+    if let Some(tap_tree) = tap_tree {
+        format!("tr({primary_expr},{tap_tree})")
+    } else {
+        format!("tr({primary_expr})")
+    }
+}
+
+fn with_checksum(body: &str) -> String {
+    let checksum = desc_checksum(body).expect("valid descriptor checksum body");
+    format!("{body}#{checksum}")
+}
+
+fn branch_expr(expr: &MuSig2KeyExpr, path_index: usize) -> Result<MuSig2KeyExpr, LianaPolicyError> {
+    match expr.derivation_mode() {
+        MuSig2DerivationMode::DeriveThenAggregate => Ok(MuSig2KeyExpr::from_str(&format!(
+            "musig({})",
+            expr.participants()
+                .iter()
+                .cloned()
+                .map(|participant| {
+                    participant
+                        .into_single_keys()
+                        .into_iter()
+                        .nth(path_index)
+                        .map(|key| key.to_string())
+                        .ok_or(LianaPolicyError::InvalidMuSig2Expression)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .join(",")
+        ))?),
+        MuSig2DerivationMode::AggregateThenDeriveBip328 => {
+            let aggregate_derivation = expr
+                .aggregate_derivation()
+                .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+            let branch_path = aggregate_derivation
+                .derivation_paths()
+                .paths()
+                .get(path_index)
+                .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+            let suffix = format_derivation_suffix(branch_path, aggregate_derivation.wildcard());
+            Ok(MuSig2KeyExpr::from_str(&format!(
+                "musig({}){suffix}",
+                expr.participants()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))?)
+        }
+    }
+}
+
+fn format_derivation_suffix(
+    derivation_path: &bip32::DerivationPath,
+    wildcard: descriptor::Wildcard,
+) -> String {
+    let mut suffix = derivation_path
+        .as_ref()
+        .iter()
+        .map(|child| format!("/{child}"))
+        .collect::<String>();
+    match wildcard {
+        descriptor::Wildcard::None => {}
+        descriptor::Wildcard::Unhardened => suffix.push_str("/*"),
+        descriptor::Wildcard::Hardened => suffix.push_str("/*'"),
+    }
+    suffix
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +599,43 @@ mod tests {
             MuSig2KeyExpr::from_str(expr),
             Err(LianaPolicyError::InvalidMuSig2Expression)
         ));
+    }
+
+    #[test]
+    fn taproot_descriptor_roundtrip_preserves_musig_expression() {
+        let descriptor = "tr(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<0;1>/*,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/<0;1>/*),and_v(v:pk([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/<2;3>/*),older(10)))";
+        let musig_desc = MuSig2TaprootDescriptor::from_str(descriptor).unwrap();
+
+        assert_eq!(musig_desc.to_string(), with_checksum(descriptor));
+    }
+
+    #[test]
+    fn branch_descriptor_preserves_aggregate_mode() {
+        let descriptor = "tr(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM)/<0;1>/*,and_v(v:pk([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/<2;3>/*),older(10)))";
+        let musig_desc = MuSig2TaprootDescriptor::from_str(descriptor).unwrap();
+
+        assert_eq!(
+            musig_desc.branch_descriptor(0).unwrap().to_string(),
+            with_checksum("tr(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM)/0/*,and_v(v:pk([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/2/*),older(10)))")
+        );
+        assert_eq!(
+            musig_desc.branch_descriptor(1).unwrap().to_string(),
+            with_checksum("tr(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM)/1/*,and_v(v:pk([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/3/*),older(10)))")
+        );
+    }
+
+    #[test]
+    fn derived_descriptor_is_standard_taproot() {
+        let descriptor = "tr(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM)/<0;1>/*,and_v(v:pk([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/<2;3>/*),older(10)))";
+        let derived = MuSig2TaprootDescriptor::from_str(descriptor)
+            .unwrap()
+            .branch_descriptor(0)
+            .unwrap()
+            .derive_descriptor(7)
+            .unwrap();
+
+        assert!(matches!(derived, Descriptor::Tr(_)));
+        assert!(!derived.to_string().contains("musig("));
     }
 
     #[test]
