@@ -2763,9 +2763,18 @@ mod tests {
                 .contains_key(&participant.x_only_public_key().0));
         }
         assert!(psbt_out.tap_internal_key.is_some());
-        assert!(psbt_out
-            .tap_key_origins
-            .contains_key(&psbt_out.tap_internal_key.unwrap()));
+        let tap_internal_key = psbt_out.tap_internal_key.unwrap();
+        let (leaf_hashes, (fingerprint, derivation_path)) =
+            psbt_out.tap_key_origins.get(&tap_internal_key).unwrap();
+        assert!(leaf_hashes.is_empty());
+        assert_eq!(
+            *fingerprint,
+            bip328_synthetic_xpub(aggregate_pubkey, bitcoin::Network::Bitcoin).fingerprint()
+        );
+        assert_eq!(
+            derivation_path,
+            &bip32::DerivationPath::from_str("1/4").unwrap()
+        );
     }
 
     fn assert_musig2_partial_spend_info(desc: LianaDescriptor, child_index: u32) {

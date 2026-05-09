@@ -392,10 +392,14 @@ impl MuSig2DerivedDescriptor {
         if let (Some(key_origin), Some(tap_internal_key)) =
             (&self.output_key_origin, psbt_in.tap_internal_key)
         {
+            let leaf_hashes = psbt_in
+                .tap_key_origins
+                .get(&tap_internal_key)
+                .map(|(leaf_hashes, _)| leaf_hashes.clone())
+                .unwrap_or_default();
             psbt_in
                 .tap_key_origins
-                .entry(tap_internal_key)
-                .or_insert((vec![], key_origin.clone()));
+                .insert(tap_internal_key, (leaf_hashes, key_origin.clone()));
         }
         for (participant, origin) in &self.participant_origins {
             psbt_in
@@ -426,10 +430,14 @@ impl MuSig2DerivedDescriptor {
         if let (Some(key_origin), Some(tap_internal_key)) =
             (&self.output_key_origin, psbt_out.tap_internal_key)
         {
+            let leaf_hashes = psbt_out
+                .tap_key_origins
+                .get(&tap_internal_key)
+                .map(|(leaf_hashes, _)| leaf_hashes.clone())
+                .unwrap_or_default();
             psbt_out
                 .tap_key_origins
-                .entry(tap_internal_key)
-                .or_insert((vec![], key_origin.clone()));
+                .insert(tap_internal_key, (leaf_hashes, key_origin.clone()));
         }
         for (participant, origin) in &self.participant_origins {
             psbt_out
