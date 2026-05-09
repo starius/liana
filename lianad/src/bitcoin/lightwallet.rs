@@ -166,6 +166,11 @@ impl BdkWallet {
         &self.local_chain
     }
 
+    /// Replace the local chain with a freshly reconstructed view.
+    pub fn set_local_chain(&mut self, local_chain: LocalChain) {
+        self.local_chain = local_chain;
+    }
+
     /// Whether `tip` exists in `local_chain`.
     ///
     /// Returns `None` if no block at that height exists in `local_chain`.
@@ -183,6 +188,11 @@ impl BdkWallet {
     /// Get a reference to the transaction index.
     pub fn index(&self) -> &KeychainTxOutIndex<KeychainType> {
         &self.graph.index
+    }
+
+    /// Get all revealed and lookahead script pubkeys tracked by the wallet.
+    pub fn all_spks(&self) -> impl Iterator<Item = &ScriptBuf> {
+        self.graph.index.inner().all_spks().values()
     }
 
     /// Reveal SPKs based on derivation indices set in DB.
@@ -347,6 +357,23 @@ impl BdkWallet {
     /// Apply a graph update.
     pub fn apply_graph_update(&mut self, graph_update: TxGraph<ConfirmationTimeHeightAnchor>) {
         let _ = self.graph.apply_update(graph_update);
+    }
+
+    /// Apply confirmed transactions, indexing only those relevant to this wallet.
+    pub fn apply_relevant_confirmed_transactions(
+        &mut self,
+        txs: &[(bitcoin::Transaction, ConfirmationTimeHeightAnchor)],
+    ) {
+        let _ = self
+            .graph
+            .batch_insert_relevant(txs.iter().map(|(tx, anchor)| (tx, [*anchor])));
+    }
+
+    /// Apply unconfirmed transactions, indexing only those relevant to this wallet.
+    pub fn apply_relevant_unconfirmed_transactions(&mut self, txs: &[(bitcoin::Transaction, u64)]) {
+        let _ = self
+            .graph
+            .batch_insert_relevant_unconfirmed(txs.iter().map(|(tx, seen_at)| (tx, *seen_at)));
     }
 
     /// Apply a keychain update.

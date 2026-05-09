@@ -2,6 +2,7 @@
 //!
 //! Broadcast transactions, poll for new unspent coins, gather fee estimates.
 
+pub mod bip157;
 pub mod d;
 pub mod electrum;
 pub mod lightwallet;
@@ -589,6 +590,171 @@ impl BitcoinInterface for electrum::Electrum {
 
     fn tip_time(&self) -> Option<u32> {
         self.client().tip_time().ok()
+    }
+}
+
+impl BitcoinInterface for bip157::Bip157 {
+    fn sync_wallet(
+        &mut self,
+        receive_index: ChildNumber,
+        change_index: ChildNumber,
+    ) -> Result<Option<BlockChainTip>, String> {
+        bip157::Bip157::sync_wallet(self, receive_index, change_index).map_err(|e| e.to_string())
+    }
+
+    fn received_coins(
+        &self,
+        tip: &BlockChainTip,
+        _descs: &[descriptors::SinglePathLianaDesc],
+    ) -> Vec<UTxO> {
+        bip157::Bip157::wallet_coins(self, None)
+            .values()
+            .filter_map(|c| {
+                let height = c.block_info.map(|info| info.height);
+                if height.filter(|h| *h <= tip.height).is_some() {
+                    None
+                } else {
+                    Some(UTxO {
+                        outpoint: c.outpoint,
+                        block_height: height,
+                        amount: c.amount,
+                        address: UTxOAddress::DerivIndex(c.derivation_index, c.is_change),
+                        is_immature: c.is_immature,
+                    })
+                }
+            })
+            .collect()
+    }
+
+    fn confirmed_coins(
+        &self,
+        outpoints: &[bitcoin::OutPoint],
+    ) -> (Vec<(bitcoin::OutPoint, i32, u32)>, Vec<bitcoin::OutPoint>) {
+        let wallet_coins = &bip157::Bip157::wallet_coins(self, Some(outpoints));
+        let mut confirmed = Vec::new();
+        let mut expired = Vec::new();
+        for op in outpoints {
+            if let Some(w_c) = wallet_coins.get(op) {
+                if let Some(block) = w_c.block_info {
+                    if w_c.is_immature {
+                        log::debug!(
+                            "Coin at '{}' comes from an immature coinbase transaction at \
+                            block height {}. Not marking it as confirmed for now.",
+                            op,
+                            block.height
+                        );
+                        continue;
+                    }
+                    confirmed.push((w_c.outpoint, block.height, block.time));
+                }
+            } else {
+                expired.push(*op);
+            }
+        }
+        (confirmed, expired)
+    }
+
+    fn spending_coins(
+        &self,
+        outpoints: &[bitcoin::OutPoint],
+    ) -> Vec<(bitcoin::OutPoint, bitcoin::Txid)> {
+        let wallet_coins = &bip157::Bip157::wallet_coins(self, Some(outpoints));
+        outpoints
+            .iter()
+            .filter_map(|op| {
+                if let Some(w_c) = wallet_coins.get(op) {
+                    w_c.spend_txid.map(|txid| (w_c.outpoint, txid))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn spent_coins(
+        &self,
+        outpoints: &[(bitcoin::OutPoint, bitcoin::Txid)],
+    ) -> (Vec<SpentCoin>, Vec<bitcoin::OutPoint>) {
+        let ops: Vec<_> = outpoints.iter().map(|(op, _)| op).copied().collect();
+        let wallet_coins = &bip157::Bip157::wallet_coins(self, Some(&ops));
+        let mut spent = Vec::new();
+        let mut expired_spending = Vec::new();
+
+        for (op, spend_txid) in outpoints {
+            if let Some(w_c) = wallet_coins.get(op) {
+                if w_c.spend_txid != Some(*spend_txid) {
+                    expired_spending.push(*op);
+                }
+                if let Some(block) = w_c.spend_block {
+                    spent.push((*op, *spend_txid, block.height, block.time));
+                }
+            }
+        }
+        (spent, expired_spending)
+    }
+
+    fn genesis_block_timestamp(&self) -> u32 {
+        bip157::Bip157::genesis_block_timestamp(self)
+    }
+
+    fn genesis_block(&self) -> BlockChainTip {
+        bip157::Bip157::genesis_block(self)
+    }
+
+    fn chain_tip(&self) -> BlockChainTip {
+        bip157::Bip157::wallet_tip(self)
+    }
+
+    fn is_in_chain(&self, tip: &BlockChainTip) -> bool {
+        bip157::Bip157::is_in_wallet_chain(self, *tip).unwrap_or_default()
+    }
+
+    fn common_ancestor(&self, _tip: &BlockChainTip) -> Option<BlockChainTip> {
+        unreachable!("The common ancestor is returned in `sync_wallet()`. If no reorg was detected then, this method will never be called on a BIP157 backend.")
+    }
+
+    fn broadcast_tx(&self, tx: &bitcoin::Transaction) -> Result<(), String> {
+        bip157::Bip157::broadcast_tx(self, tx).map_err(|e| e.to_string())
+    }
+
+    fn wallet_transaction(
+        &self,
+        txid: &bitcoin::Txid,
+    ) -> Option<(bitcoin::Transaction, Option<Block>)> {
+        bip157::Bip157::wallet_transaction(self, txid)
+    }
+
+    fn mempool_entry(&self, txid: &bitcoin::Txid) -> Option<MempoolEntry> {
+        bip157::Bip157::mempool_entry(self, txid)
+    }
+
+    fn mempool_spenders(&self, outpoints: &[bitcoin::OutPoint]) -> Vec<MempoolEntry> {
+        bip157::Bip157::mempool_spenders(self, outpoints)
+    }
+
+    fn sync_progress(&self) -> SyncProgress {
+        bip157::Bip157::sync_progress(self)
+    }
+
+    fn start_rescan(
+        &mut self,
+        _desc: &descriptors::LianaDescriptor,
+        _timestamp: u32,
+    ) -> Result<(), String> {
+        self.trigger_rescan();
+        Ok(())
+    }
+
+    fn rescan_progress(&self) -> Option<f64> {
+        bip157::Bip157::rescan_progress(self)
+    }
+
+    fn block_before_date(&self, _timestamp: u32) -> Option<BlockChainTip> {
+        Some(bip157::Bip157::genesis_block(self))
+    }
+
+    fn tip_time(&self) -> Option<u32> {
+        bip157::Bip157::tip_time(self)
     }
 }
 

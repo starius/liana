@@ -89,6 +89,9 @@ pub enum BitcoinBackend {
     /// Settings specific to Electrum as the Bitcoin interface.
     #[serde(rename = "electrum_config")]
     Electrum(ElectrumConfig),
+    /// Settings specific to a BIP157/BIP158 compact filters backend.
+    #[serde(rename = "bip157_config")]
+    Bip157(Bip157Config),
 }
 
 /// RPC authentication options.
@@ -136,6 +139,29 @@ pub struct ElectrumConfig {
 
 fn default_validate_domain() -> bool {
     true
+}
+
+fn default_bip157_required_peers() -> u8 {
+    1
+}
+
+/// Everything we need to know for talking to a BIP157 backend serenely.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct Bip157Config {
+    /// Preferred peers to bootstrap from.
+    ///
+    /// Entries may be IP addresses, `IP:port`, hostnames, or `hostname:port`.
+    #[serde(default)]
+    pub peers: Vec<String>,
+    /// The minimum number of peer connections the node should try to maintain.
+    #[serde(default = "default_bip157_required_peers")]
+    pub required_peers: u8,
+    /// When true, only connect to the configured peers.
+    #[serde(default)]
+    pub whitelist_only: bool,
+    /// Optional Socks5 proxy, typically for Tor.
+    #[serde(default)]
+    pub proxy_addr: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -548,6 +574,44 @@ mod tests {
             validate_domain: true,
         };
         assert_eq!(parsed, expected,);
+    }
+
+    #[test]
+    fn toml_bip157_config() {
+        let toml_str = r#"
+            peers = ['seed.bitcoin.sipa.be:8333', '127.0.0.1']
+            required_peers = 2
+            whitelist_only = true
+            proxy_addr = '127.0.0.1:9050'
+            "#
+        .trim_start()
+        .replace("            ", "");
+        toml::from_str::<Bip157Config>(&toml_str).expect("Deserializing toml_str");
+        let parsed = toml::from_str::<Bip157Config>(&toml_str).expect("Deserializing toml_str");
+        let serialized = toml::to_string_pretty(&parsed).expect("Serializing to toml");
+        let reparsed =
+            toml::from_str::<Bip157Config>(&serialized).expect("Deserializing serialized toml");
+        assert_eq!(parsed, reparsed);
+        let expected = Bip157Config {
+            peers: vec!["seed.bitcoin.sipa.be:8333".into(), "127.0.0.1".into()],
+            required_peers: 2,
+            whitelist_only: true,
+            proxy_addr: Some("127.0.0.1:9050".parse().unwrap()),
+        };
+        assert_eq!(parsed, expected);
+
+        let toml_str = r#"
+            "#
+        .trim_start()
+        .replace("            ", "");
+        let parsed = toml::from_str::<Bip157Config>(&toml_str).expect("Deserializing toml_str");
+        let expected = Bip157Config {
+            peers: Vec::new(),
+            required_peers: 1,
+            whitelist_only: false,
+            proxy_addr: None,
+        };
+        assert_eq!(parsed, expected);
     }
 
     #[test]

@@ -51,6 +51,7 @@ rusqlite = "0.30"
 # feature and avoid the default aws-ls-rs provider from rustls, which would break the reproducible build
 # (see https://github.com/aws/aws-lc-rs/issues/409).
 bdk_electrum = { git = "https://github.com/wizardsardine/bdk", branch = "release/1.0.0-alpha.13", default-features = false }
+bip157 = "0.5.0"
 
 # liana-connect WebSocket protocol
 uuid = "1.19.0"

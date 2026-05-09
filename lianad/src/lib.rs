@@ -14,6 +14,7 @@ use datadir::DataDirectory;
 pub use miniscript;
 
 pub use crate::bitcoin::{
+    bip157::{Bip157, Bip157Error},
     d::{BitcoinD, BitcoindError, WalletError},
     electrum::{Electrum, ElectrumError},
 };
@@ -82,11 +83,13 @@ pub enum StartupError {
     DatadirCreation(path::PathBuf, io::Error),
     MissingBitcoindConfig,
     MissingElectrumConfig,
+    MissingBip157Config,
     MissingBitcoinBackendConfig,
     DbMigrateBitcoinTxs(&'static str),
     Database(SqliteDbError),
     Bitcoind(BitcoindError),
     Electrum(ElectrumError),
+    Bip157(Bip157Error),
     #[cfg(windows)]
     NoWatchonlyInDatadir,
 }
@@ -111,6 +114,10 @@ impl fmt::Display for StartupError {
                 f,
                 "Our Bitcoin interface is Electrum but we have no 'electrum_config' entry in the configuration."
             ),
+            Self::MissingBip157Config => write!(
+                f,
+                "Our Bitcoin interface is BIP157 but we have no 'bip157_config' entry in the configuration."
+            ),
             Self::MissingBitcoinBackendConfig => write!(
                 f,
                 "No Bitcoin backend entry in the configuration."
@@ -122,6 +129,7 @@ impl fmt::Display for StartupError {
             Self::Database(e) => write!(f, "Error initializing database: '{e}'."),
             Self::Bitcoind(e) => write!(f, "Error setting up bitcoind interface: '{e}'."),
             Self::Electrum(e) => write!(f, "Error setting up Electrum interface: '{e}'."),
+            Self::Bip157(e) => write!(f, "Error setting up BIP157 interface: '{e}'."),
             #[cfg(windows)]
             Self::NoWatchonlyInDatadir => {
                 write!(
@@ -154,6 +162,12 @@ impl From<SqliteDbError> for StartupError {
 impl From<BitcoindError> for StartupError {
     fn from(e: BitcoindError) -> Self {
         Self::Bitcoind(e)
+    }
+}
+
+impl From<Bip157Error> for StartupError {
+    fn from(e: Bip157Error) -> Self {
+        Self::Bip157(e)
     }
 }
 
@@ -318,6 +332,32 @@ fn setup_electrum(
     Ok(electrum)
 }
 
+// Create a BIP157 interface from the configured compact-filters client and DB-backed wallet
+// state.
+fn setup_bip157(
+    config: &Config,
+    data_dir: &DataDirectory,
+    db: sync::Arc<sync::Mutex<dyn DatabaseInterface>>,
+) -> Result<Bip157, StartupError> {
+    let bip157_config = match config.bitcoin_backend.as_ref() {
+        Some(config::BitcoinBackend::Bip157(bip157_config)) => bip157_config,
+        _ => Err(StartupError::MissingBip157Config)?,
+    };
+    let full_scan = {
+        let mut db_conn = db.connection();
+        db_conn.rescan_timestamp().is_some()
+    };
+    Bip157::new(
+        &config.bitcoin_config,
+        bip157_config,
+        &config.main_descriptor,
+        data_dir,
+        db,
+        full_scan,
+    )
+    .map_err(StartupError::Bip157)
+}
+
 #[derive(Clone)]
 pub struct DaemonControl {
     config: Config,
@@ -437,6 +477,9 @@ impl DaemonHandle {
             (None, Some(config::BitcoinBackend::Electrum(..))) => {
                 sync::Arc::from(sync::Mutex::from(setup_electrum(&config, db.clone())?))
             }
+            (None, Some(config::BitcoinBackend::Bip157(..))) => sync::Arc::from(sync::Mutex::from(
+                setup_bip157(&config, &data_dir, db.clone())?,
+            )),
             (None, None) => Err(StartupError::MissingBitcoinBackendConfig)?,
         };
 
