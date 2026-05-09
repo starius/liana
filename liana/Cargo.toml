@@ -19,6 +19,7 @@ serde = { workspace = true, features = ["derive"] }
 
 # Logging stuff
 log = { workspace = true }
+musig2 = { workspace = true }
 
 # Used for generating mnemonics
 getrandom = { workspace = true }

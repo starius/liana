@@ -1,10 +1,18 @@
 use std::{fmt, str::FromStr};
 
-use miniscript::descriptor::{self, DescriptorPublicKey};
+use miniscript::{
+    bitcoin::{self, bip32, secp256k1},
+    descriptor::{self, DescriptorPublicKey},
+};
+use musig2::{secp::Point, KeyAggContext};
 
 use super::{LianaPolicyError, MuSig2DerivationMode};
 
 const DUMMY_XPUB: &str = "[8c3ffb6e/48'/1'/0'/2']tpubDEMt3bpQMa99W81K9h8f2FJH1C81eSd6bbSkBP8tcqQHAfSKvuGp2fz6xiVpfShzT9sKPx7DVBphChjxvNd15WcbsCca5oVz1AcUTWHxkdS";
+const BIP328_SYNTHETIC_CHAINCODE: [u8; 32] = [
+    0x86, 0x80, 0x87, 0xca, 0x02, 0xa6, 0xf9, 0x74, 0xc4, 0x59, 0x89, 0x24, 0xc3, 0x6b, 0x57, 0x76,
+    0x2d, 0x32, 0xcb, 0x45, 0x71, 0x71, 0x67, 0xe3, 0x00, 0x62, 0x2c, 0x71, 0x67, 0xe3, 0x89, 0x65,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AggregateKeyDerivation {
@@ -149,6 +157,38 @@ impl fmt::Display for MuSig2KeyExpr {
     }
 }
 
+pub fn aggregate_plain_pubkey<I>(
+    pubkeys: I,
+) -> Result<secp256k1::PublicKey, musig2::errors::KeyAggError>
+where
+    I: IntoIterator<Item = secp256k1::PublicKey>,
+{
+    let context = KeyAggContext::new(
+        pubkeys
+            .into_iter()
+            .map(|pubkey| Point::from_slice(&pubkey.serialize()).expect("Valid pubkey bytes")),
+    )?;
+    let aggregate_pubkey = secp256k1::PublicKey::from_slice(
+        &context.aggregated_pubkey_untweaked::<Point>().serialize(),
+    )
+    .expect("MuSig2 aggregate key is a valid secp256k1 pubkey");
+    Ok(aggregate_pubkey)
+}
+
+pub fn bip328_synthetic_xpub(
+    aggregate_pubkey: secp256k1::PublicKey,
+    network: bitcoin::Network,
+) -> bip32::Xpub {
+    bip32::Xpub {
+        network: network.into(),
+        depth: 0,
+        parent_fingerprint: [0; 4].into(),
+        child_number: 0.into(),
+        public_key: aggregate_pubkey,
+        chain_code: BIP328_SYNTHETIC_CHAINCODE.into(),
+    }
+}
+
 fn split_musig_expression(expr: &str) -> Result<(Vec<&str>, &str), LianaPolicyError> {
     let expr = expr.trim();
     let inner = expr
@@ -181,6 +221,7 @@ fn split_musig_expression(expr: &str) -> Result<(Vec<&str>, &str), LianaPolicyEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use miniscript::bitcoin::Network;
 
     #[test]
     fn parse_derive_then_aggregate_expression() {
@@ -230,5 +271,53 @@ mod tests {
             MuSig2KeyExpr::from_str(expr),
             Err(LianaPolicyError::InvalidMuSig2Expression)
         ));
+    }
+
+    #[test]
+    fn bip328_vector_two_keys() {
+        let pubkeys = [
+            "03935F972DA013F80AE011890FA89B67A27B7BE6CCB24D3274D18B2D4067F261A9"
+                .parse()
+                .unwrap(),
+            "02F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9"
+                .parse()
+                .unwrap(),
+        ];
+        let aggregate_pubkey = aggregate_plain_pubkey(pubkeys).unwrap();
+        assert_eq!(
+            aggregate_pubkey.to_string(),
+            "0354240c76b8f2999143301a99c7f721ee57eee0bce401df3afeaa9ae218c70f23"
+        );
+        assert_eq!(
+            bip328_synthetic_xpub(aggregate_pubkey, Network::Bitcoin).to_string(),
+            "xpub661MyMwAqRbcFt6tk3uaczE1y6EvM1TqXvawXcYmFEWijEM4PDBnuCXwwXEKGEouzXE6QLLRxjatMcLLzJ5LV5Nib1BN7vJg6yp45yHHRbm"
+        );
+    }
+
+    #[test]
+    fn bip328_vector_four_keys() {
+        let pubkeys = [
+            "02DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"
+                .parse()
+                .unwrap(),
+            "023590A94E768F8E1815C2F24B4D80A8E3149316C3518CE7B7AD338368D038CA66"
+                .parse()
+                .unwrap(),
+            "02F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9"
+                .parse()
+                .unwrap(),
+            "03935F972DA013F80AE011890FA89B67A27B7BE6CCB24D3274D18B2D4067F261A9"
+                .parse()
+                .unwrap(),
+        ];
+        let aggregate_pubkey = aggregate_plain_pubkey(pubkeys).unwrap();
+        assert_eq!(
+            aggregate_pubkey.to_string(),
+            "022479f134cdb266141dab1a023cbba30a870f8995b95a91fc8464e56a7d41f8ea"
+        );
+        assert_eq!(
+            bip328_synthetic_xpub(aggregate_pubkey, Network::Bitcoin).to_string(),
+            "xpub661MyMwAqRbcFt6tk3uaczE1y6EvM1TqXvawXcYmFEWijEM4PDBnuCXwwUvaZYpysLX4wN59tjwU5pBuDjNrPEJbfxjLwn7ruzbXTcUTHkZ"
+        );
     }
 }
