@@ -77,7 +77,11 @@ fear not! This is just a one time cost. Also, the full node is pruned so it will
 Liana can be run as a headless server using the `lianad` program.
 
 As a Bitcoin wallet, Liana needs to be able to connect to the Bitcoin network,
-which is currently possible through the Bitcoin Core daemon (`bitcoind`) or an Electrum server.
+which is currently possible through:
+
+- the Bitcoin Core daemon (`bitcoind`)
+- an Electrum server
+- a BIP157/BIP158 compact-filters backend
 
 The chosen Bitcoin backend must be available while Liana is running.
 
@@ -88,6 +92,15 @@ regtest). Note that testnet4 will only be available if Bitcoin Core version 28.0
 The minimum supported version of Bitcoin Core is `24.0.1` (if you want to use Taproot it's `26.0`).
 If you don't have Bitcoin Core installed on your machine yet, you can download it
 [here](https://bitcoincore.org/en/download/).
+
+If using the compact-filters backend, Liana will connect directly to Bitcoin peers and scan BIP157
+/ BIP158 filters for transactions matching the wallet descriptor. This backend does not require
+`bitcoind` or Electrum, but it currently has a few first-version limitations:
+
+- rescans replay the compact-filter history instead of starting from an exact timestamp cutoff
+- mempool visibility is limited compared to `bitcoind`
+- unconfirmed incoming transactions are only tracked once they have been learned through the
+  wallet's own view of the network
 
 You can use the `liana-cli` program to send commands to it. It will need the path to the same
 configuration as the daemon. You can find a full documentation of the JSONRPC API exposed by

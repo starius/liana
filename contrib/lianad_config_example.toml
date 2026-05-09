@@ -58,6 +58,20 @@ poll_interval_secs = 30
 # addr = "127.0.0.1:50001"
 # validate_domain = false 
 #
+# If using compact filters, the section name is [bip157_config].
+# `peers` is optional: if omitted, the backend will use DNS seeds unless
+# `whitelist_only` is set to `true`.
+# `required_peers` defaults to 1 and is clamped by the backend to a
+# reasonable range.
+# `proxy_addr` is optional and can be used with a local Tor daemon.
+# Note that rescans currently replay compact-filter history rather than
+# starting from a precise timestamp cutoff.
+# [bip157_config]
+# peers = ["seed.bitcoin.sipa.be:18333", "127.0.0.1:18333"]
+# required_peers = 2
+# whitelist_only = false
+# proxy_addr = "127.0.0.1:9050"
+#
 #
 [bitcoind_config]
 addr = "127.0.0.1:18332"
