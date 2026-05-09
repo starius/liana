@@ -28,6 +28,11 @@ pub enum LianaPolicyError {
     DuplicateOriginSamePath(Box<descriptor::DescriptorPublicKey>),
     InvalidMultiThresh(usize),
     InvalidMultiKeys(usize),
+    InvalidMuSig2ParticipantCount(usize),
+    InvalidMuSig2Participant(Box<descriptor::DescriptorPublicKey>),
+    InvalidMuSig2Expression,
+    MixedMuSig2DerivationModes,
+    TaprootOnlyMuSig2,
     IncompatibleDesc,
     PolicyAnalysis(miniscript::Error),
     /// The spending policy is not a valid Miniscript policy: it may for instance be malleable, or
@@ -50,6 +55,24 @@ impl std::fmt::Display for LianaPolicyError {
             }
             Self::InvalidMultiThresh(thresh) => write!(f, "Invalid multisig threshold value '{thresh}'. The threshold must be > to 0 and <= to the number of keys."),
             Self::InvalidMultiKeys(n_keys) => write!(f, "Invalid number of keys '{n_keys}'. Between 2 and 20 keys must be given to use multiple keys in a specific path."),
+            Self::InvalidMuSig2ParticipantCount(n_keys) => write!(
+                f,
+                "Invalid number of MuSig2 participants '{n_keys}'. At least two keys must be given."
+            ),
+            Self::InvalidMuSig2Participant(key) => write!(
+                f,
+                "Invalid MuSig2 participant key '{key}'."
+            ),
+            Self::InvalidMuSig2Expression => {
+                write!(f, "Invalid MuSig2 descriptor expression.")
+            }
+            Self::MixedMuSig2DerivationModes => write!(
+                f,
+                "Mixed MuSig2 derivation modes are not allowed within a single musig() expression."
+            ),
+            Self::TaprootOnlyMuSig2 => {
+                write!(f, "MuSig2 primary paths are only supported for Taproot descriptors.")
+            }
             Self::DuplicateKey(key) => {
                 write!(f, "Duplicate key '{key}'.")
             }

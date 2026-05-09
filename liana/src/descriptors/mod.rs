@@ -28,6 +28,9 @@ pub use keys::*;
 pub mod analysis;
 pub use analysis::*;
 
+pub mod musig;
+pub use musig::*;
+
 #[derive(Debug)]
 pub enum LianaDescError {
     Miniscript(miniscript::Error),
