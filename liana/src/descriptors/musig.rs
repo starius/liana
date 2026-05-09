@@ -1,10 +1,15 @@
 use std::{fmt, str::FromStr};
 
 use miniscript::{
-    bitcoin::{self, bip32, secp256k1},
+    bitcoin::{
+        self, bip32,
+        psbt::{raw, Input as PsbtIn, Output as PsbtOut},
+        secp256k1,
+    },
     descriptor::{
         self, checksum::desc_checksum, DefiniteDescriptorKey, Descriptor, DescriptorPublicKey,
     },
+    psbt::{PsbtInputExt, PsbtOutputExt},
     ToPublicKey,
 };
 use musig2::{secp::Point, KeyAggContext};
@@ -17,6 +22,8 @@ const BIP328_SYNTHETIC_CHAINCODE: [u8; 32] = [
     0x86, 0x80, 0x87, 0xca, 0x02, 0xa6, 0xf9, 0x74, 0xc4, 0x59, 0x89, 0x24, 0xc3, 0x6b, 0x57, 0x76,
     0x2d, 0x32, 0xcb, 0x45, 0x71, 0x71, 0x67, 0xe3, 0x00, 0x62, 0x2c, 0x71, 0x67, 0xe3, 0x89, 0x65,
 ];
+const PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS: u8 = 0x1a;
+const PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS: u8 = 0x08;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AggregateKeyDerivation {
@@ -235,6 +242,14 @@ pub struct MuSig2SinglePathDescriptor {
     shadow_desc: Descriptor<DescriptorPublicKey>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuSig2DerivedDescriptor {
+    desc: Descriptor<DefiniteDescriptorKey>,
+    aggregate_pubkey: secp256k1::PublicKey,
+    participant_origins: Vec<(secp256k1::PublicKey, bip32::KeySource)>,
+    output_key_origin: Option<bip32::KeySource>,
+}
+
 impl MuSig2SinglePathDescriptor {
     pub fn expr(&self) -> &MuSig2KeyExpr {
         &self.expr
@@ -262,6 +277,81 @@ impl MuSig2SinglePathDescriptor {
         )))
         .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)
     }
+
+    pub fn derive_psbt_descriptor(
+        &self,
+        child_index: u32,
+    ) -> Result<MuSig2DerivedDescriptor, LianaPolicyError> {
+        let desc = self.derive_descriptor(child_index)?;
+        let participant_origins = match self.expr.derivation_mode() {
+            MuSig2DerivationMode::DeriveThenAggregate => self
+                .expr
+                .participants()
+                .iter()
+                .cloned()
+                .map(|participant| derive_participant_origin(participant, 0, child_index))
+                .collect::<Result<Vec<_>, _>>()?,
+            MuSig2DerivationMode::AggregateThenDeriveBip328 => self
+                .expr
+                .participants()
+                .iter()
+                .cloned()
+                .map(|participant| derive_participant_origin(participant, 0, 0))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        let aggregate_pubkey = match self.expr.derivation_mode() {
+            MuSig2DerivationMode::DeriveThenAggregate => {
+                derive_aggregate_pubkey(&self.expr, 0, child_index)?
+            }
+            MuSig2DerivationMode::AggregateThenDeriveBip328 => aggregate_sorted_pubkey(
+                participant_origins
+                    .iter()
+                    .map(|(participant, _)| *participant)
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            )
+            .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?,
+        };
+        let output_key_origin = match self.expr.derivation_mode() {
+            MuSig2DerivationMode::DeriveThenAggregate => None,
+            MuSig2DerivationMode::AggregateThenDeriveBip328 => {
+                let network = participant_network(
+                    self.expr
+                        .participants()
+                        .first()
+                        .ok_or(LianaPolicyError::InvalidMuSig2ParticipantCount(0))?,
+                )
+                .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+                let synthetic_xpub = bip328_synthetic_xpub(aggregate_pubkey, network);
+                let aggregate_derivation = self
+                    .expr
+                    .aggregate_derivation()
+                    .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+                let branch_path = aggregate_derivation
+                    .derivation_paths()
+                    .paths()
+                    .first()
+                    .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+                let derivation_path =
+                    if aggregate_derivation.wildcard() == descriptor::Wildcard::None {
+                        branch_path.clone()
+                    } else {
+                        branch_path.clone().into_child(
+                            bip32::ChildNumber::from_normal_idx(child_index)
+                                .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?,
+                        )
+                    };
+                Some((synthetic_xpub.fingerprint(), derivation_path))
+            }
+        };
+
+        Ok(MuSig2DerivedDescriptor {
+            desc,
+            aggregate_pubkey,
+            participant_origins,
+            output_key_origin,
+        })
+    }
 }
 
 impl fmt::Display for MuSig2SinglePathDescriptor {
@@ -273,6 +363,90 @@ impl fmt::Display for MuSig2SinglePathDescriptor {
             &self.expr.to_string(),
             tap_tree,
         )))
+    }
+}
+
+impl MuSig2DerivedDescriptor {
+    pub fn descriptor(&self) -> &Descriptor<DefiniteDescriptorKey> {
+        &self.desc
+    }
+
+    pub fn script_pubkey(&self) -> bitcoin::ScriptBuf {
+        self.desc.script_pubkey()
+    }
+
+    pub fn address(&self, network: bitcoin::Network) -> bitcoin::Address {
+        self.desc
+            .address(network)
+            .expect("A Taproot descriptor always has an address")
+    }
+
+    pub fn update_psbt_in(&self, psbt_in: &mut PsbtIn) {
+        if let Err(e) = psbt_in.update_with_descriptor_unchecked(&self.desc) {
+            log::error!(
+                "BUG! Please report this! Error when adding MuSig2 input metadata for desc: {}. Descriptor: {}.",
+                e,
+                self.desc
+            );
+        }
+        if let (Some(key_origin), Some(tap_internal_key)) =
+            (&self.output_key_origin, psbt_in.tap_internal_key)
+        {
+            psbt_in
+                .tap_key_origins
+                .entry(tap_internal_key)
+                .or_insert((vec![], key_origin.clone()));
+        }
+        for (participant, origin) in &self.participant_origins {
+            psbt_in
+                .tap_key_origins
+                .entry(participant.x_only_public_key().0)
+                .or_insert((vec![], origin.clone()));
+        }
+        psbt_in.unknown.insert(
+            raw::Key {
+                type_value: PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
+                key: self.aggregate_pubkey.serialize().to_vec(),
+            },
+            self.participant_origins
+                .iter()
+                .flat_map(|(participant, _)| participant.serialize())
+                .collect(),
+        );
+    }
+
+    pub fn update_change_psbt_out(&self, psbt_out: &mut PsbtOut) {
+        if let Err(e) = psbt_out.update_with_descriptor_unchecked(&self.desc) {
+            log::error!(
+                "BUG! Please report this! Error when adding MuSig2 output metadata for desc: {}. Descriptor: {}.",
+                e,
+                self.desc
+            );
+        }
+        if let (Some(key_origin), Some(tap_internal_key)) =
+            (&self.output_key_origin, psbt_out.tap_internal_key)
+        {
+            psbt_out
+                .tap_key_origins
+                .entry(tap_internal_key)
+                .or_insert((vec![], key_origin.clone()));
+        }
+        for (participant, origin) in &self.participant_origins {
+            psbt_out
+                .tap_key_origins
+                .entry(participant.x_only_public_key().0)
+                .or_insert((vec![], origin.clone()));
+        }
+        psbt_out.unknown.insert(
+            raw::Key {
+                type_value: PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS,
+                key: self.aggregate_pubkey.serialize().to_vec(),
+            },
+            self.participant_origins
+                .iter()
+                .flat_map(|(participant, _)| participant.serialize())
+                .collect(),
+        );
     }
 }
 
@@ -388,6 +562,28 @@ fn derive_participant_pubkey(
         .at_derivation_index(child_index)
         .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?;
     Ok(definite_key.to_public_key().inner)
+}
+
+fn derive_participant_origin(
+    participant: DescriptorPublicKey,
+    path_index: usize,
+    child_index: u32,
+) -> Result<(secp256k1::PublicKey, bip32::KeySource), LianaPolicyError> {
+    let participant = participant
+        .into_single_keys()
+        .into_iter()
+        .nth(path_index)
+        .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+    let definite_key = participant
+        .at_derivation_index(child_index)
+        .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?;
+    let derivation_path = definite_key
+        .full_derivation_path()
+        .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+    Ok((
+        definite_key.to_public_key().inner,
+        (definite_key.master_fingerprint(), derivation_path),
+    ))
 }
 
 fn participant_network(participant: &DescriptorPublicKey) -> Option<bitcoin::Network> {
