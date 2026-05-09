@@ -77,6 +77,8 @@ pub fn multisig_security_template_description(
 pub fn multisig_security_template<'a>(
     progress: (usize, usize),
     use_taproot: bool,
+    primary_spend: crate::installer::descriptor::PrimarySpendKind,
+    allow_musig: bool,
     primary_path: &'a Path,
     recovery_path: &'a Path,
     valid: bool,
@@ -100,7 +102,7 @@ pub fn multisig_security_template<'a>(
                         .spacing(10)
                         .push(text("Advanced settings").small().bold())
                         .push(icon::collapsed_icon()),
-                    define_descriptor_advanced_settings(use_taproot),
+                    define_descriptor_advanced_settings(use_taproot, primary_spend, allow_musig),
                 )
                 .style(theme::button::transparent),
             )

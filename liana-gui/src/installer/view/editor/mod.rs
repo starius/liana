@@ -20,7 +20,7 @@ use liana_ui::{
 };
 
 use crate::installer::{
-    descriptor::{PathKind, PathSequence, PathWarning},
+    descriptor::{PathKind, PathSequence, PathWarning, PrimarySpendKind},
     message::{self, Message},
     view::defined_sequence,
 };
@@ -34,6 +34,11 @@ pub enum DescriptorKind {
 }
 
 const DESCRIPTOR_KINDS: [DescriptorKind; 2] = [DescriptorKind::P2WSH, DescriptorKind::Taproot];
+const PRIMARY_SPEND_KINDS: [PrimarySpendKind; 3] = [
+    PrimarySpendKind::ScriptPath,
+    PrimarySpendKind::MuSig2DeriveThenAggregate,
+    PrimarySpendKind::MuSig2AggregateThenDeriveBip328,
+];
 
 impl std::fmt::Display for DescriptorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -45,7 +50,11 @@ impl std::fmt::Display for DescriptorKind {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn define_descriptor_advanced_settings<'a>(use_taproot: bool) -> Element<'a, Message> {
+pub fn define_descriptor_advanced_settings<'a>(
+    use_taproot: bool,
+    primary_spend: PrimarySpendKind,
+    allow_musig: bool,
+) -> Element<'a, Message> {
     let col_wallet = Column::new()
         .spacing(10)
         .push(text("Descriptor type").bold())
@@ -61,17 +70,61 @@ pub fn define_descriptor_advanced_settings<'a>(use_taproot: bool) -> Element<'a,
             )
             .padding(10),
         ));
+    let primary_spend_options: Vec<_> = if allow_musig {
+        PRIMARY_SPEND_KINDS.to_vec()
+    } else {
+        vec![PrimarySpendKind::ScriptPath]
+    };
 
     container(
         Column::new()
             .spacing(20)
             .push(Space::with_height(0))
             .push(separation().width(500))
-            .push(Row::new().push(col_wallet))
+            .push(
+                Row::new()
+                    .push(col_wallet)
+                    .push_maybe(if use_taproot {
+                        Some(
+                            Column::new()
+                                .spacing(10)
+                                .push(text("Primary spend").bold())
+                                .push(container(
+                                    pick_list::pick_list(
+                                        primary_spend_options,
+                                        Some(primary_spend),
+                                        Message::SelectPrimarySpendKind,
+                                    )
+                                    .padding(10),
+                                )),
+                        )
+                    } else {
+                        None
+                    }),
+            )
             .push_maybe(if use_taproot {
                 Some(
-                    p1_regular("Taproot is only supported by Liana version 5.0 and above")
-                        .style(theme::text::secondary),
+                    Column::new()
+                        .spacing(5)
+                        .push(
+                            p1_regular("Taproot is only supported by Liana version 5.0 and above")
+                                .style(theme::text::secondary),
+                        )
+                        .push_maybe(if allow_musig {
+                            Some(
+                                p1_regular(
+                                    "MuSig2 uses every primary key and the selected mode applies to the whole musig() expression.",
+                                )
+                                .style(theme::text::secondary),
+                            )
+                        } else {
+                            Some(
+                                p1_regular(
+                                    "MuSig2 becomes available once the primary Taproot path has at least two keys and the threshold matches the number of primary keys.",
+                                )
+                                .style(theme::text::secondary),
+                            )
+                        }),
                 )
             } else {
                 None

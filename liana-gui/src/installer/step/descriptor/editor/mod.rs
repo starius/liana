@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use iced::{Subscription, Task};
 use liana::miniscript::bitcoin::bip32::ChildNumber;
 use liana::{
-    descriptors::{LianaDescriptor, LianaPolicy, PathInfo},
+    descriptors::{LianaDescriptor, LianaPolicy, MuSig2KeyExpr, PathInfo, PrimaryPathInfo},
     miniscript::{
         bitcoin::{bip32::Fingerprint, Network},
         descriptor::DescriptorPublicKey,
@@ -26,7 +26,7 @@ use crate::{
     hw::HardwareWallets,
     installer::{
         context::DescriptorTemplate,
-        descriptor::{Key, Path, PathKind, PathSequence, PathWarning},
+        descriptor::{Key, Path, PathKind, PathSequence, PathWarning, PrimarySpendKind},
         message::{self, Message},
         step::{Context, Step},
         view,
@@ -53,6 +53,7 @@ pub trait DescriptorEditModal {
 pub struct DefineDescriptor {
     network: Network,
     use_taproot: bool,
+    primary_spend: PrimarySpendKind,
 
     modal: Option<Box<dyn DescriptorEditModal>>,
     signer: Arc<Mutex<Signer>>,
@@ -70,6 +71,7 @@ impl DefineDescriptor {
         Self {
             network,
             use_taproot: false,
+            primary_spend: PrimarySpendKind::ScriptPath,
             modal: None,
 
             signer,
@@ -122,10 +124,24 @@ impl DefineDescriptor {
                         .iter()
                         .any(|k| !k.as_ref().is_some_and(|k| k.source.is_compatible_taproot())))
         }) && self.paths.len() >= 2
+            && (!self.primary_spend_is_musig() || self.primary_path_supports_musig())
     }
 
     fn check_setup(&mut self) {
+        if !self.primary_path_supports_musig() {
+            self.primary_spend = PrimarySpendKind::ScriptPath;
+        }
         self.check_for_warning();
+    }
+
+    fn primary_spend_is_musig(&self) -> bool {
+        self.primary_spend.musig_mode().is_some()
+    }
+
+    fn primary_path_supports_musig(&self) -> bool {
+        self.paths
+            .first()
+            .is_some_and(|path| path.keys.len() >= 2 && path.threshold == path.keys.len())
     }
 
     fn load_template(&mut self, template: DescriptorTemplate) {
@@ -230,6 +246,13 @@ impl Step for DefineDescriptor {
             }
             Message::CreateTaprootDescriptor(use_taproot) => {
                 self.use_taproot = use_taproot;
+                if !use_taproot {
+                    self.primary_spend = PrimarySpendKind::ScriptPath;
+                }
+                self.check_setup();
+            }
+            Message::SelectPrimarySpendKind(primary_spend) => {
+                self.primary_spend = primary_spend;
                 self.check_setup();
             }
             Message::DefineDescriptor(message::DefineDescriptor::ChangeTemplate(template)) => {
@@ -350,6 +373,7 @@ impl Step for DefineDescriptor {
                         if let Some(path) = self.paths.get_mut(i) {
                             path.threshold = t;
                         }
+                        self.check_setup();
                     }
                     message::DefinePath::EditSequence => {
                         if let Some(path) = self.paths.get(i) {
@@ -554,16 +578,91 @@ impl Step for DefineDescriptor {
             return false;
         }
 
-        let spending_keys = if spending_keys.len() == 1 {
-            PathInfo::Single(spending_keys[0].clone())
+        let primary_path = if self.use_taproot {
+            if let Some(mode) = self.primary_spend.musig_mode() {
+                let participants = self.paths[0]
+                    .keys
+                    .iter()
+                    .map(|spending_key| {
+                        let fingerprint = spending_key
+                            .as_ref()
+                            .expect("Must be present at this step")
+                            .fingerprint;
+                        let key = self
+                            .keys
+                            .get(&fingerprint)
+                            .expect("Must be present at this step");
+                        match (&key.key, mode) {
+                            (
+                                DescriptorPublicKey::XPub(xpub),
+                                liana::descriptors::MuSig2DerivationMode::DeriveThenAggregate,
+                            ) => Ok(DescriptorPublicKey::MultiXPub(new_multixkey_from_xpub(
+                                xpub.clone(),
+                                0,
+                            ))),
+                            (
+                                DescriptorPublicKey::XPub(xpub),
+                                liana::descriptors::MuSig2DerivationMode::AggregateThenDeriveBip328,
+                            ) => Ok(DescriptorPublicKey::XPub(xpub.clone())),
+                            _ => {
+                                Err("MuSig2 primary keys must be extended public keys".to_string())
+                            }
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                let participants = match participants {
+                    Ok(participants) => participants,
+                    Err(e) => {
+                        self.error = Some(e);
+                        return false;
+                    }
+                };
+                let aggregate_suffix = if matches!(
+                    mode,
+                    liana::descriptors::MuSig2DerivationMode::AggregateThenDeriveBip328
+                ) {
+                    "/<0;1>/*"
+                } else {
+                    ""
+                };
+                let expr = match MuSig2KeyExpr::from_str(&format!(
+                    "musig({}){aggregate_suffix}",
+                    participants
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )) {
+                    Ok(expr) => expr,
+                    Err(e) => {
+                        self.error = Some(e.to_string());
+                        return false;
+                    }
+                };
+                PrimaryPathInfo::MuSig2(expr)
+            } else if spending_keys.len() == 1 {
+                PrimaryPathInfo::from_key_path(PathInfo::Single(spending_keys[0].clone()))
+            } else {
+                PrimaryPathInfo::from_key_path(PathInfo::Multi(
+                    self.paths[0].threshold,
+                    spending_keys,
+                ))
+            }
         } else {
-            PathInfo::Multi(self.paths[0].threshold, spending_keys)
+            if spending_keys.len() == 1 {
+                PrimaryPathInfo::from_key_path(PathInfo::Single(spending_keys[0].clone()))
+            } else {
+                PrimaryPathInfo::from_key_path(PathInfo::Multi(
+                    self.paths[0].threshold,
+                    spending_keys,
+                ))
+            }
         };
 
         let policy = match if self.use_taproot {
-            LianaPolicy::new(spending_keys, recovery_paths)
+            LianaPolicy::new_with_primary_info(primary_path, recovery_paths)
         } else {
-            LianaPolicy::new_legacy(spending_keys, recovery_paths)
+            LianaPolicy::new_legacy_with_primary_info(primary_path, recovery_paths)
         } {
             Ok(policy) => policy,
             Err(e) => {
@@ -588,6 +687,8 @@ impl Step for DefineDescriptor {
                 view::editor::template::inheritance::inheritance_template(
                     progress,
                     self.use_taproot,
+                    self.primary_spend,
+                    self.primary_path_supports_musig(),
                     &self.paths[0],
                     &self.paths[1],
                     self.valid(),
@@ -597,6 +698,8 @@ impl Step for DefineDescriptor {
                 view::editor::template::multisig_security_wallet::multisig_security_template(
                     progress,
                     self.use_taproot,
+                    self.primary_spend,
+                    self.primary_path_supports_musig(),
                     &self.paths[0],
                     &self.paths[1],
                     self.valid(),
@@ -605,6 +708,8 @@ impl Step for DefineDescriptor {
             DescriptorTemplate::Custom => view::editor::template::custom::custom_template(
                 progress,
                 self.use_taproot,
+                self.primary_spend,
+                self.primary_path_supports_musig(),
                 &self.paths[0],
                 &mut self.paths[1..]
                     .iter()
@@ -761,11 +866,15 @@ mod tests {
     use super::*;
     use iced::futures::StreamExt;
     use iced_runtime::{task::into_stream, Action};
+    use liana::descriptors::MuSig2DerivationMode;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     use crate::installer::step::descriptor::editor::key::{SelectKeySource, SelectedKey};
-    use crate::{dir::LianaDirectory, installer::descriptor::KeySource};
+    use crate::{
+        dir::LianaDirectory,
+        installer::descriptor::{KeySource, PrimarySpendKind},
+    };
 
     pub struct Sandbox<S: Step> {
         step: Arc<Mutex<S>>,
@@ -800,6 +909,28 @@ mod tests {
         pub async fn load(&self, ctx: &Context) {
             self.step.lock().unwrap().load_context(ctx);
         }
+    }
+
+    fn manual_key(alias: &str, desc_key: &str) -> Key {
+        let key = DescriptorPublicKey::from_str(desc_key).unwrap();
+        Key {
+            name: alias.to_string(),
+            fingerprint: key.master_fingerprint(),
+            key,
+            source: KeySource::Manual,
+            account: None,
+        }
+    }
+
+    async fn insert_key(sandbox: &Sandbox<DefineDescriptor>, coordinate: (usize, usize), key: Key) {
+        sandbox
+            .update(Message::DefineDescriptor(
+                message::DefineDescriptor::KeysEdited(
+                    vec![coordinate],
+                    SelectedKey::New(Box::new(key)),
+                ),
+            ))
+            .await;
     }
 
     #[tokio::test]
@@ -987,6 +1118,217 @@ mod tests {
         sandbox.check(|step| {
             assert!((step).apply(&mut ctx));
             assert!(ctx.hw_is_used);
+        });
+    }
+
+    #[tokio::test]
+    async fn test_define_descriptor_builds_derive_then_aggregate_musig_primary_path() {
+        let mut ctx = Context::new(
+            Network::Signet,
+            LianaDirectory::new(PathBuf::from_str("/").unwrap()),
+            crate::installer::context::RemoteBackend::None,
+        );
+        let sandbox: Sandbox<DefineDescriptor> = Sandbox::new(DefineDescriptor::new(
+            Network::Signet,
+            Arc::new(Mutex::new(Signer::generate(Network::Signet).unwrap())),
+        ));
+        sandbox.load(&ctx).await;
+
+        sandbox.update(Message::CreateTaprootDescriptor(true)).await;
+        sandbox
+            .update(Message::DefineDescriptor(message::DefineDescriptor::Path(
+                0,
+                message::DefinePath::AddKey,
+            )))
+            .await;
+        insert_key(
+            &sandbox,
+            (0, 0),
+            manual_key(
+                "primary_a",
+                "[9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK",
+            ),
+        )
+        .await;
+        insert_key(
+            &sandbox,
+            (0, 1),
+            manual_key(
+                "primary_b",
+                "[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM",
+            ),
+        )
+        .await;
+        insert_key(
+            &sandbox,
+            (1, 0),
+            manual_key(
+                "recovery",
+                "[1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs",
+            ),
+        )
+        .await;
+        sandbox
+            .update(Message::SelectPrimarySpendKind(
+                PrimarySpendKind::MuSig2DeriveThenAggregate,
+            ))
+            .await;
+
+        sandbox.check(|step| {
+            assert!(step.apply(&mut ctx));
+            let policy = ctx.descriptor.as_ref().unwrap().policy();
+            let expr = policy.primary_path().musig().unwrap();
+            assert_eq!(
+                expr.derivation_mode(),
+                MuSig2DerivationMode::DeriveThenAggregate
+            );
+            assert!(expr.aggregate_derivation().is_none());
+            assert!(expr
+                .participants()
+                .iter()
+                .all(|key| matches!(key, DescriptorPublicKey::MultiXPub(_))));
+        });
+    }
+
+    #[tokio::test]
+    async fn test_define_descriptor_builds_aggregate_then_derive_musig_primary_path() {
+        let mut ctx = Context::new(
+            Network::Signet,
+            LianaDirectory::new(PathBuf::from_str("/").unwrap()),
+            crate::installer::context::RemoteBackend::None,
+        );
+        let sandbox: Sandbox<DefineDescriptor> = Sandbox::new(DefineDescriptor::new(
+            Network::Signet,
+            Arc::new(Mutex::new(Signer::generate(Network::Signet).unwrap())),
+        ));
+        sandbox.load(&ctx).await;
+
+        sandbox.update(Message::CreateTaprootDescriptor(true)).await;
+        sandbox
+            .update(Message::DefineDescriptor(message::DefineDescriptor::Path(
+                0,
+                message::DefinePath::AddKey,
+            )))
+            .await;
+        insert_key(
+            &sandbox,
+            (0, 0),
+            manual_key(
+                "primary_a",
+                "[9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK",
+            ),
+        )
+        .await;
+        insert_key(
+            &sandbox,
+            (0, 1),
+            manual_key(
+                "primary_b",
+                "[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM",
+            ),
+        )
+        .await;
+        insert_key(
+            &sandbox,
+            (1, 0),
+            manual_key(
+                "recovery",
+                "[1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs",
+            ),
+        )
+        .await;
+        sandbox
+            .update(Message::SelectPrimarySpendKind(
+                PrimarySpendKind::MuSig2AggregateThenDeriveBip328,
+            ))
+            .await;
+
+        sandbox.check(|step| {
+            assert!(step.apply(&mut ctx));
+            let policy = ctx.descriptor.as_ref().unwrap().policy();
+            let expr = policy.primary_path().musig().unwrap();
+            assert_eq!(
+                expr.derivation_mode(),
+                MuSig2DerivationMode::AggregateThenDeriveBip328
+            );
+            assert!(expr.aggregate_derivation().is_some());
+            assert!(expr
+                .participants()
+                .iter()
+                .all(|key| matches!(key, DescriptorPublicKey::XPub(_))));
+        });
+    }
+
+    #[tokio::test]
+    async fn test_define_descriptor_resets_musig_mode_when_primary_path_stops_matching_n_of_n() {
+        let mut ctx = Context::new(
+            Network::Signet,
+            LianaDirectory::new(PathBuf::from_str("/").unwrap()),
+            crate::installer::context::RemoteBackend::None,
+        );
+        let sandbox: Sandbox<DefineDescriptor> = Sandbox::new(DefineDescriptor::new(
+            Network::Signet,
+            Arc::new(Mutex::new(Signer::generate(Network::Signet).unwrap())),
+        ));
+        sandbox.load(&ctx).await;
+
+        sandbox.update(Message::CreateTaprootDescriptor(true)).await;
+        sandbox
+            .update(Message::DefineDescriptor(message::DefineDescriptor::Path(
+                0,
+                message::DefinePath::AddKey,
+            )))
+            .await;
+        insert_key(
+            &sandbox,
+            (0, 0),
+            manual_key(
+                "primary_a",
+                "[9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK",
+            ),
+        )
+        .await;
+        insert_key(
+            &sandbox,
+            (0, 1),
+            manual_key(
+                "primary_b",
+                "[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM",
+            ),
+        )
+        .await;
+        insert_key(
+            &sandbox,
+            (1, 0),
+            manual_key(
+                "recovery",
+                "[1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs",
+            ),
+        )
+        .await;
+        sandbox
+            .update(Message::SelectPrimarySpendKind(
+                PrimarySpendKind::MuSig2AggregateThenDeriveBip328,
+            ))
+            .await;
+        sandbox
+            .update(Message::DefineDescriptor(message::DefineDescriptor::Path(
+                0,
+                message::DefinePath::ThresholdEdited(1),
+            )))
+            .await;
+
+        sandbox.check(|step| {
+            assert_eq!(step.primary_spend, PrimarySpendKind::ScriptPath);
+            assert!(step.apply(&mut ctx));
+            assert!(ctx
+                .descriptor
+                .as_ref()
+                .unwrap()
+                .policy()
+                .primary_path()
+                .musig()
+                .is_none());
         });
     }
 }

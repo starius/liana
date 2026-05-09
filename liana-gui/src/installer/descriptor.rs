@@ -1,7 +1,10 @@
 use async_hwi::{DeviceKind, Version};
-use liana::miniscript::{
-    bitcoin::bip32::{ChildNumber, Fingerprint},
-    descriptor::DescriptorPublicKey,
+use liana::{
+    descriptors::MuSig2DerivationMode,
+    miniscript::{
+        bitcoin::bip32::{ChildNumber, Fingerprint},
+        descriptor::DescriptorPublicKey,
+    },
 };
 
 use crate::{app::settings::ProviderKey, hw::is_compatible_with_tapminiscript};
@@ -245,6 +248,37 @@ impl PathWarning {
             Self::OnlyCosignerKeys => "A path cannot contain only cosigner keys.",
             Self::KeySourceKindDisallowed => {
                 "Path contains a key that is disallowed for this kind of path."
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimarySpendKind {
+    ScriptPath,
+    MuSig2DeriveThenAggregate,
+    MuSig2AggregateThenDeriveBip328,
+}
+
+impl PrimarySpendKind {
+    pub fn musig_mode(&self) -> Option<MuSig2DerivationMode> {
+        match self {
+            Self::ScriptPath => None,
+            Self::MuSig2DeriveThenAggregate => Some(MuSig2DerivationMode::DeriveThenAggregate),
+            Self::MuSig2AggregateThenDeriveBip328 => {
+                Some(MuSig2DerivationMode::AggregateThenDeriveBip328)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for PrimarySpendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ScriptPath => write!(f, "Script path"),
+            Self::MuSig2DeriveThenAggregate => write!(f, "MuSig2: derive then aggregate"),
+            Self::MuSig2AggregateThenDeriveBip328 => {
+                write!(f, "MuSig2: aggregate then derive (BIP 328)")
             }
         }
     }

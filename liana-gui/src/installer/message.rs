@@ -24,7 +24,10 @@ use crate::{
     download::{DownloadError, Progress},
     export::ImportExportMessage,
     hw::HardwareWalletMessage,
-    installer::{decrypt::Decrypt, descriptor::PathKind},
+    installer::{
+        decrypt::Decrypt,
+        descriptor::{PathKind, PrimarySpendKind},
+    },
     node::{
         bitcoind::{Bitcoind, ConfigField, RpcAuthType},
         electrum, NodeType,
@@ -48,6 +51,7 @@ pub enum Message {
     UseHotSigner,
     Installed(settings::WalletId, Result<settings::WalletSettings, Error>),
     CreateTaprootDescriptor(bool),
+    SelectPrimarySpendKind(PrimarySpendKind),
     SelectDescriptorTemplate(context::DescriptorTemplate),
     SelectBackend(SelectBackend),
     ImportRemoteWallet(ImportRemoteWallet),

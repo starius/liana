@@ -56,6 +56,8 @@ pub fn custom_template_description(progress: (usize, usize)) -> Element<'static,
 pub fn custom_template<'a>(
     progress: (usize, usize),
     use_taproot: bool,
+    primary_spend: crate::installer::descriptor::PrimarySpendKind,
+    allow_musig: bool,
     primary_path: &'a Path,
     recovery_paths: &mut dyn Iterator<Item = (usize, &'a Path)>,
     safety_net_path: Option<(usize, &'a Path)>,
@@ -82,7 +84,7 @@ pub fn custom_template<'a>(
                         .spacing(10)
                         .push(text("Advanced settings").small().bold())
                         .push(icon::collapsed_icon()),
-                    define_descriptor_advanced_settings(use_taproot),
+                    define_descriptor_advanced_settings(use_taproot, primary_spend, allow_musig),
                 )
                 .style(theme::button::transparent),
             )
