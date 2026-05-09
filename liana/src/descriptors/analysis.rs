@@ -375,6 +375,84 @@ impl PathInfo {
     }
 }
 
+/// The two MuSig2 derivation modes Liana will support for a primary Taproot key path.
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Ord, PartialOrd, Hash)]
+pub enum MuSig2DerivationMode {
+    /// Derive the participant keys first and then aggregate them into a MuSig2 key.
+    DeriveThenAggregate,
+    /// Aggregate the participant xpubs first and then derive from the synthetic BIP328 xpub.
+    AggregateThenDeriveBip328,
+}
+
+/// Information about the primary spending path in the descriptor.
+///
+/// This is kept distinct from recovery paths so Taproot-only primary path types such as MuSig2
+/// can be introduced without overloading the semantics of `PathInfo`.
+#[derive(Debug, Eq, PartialEq, Clone, Ord, PartialOrd, Hash)]
+pub struct PrimaryPathInfo(PathInfo);
+
+impl PrimaryPathInfo {
+    pub fn from_key_path(path: PathInfo) -> Self {
+        Self(path)
+    }
+
+    pub fn from_primary_path(
+        policy: SemanticPolicy<descriptor::DescriptorPublicKey>,
+    ) -> Result<Self, LianaPolicyError> {
+        PathInfo::from_primary_path(policy).map(Self)
+    }
+
+    pub fn as_key_path(&self) -> &PathInfo {
+        &self.0
+    }
+
+    pub fn into_key_path(self) -> PathInfo {
+        self.0
+    }
+
+    pub fn with_added_key(self, key: descriptor::DescriptorPublicKey) -> Self {
+        Self(self.0.with_added_key(key))
+    }
+
+    pub fn thresh_origins(
+        &self,
+    ) -> (
+        usize,
+        HashMap<bip32::Fingerprint, HashSet<bip32::DerivationPath>>,
+    ) {
+        self.0.thresh_origins()
+    }
+
+    pub fn spend_info<'a>(
+        &self,
+        all_pubkeys_signed: impl Iterator<Item = &'a (bip32::Fingerprint, bip32::DerivationPath)>,
+    ) -> PathSpendInfo {
+        self.0.spend_info(all_pubkeys_signed)
+    }
+
+    pub fn into_ms_policy(
+        self,
+    ) -> Result<ConcretePolicy<descriptor::DescriptorPublicKey>, LianaPolicyError> {
+        self.0.into_ms_policy()
+    }
+
+    pub fn contains_fingerprint(&self, fingerprint: Fingerprint) -> bool {
+        self.0.contains_fingerprint(fingerprint)
+    }
+}
+
+impl From<PathInfo> for PrimaryPathInfo {
+    fn from(path: PathInfo) -> Self {
+        Self::from_key_path(path)
+    }
+}
+
+impl PartialEq<PathInfo> for PrimaryPathInfo {
+    fn eq(&self, other: &PathInfo) -> bool {
+        self.as_key_path() == other
+    }
+}
+
 // See
 // https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki#constructing-and-spending-taproot-outputs:
 // > One example of such a point is H =
@@ -471,7 +549,7 @@ pub fn unspendable_internal_key(
 /// **cannot roundtrip** a descriptor through a `LianaPolicy`.
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub struct LianaPolicy {
-    pub(super) primary_path: PathInfo,
+    pub(super) primary_path: PrimaryPathInfo,
     pub(super) recovery_paths: BTreeMap<u16, PathInfo>,
     is_taproot: bool,
 }
@@ -482,7 +560,7 @@ impl LianaPolicy {
     /// `compile` controls whether to check the policy compiles
     /// to miniscript before returning.
     fn _new(
-        primary_path: PathInfo,
+        primary_path: PrimaryPathInfo,
         recovery_paths: BTreeMap<u16, PathInfo>,
         is_taproot: bool,
         compile: bool,
@@ -506,11 +584,11 @@ impl LianaPolicy {
         // Note while the Miniscript compiler does check for duplicate, it does so at the
         // "descriptor key expression" level. We don't want duplicate xpubs at all so we do it
         // ourselves here.
-        let spending_paths = recovery_paths
-            .values()
-            .chain(std::iter::once(&primary_path));
         let mut key_checker = DescKeyChecker::new();
-        for path in spending_paths {
+        for path in recovery_paths
+            .values()
+            .chain(std::iter::once(primary_path.as_key_path()))
+        {
             match path {
                 PathInfo::Single(ref key) => {
                     let _ = key_checker.check(key)?;
@@ -552,6 +630,13 @@ impl LianaPolicy {
         primary_path: PathInfo,
         recovery_paths: BTreeMap<u16, PathInfo>,
     ) -> Result<LianaPolicy, LianaPolicyError> {
+        Self::new_with_primary_info(primary_path.into(), recovery_paths)
+    }
+
+    pub fn new_with_primary_info(
+        primary_path: PrimaryPathInfo,
+        recovery_paths: BTreeMap<u16, PathInfo>,
+    ) -> Result<LianaPolicy, LianaPolicyError> {
         Self::_new(
             primary_path,
             recovery_paths,
@@ -563,6 +648,13 @@ impl LianaPolicy {
     /// Create a new Liana policy for use under a P2WSH context.
     pub fn new_legacy(
         primary_path: PathInfo,
+        recovery_paths: BTreeMap<u16, PathInfo>,
+    ) -> Result<LianaPolicy, LianaPolicyError> {
+        Self::new_legacy_with_primary_info(primary_path.into(), recovery_paths)
+    }
+
+    pub fn new_legacy_with_primary_info(
+        primary_path: PrimaryPathInfo,
         recovery_paths: BTreeMap<u16, PathInfo>,
     ) -> Result<LianaPolicy, LianaPolicyError> {
         Self::_new(
@@ -628,7 +720,7 @@ impl LianaPolicy {
 
         // Fetch all spending paths' semantic policies. The primary path is identified as the only
         // one that isn't timelocked.
-        let (mut primary_path, mut recovery_paths) = (None::<PathInfo>, BTreeMap::new());
+        let (mut primary_path, mut recovery_paths) = (None::<PrimaryPathInfo>, BTreeMap::new());
         for sub in subs {
             // Rust-Miniscript now forces the policy in thresholds to be wrapped into an Arc. Since
             // we lift the policy from the descriptor right above, there is necessarily a single
@@ -650,7 +742,7 @@ impl LianaPolicy {
                         return Err(LianaPolicyError::IncompatibleDesc);
                     }
                 } else {
-                    primary_path = Some(PathInfo::from_primary_path(sub)?);
+                    primary_path = Some(PrimaryPathInfo::from_primary_path(sub)?);
                 }
             } else {
                 // If it's not a simple (multi)key check, it must be (one of) the timelocked
@@ -677,7 +769,7 @@ impl LianaPolicy {
         )
     }
 
-    pub fn primary_path(&self) -> &PathInfo {
+    pub fn primary_path(&self) -> &PrimaryPathInfo {
         &self.primary_path
     }
 

@@ -629,7 +629,7 @@ impl LianaDescriptor {
                     .get(tl)
                     .expect("Same timelocks must be keys in both mappings.")
             })
-            .unwrap_or(&policy.primary_path);
+            .unwrap_or(policy.primary_path.as_key_path());
         Ok(self.prune_bip32_derivs(psbt, path_info))
     }
 
@@ -2124,7 +2124,7 @@ mod tests {
         // Prune the PSBT. It should result in the same as when manually pruned using bip174.org.
         assert_ne!(psbt, pruned_psbt);
         let prim_path_info = desc.policy().primary_path;
-        let psbt = desc.prune_bip32_derivs(psbt, &prim_path_info);
+        let psbt = desc.prune_bip32_derivs(psbt, prim_path_info.as_key_path());
         assert_eq!(psbt, pruned_psbt);
 
         // After pruning it the PSBT only has an entry per key in the primary path.
@@ -2185,7 +2185,7 @@ mod tests {
                 .cloned()
                 .collect();
         assert_eq!(tap_psbt.inputs[0].tap_key_origins.len(), 1);
-        let tap_psbt = tap_desc.prune_bip32_derivs(tap_psbt, &prim_path_info);
+        let tap_psbt = tap_desc.prune_bip32_derivs(tap_psbt, prim_path_info.as_key_path());
         assert_eq!(tap_psbt.inputs[0].tap_key_origins.len(), 1);
         let mut tap_psbt = tap_desc.prune_bip32_derivs(tap_psbt, rec_path_info);
         assert!(tap_psbt.inputs[0].tap_key_origins.is_empty());
@@ -2200,7 +2200,7 @@ mod tests {
         assert_eq!(tap_psbt.inputs[0].tap_key_origins.len(), 1);
         let tap_psbt = tap_desc.prune_bip32_derivs(tap_psbt, rec_path_info);
         assert_eq!(tap_psbt.inputs[0].tap_key_origins.len(), 1);
-        let tap_psbt = tap_desc.prune_bip32_derivs(tap_psbt, &prim_path_info);
+        let tap_psbt = tap_desc.prune_bip32_derivs(tap_psbt, prim_path_info.as_key_path());
         assert!(tap_psbt.inputs[0].tap_key_origins.is_empty());
     }
 
