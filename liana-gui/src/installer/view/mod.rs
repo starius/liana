@@ -1941,7 +1941,7 @@ pub fn choose_backend(progress: (usize, usize)) -> Element<'static, Message> {
                         Column::new()
                             .spacing(20)
                             .width(Length::FillPortion(1))
-                            .push(h3("Use your own node"))
+                            .push(h3("Use a local Bitcoin backend"))
                             .push(text::p2_medium(LOCAL_WALLET_DESC).style(theme::text::secondary)),
                     )
                     .push(
