@@ -15,7 +15,7 @@ const BIP328_SYNTHETIC_CHAINCODE: [u8; 32] = [
     0x2d, 0x32, 0xcb, 0x45, 0x71, 0x71, 0x67, 0xe3, 0x00, 0x62, 0x2c, 0x71, 0x67, 0xe3, 0x89, 0x65,
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AggregateKeyDerivation {
     suffix: String,
     derivation_paths: descriptor::DerivPaths,
@@ -76,7 +76,7 @@ impl fmt::Display for AggregateKeyDerivation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MuSig2KeyExpr {
     participants: Vec<DescriptorPublicKey>,
     derivation_mode: MuSig2DerivationMode,

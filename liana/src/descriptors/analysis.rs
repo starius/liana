@@ -18,6 +18,8 @@ use std::{
     sync,
 };
 
+use crate::descriptors::musig::MuSig2KeyExpr;
+
 #[derive(Debug)]
 pub enum LianaPolicyError {
     MissingRecoveryPath,
@@ -127,13 +129,15 @@ impl DescKeyChecker {
         &mut self,
         key: &descriptor::DescriptorPublicKey,
     ) -> Result<bip32::Fingerprint, LianaPolicyError> {
+        let key_identifier = desc_key_identifier(key)
+            .ok_or_else(|| LianaPolicyError::InvalidKey(key.clone().into()))?;
+        // First make sure it's not a duplicate and record seeing it.
+        if self.keys_set.contains(&key_identifier) {
+            return Err(LianaPolicyError::DuplicateKey(key.clone().into()));
+        }
+        self.keys_set.insert(key_identifier);
+
         if let descriptor::DescriptorPublicKey::MultiXPub(ref xpub) = *key {
-            let key_identifier = (xpub.xkey, xpub.derivation_paths.clone());
-            // First make sure it's not a duplicate and record seeing it.
-            if self.keys_set.contains(&key_identifier) {
-                return Err(LianaPolicyError::DuplicateKey(key.clone().into()));
-            }
-            self.keys_set.insert(key_identifier);
             // Then perform the contextless checks (origin, deriv paths, ..).
             // Technically the xpub could be for the master xpub and not have an origin. But it's
             // unlikely (and easily fixable) while users shooting themselves in the foot by
@@ -151,6 +155,61 @@ impl DescKeyChecker {
             }
         }
         Err(LianaPolicyError::InvalidKey(key.clone().into()))
+    }
+
+    pub fn check_musig_participant(
+        &mut self,
+        key: &descriptor::DescriptorPublicKey,
+        derivation_mode: MuSig2DerivationMode,
+    ) -> Result<bip32::Fingerprint, LianaPolicyError> {
+        let key_identifier = desc_key_identifier(key)
+            .ok_or_else(|| LianaPolicyError::InvalidMuSig2Participant(key.clone().into()))?;
+        if self.keys_set.contains(&key_identifier) {
+            return Err(LianaPolicyError::DuplicateKey(key.clone().into()));
+        }
+        self.keys_set.insert(key_identifier);
+
+        match (derivation_mode, key) {
+            (
+                MuSig2DerivationMode::DeriveThenAggregate,
+                descriptor::DescriptorPublicKey::MultiXPub(xpub),
+            ) => {
+                if let Some(origin) = &xpub.origin {
+                    let der_paths = xpub.derivation_paths.paths();
+                    let valid = xpub.wildcard == descriptor::Wildcard::Unhardened
+                        && der_paths.len() == 2
+                        && der_paths.iter().flatten().all(|step| step.is_normal());
+                    if valid {
+                        return Ok(origin.0);
+                    }
+                }
+                Err(LianaPolicyError::InvalidMuSig2Participant(
+                    key.clone().into(),
+                ))
+            }
+            (
+                MuSig2DerivationMode::AggregateThenDeriveBip328,
+                descriptor::DescriptorPublicKey::XPub(xpub),
+            ) => {
+                if let Some(origin) = &xpub.origin {
+                    let valid = xpub.wildcard == descriptor::Wildcard::None
+                        && xpub
+                            .derivation_path
+                            .as_ref()
+                            .iter()
+                            .all(|step| step.is_normal());
+                    if valid {
+                        return Ok(origin.0);
+                    }
+                }
+                Err(LianaPolicyError::InvalidMuSig2Participant(
+                    key.clone().into(),
+                ))
+            }
+            _ => Err(LianaPolicyError::InvalidMuSig2Participant(
+                key.clone().into(),
+            )),
+        }
     }
 }
 
@@ -171,6 +230,21 @@ fn csv_check(csv_value: u32) -> Result<u16, LianaPolicyError> {
 
 // Get the fingerprint and the full derivation paths (path from the master fingerprint in the
 // origin, with the xpub derivation path appended) for a multipath xpub.
+fn desc_key_identifier(
+    key: &descriptor::DescriptorPublicKey,
+) -> Option<(bip32::Xpub, descriptor::DerivPaths)> {
+    match key {
+        descriptor::DescriptorPublicKey::MultiXPub(xpub) => {
+            Some((xpub.xkey, xpub.derivation_paths.clone()))
+        }
+        descriptor::DescriptorPublicKey::XPub(xpub) => Some((
+            xpub.xkey,
+            descriptor::DerivPaths::new(vec![xpub.derivation_path.clone()])?,
+        )),
+        _ => None,
+    }
+}
+
 fn key_origins(
     key: &descriptor::DescriptorPublicKey,
 ) -> Option<(bip32::Fingerprint, HashSet<bip32::DerivationPath>)> {
@@ -187,6 +261,19 @@ fn key_origins(
                             .collect(),
                     );
                 }
+                (*fg, der_paths)
+            })
+        }
+        descriptor::DescriptorPublicKey::XPub(ref xpub) => {
+            xpub.origin.as_ref().map(|(fg, orig_path)| {
+                let mut der_paths = HashSet::with_capacity(1);
+                der_paths.insert(
+                    orig_path
+                        .into_iter()
+                        .chain(xpub.derivation_path.as_ref().iter())
+                        .copied()
+                        .collect(),
+                );
                 (*fg, der_paths)
             })
         }
@@ -414,6 +501,7 @@ pub enum MuSig2DerivationMode {
 #[derive(Debug, Eq, PartialEq, Clone, Ord, PartialOrd, Hash)]
 pub enum PrimaryPathInfo {
     KeyPath(PathInfo),
+    MuSig2(MuSig2KeyExpr),
 }
 
 impl PrimaryPathInfo {
@@ -430,18 +518,31 @@ impl PrimaryPathInfo {
     pub fn as_key_path(&self) -> Option<&PathInfo> {
         match self {
             Self::KeyPath(path) => Some(path),
+            Self::MuSig2(_) => None,
         }
     }
 
     pub fn into_key_path(self) -> Option<PathInfo> {
         match self {
             Self::KeyPath(path) => Some(path),
+            Self::MuSig2(_) => None,
         }
     }
 
-    pub fn with_added_key(self, key: descriptor::DescriptorPublicKey) -> Self {
+    pub fn musig(&self) -> Option<&MuSig2KeyExpr> {
         match self {
-            Self::KeyPath(path) => Self::KeyPath(path.with_added_key(key)),
+            Self::MuSig2(expr) => Some(expr),
+            Self::KeyPath(_) => None,
+        }
+    }
+
+    pub fn with_added_key(
+        self,
+        key: descriptor::DescriptorPublicKey,
+    ) -> Result<Self, LianaPolicyError> {
+        match self {
+            Self::KeyPath(path) => Ok(Self::KeyPath(path.with_added_key(key))),
+            Self::MuSig2(_) => Err(LianaPolicyError::IncompatibleDesc),
         }
     }
 
@@ -453,6 +554,16 @@ impl PrimaryPathInfo {
     ) {
         match self {
             Self::KeyPath(path) => path.thresh_origins(),
+            Self::MuSig2(expr) => {
+                let mut origins: HashMap<_, HashSet<bip32::DerivationPath>> =
+                    HashMap::with_capacity(expr.participants().len());
+                for key in expr.participants() {
+                    if let Some((fg, der_paths)) = key_origins(key) {
+                        origins.entry(fg).or_default().extend(der_paths);
+                    }
+                }
+                (expr.participants().len(), origins)
+            }
         }
     }
 
@@ -462,6 +573,26 @@ impl PrimaryPathInfo {
     ) -> PathSpendInfo {
         match self {
             Self::KeyPath(path) => path.spend_info(all_pubkeys_signed),
+            Self::MuSig2(_) => {
+                let (threshold, path_origins) = self.thresh_origins();
+                let mut sigs_count = 0;
+                let mut signed_pubkeys = HashMap::with_capacity(path_origins.len());
+                for (fg, der_path) in all_pubkeys_signed {
+                    if path_origins
+                        .get(fg)
+                        .map(|known_paths| known_paths.contains(der_path))
+                        .unwrap_or(false)
+                    {
+                        sigs_count += 1;
+                        *signed_pubkeys.entry(*fg).or_insert(0) += 1;
+                    }
+                }
+                PathSpendInfo {
+                    threshold,
+                    sigs_count,
+                    signed_pubkeys,
+                }
+            }
         }
     }
 
@@ -470,12 +601,18 @@ impl PrimaryPathInfo {
     ) -> Result<ConcretePolicy<descriptor::DescriptorPublicKey>, LianaPolicyError> {
         match self {
             Self::KeyPath(path) => path.into_ms_policy(),
+            Self::MuSig2(_) => Err(LianaPolicyError::InvalidMuSig2Expression),
         }
     }
 
     pub fn contains_fingerprint(&self, fingerprint: Fingerprint) -> bool {
         match self {
             Self::KeyPath(path) => path.contains_fingerprint(fingerprint),
+            Self::MuSig2(expr) => expr
+                .participants()
+                .iter()
+                .filter_map(|key| key_origins(key))
+                .any(|(fg, _)| fg == fingerprint),
         }
     }
 }
@@ -624,11 +761,7 @@ impl LianaPolicy {
         // "descriptor key expression" level. We don't want duplicate xpubs at all so we do it
         // ourselves here.
         let mut key_checker = DescKeyChecker::new();
-        for path in recovery_paths.values().chain(std::iter::once(
-            primary_path
-                .as_key_path()
-                .expect("Current Liana primary paths are plain key paths."),
-        )) {
+        for path in recovery_paths.values() {
             match path {
                 PathInfo::Single(ref key) => {
                     let _ = key_checker.check(key)?;
@@ -649,6 +782,51 @@ impl LianaPolicy {
                         }
                         origin_fingerprints.insert(fg);
                     }
+                }
+            }
+        }
+        match &primary_path {
+            PrimaryPathInfo::KeyPath(path) => match path {
+                PathInfo::Single(ref key) => {
+                    let _ = key_checker.check(key)?;
+                }
+                PathInfo::Multi(_, ref keys) => {
+                    let mut origin_fingerprints = HashSet::with_capacity(keys.len());
+                    for key in keys {
+                        let fg = key_checker.check(key)?;
+                        if origin_fingerprints.contains(&fg) {
+                            return Err(LianaPolicyError::DuplicateOriginSamePath(
+                                key.clone().into(),
+                            ));
+                        }
+                        origin_fingerprints.insert(fg);
+                    }
+                }
+            },
+            PrimaryPathInfo::MuSig2(expr) => {
+                if !is_taproot {
+                    return Err(LianaPolicyError::TaprootOnlyMuSig2);
+                }
+                if expr.derivation_mode() == MuSig2DerivationMode::AggregateThenDeriveBip328 {
+                    let aggregate_derivation = expr
+                        .aggregate_derivation()
+                        .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+                    let valid_liana_receive_change = aggregate_derivation.wildcard()
+                        == descriptor::Wildcard::Unhardened
+                        && aggregate_derivation.derivation_paths().paths().len() == 2;
+                    if !valid_liana_receive_change {
+                        return Err(LianaPolicyError::InvalidMuSig2Expression);
+                    }
+                }
+                let mut origin_fingerprints = HashSet::with_capacity(expr.participants().len());
+                for key in expr.participants() {
+                    let fg = key_checker.check_musig_participant(key, expr.derivation_mode())?;
+                    if origin_fingerprints.contains(&fg) {
+                        return Err(LianaPolicyError::DuplicateOriginSamePath(
+                            key.clone().into(),
+                        ));
+                    }
+                    origin_fingerprints.insert(fg);
                 }
             }
         }
@@ -777,7 +955,7 @@ impl LianaPolicy {
                 // thresh(2, older(42), pk(C)))`.
                 if let Some(prim_path) = primary_path {
                     if let SemanticPolicy::Key(key) = sub {
-                        primary_path = Some(prim_path.with_added_key(key.clone()));
+                        primary_path = Some(prim_path.with_added_key(key.clone())?);
                     } else {
                         return Err(LianaPolicyError::IncompatibleDesc);
                     }
@@ -970,6 +1148,18 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
+    fn recovery_paths() -> BTreeMap<u16, PathInfo> {
+        BTreeMap::from([(
+            42,
+            PathInfo::Single(
+                descriptor::DescriptorPublicKey::from_str(
+                    "[1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/<0;1>/*",
+                )
+                .unwrap(),
+            ),
+        )])
+    }
+
     #[test]
     fn valid_key() {
         let xpub_str =
@@ -1028,6 +1218,69 @@ mod tests {
         assert!(matches!(
             checker.check(&key),
             Err(LianaPolicyError::InvalidKey(k)) if k == key.into()
+        ));
+    }
+
+    #[test]
+    fn valid_musig_primary_path() {
+        let expr = MuSig2KeyExpr::from_str(
+            "musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<0;1>/*,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/<0;1>/*)"
+        )
+        .unwrap();
+        let primary_path = PrimaryPathInfo::MuSig2(expr);
+        let policy =
+            LianaPolicy::_new(primary_path.clone(), recovery_paths(), true, false).unwrap();
+
+        assert_eq!(policy.primary_path(), &primary_path);
+        assert!(policy
+            .primary_path()
+            .contains_fingerprint(Fingerprint::from_str("9e1c1983").unwrap()));
+        assert!(policy
+            .primary_path()
+            .contains_fingerprint(Fingerprint::from_str("3b1913e1").unwrap()));
+    }
+
+    #[test]
+    fn reject_musig_legacy_policy() {
+        let expr = MuSig2KeyExpr::from_str(
+            "musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<0;1>/*,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/<0;1>/*)"
+        )
+        .unwrap();
+
+        assert!(matches!(
+            LianaPolicy::_new(
+                PrimaryPathInfo::MuSig2(expr),
+                recovery_paths(),
+                false,
+                false
+            ),
+            Err(LianaPolicyError::TaprootOnlyMuSig2)
+        ));
+    }
+
+    #[test]
+    fn reject_musig_duplicate_origin_same_path() {
+        let expr = MuSig2KeyExpr::from_str(
+            "musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<0;1>/*,[9e1c1983/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/<0;1>/*)"
+        )
+        .unwrap();
+
+        assert!(matches!(
+            LianaPolicy::_new(PrimaryPathInfo::MuSig2(expr), recovery_paths(), true, false),
+            Err(LianaPolicyError::DuplicateOriginSamePath(_))
+        ));
+    }
+
+    #[test]
+    fn reject_musig_without_receive_change_multipath() {
+        let expr = MuSig2KeyExpr::from_str(
+            "musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM)/0/*"
+        )
+        .unwrap();
+
+        assert!(matches!(
+            LianaPolicy::_new(PrimaryPathInfo::MuSig2(expr), recovery_paths(), true, false),
+            Err(LianaPolicyError::InvalidMuSig2Expression)
         ));
     }
 }
