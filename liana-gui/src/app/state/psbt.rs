@@ -6,7 +6,11 @@ use iced::Subscription;
 use iced::Task;
 use liana::{
     descriptors::LianaPolicy,
-    miniscript::bitcoin::{bip32::Fingerprint, psbt::Psbt, Network, Txid},
+    miniscript::bitcoin::{
+        bip32::Fingerprint,
+        psbt::{Input as PsbtIn, Psbt},
+        Network, Txid,
+    },
 };
 use lianad::commands::CoinStatus;
 
@@ -614,6 +618,42 @@ impl Modal for SignModal {
     }
 }
 
+fn merge_psbt_input_signing_data(psbt_in: &mut PsbtIn, signed_psbt_in: &PsbtIn) {
+    psbt_in.partial_sigs.extend(
+        signed_psbt_in
+            .partial_sigs
+            .iter()
+            .map(|(pk, sig)| (*pk, *sig)),
+    );
+    psbt_in.tap_script_sigs.extend(
+        signed_psbt_in
+            .tap_script_sigs
+            .iter()
+            .map(|(key, sig)| (*key, *sig)),
+    );
+    psbt_in.tap_key_origins.extend(
+        signed_psbt_in
+            .tap_key_origins
+            .iter()
+            .map(|(key, origin)| (*key, origin.clone())),
+    );
+    psbt_in.unknown.extend(
+        signed_psbt_in
+            .unknown
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    psbt_in.proprietary.extend(
+        signed_psbt_in
+            .proprietary
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    if let Some(sig) = signed_psbt_in.tap_key_sig {
+        psbt_in.tap_key_sig = Some(sig);
+    }
+}
+
 fn merge_signatures(psbt: &mut Psbt, signed_psbt: &Psbt) {
     for i in 0..signed_psbt.inputs.len() {
         let psbtin = match psbt.inputs.get_mut(i) {
@@ -624,15 +664,7 @@ fn merge_signatures(psbt: &mut Psbt, signed_psbt: &Psbt) {
             Some(signed_psbtin) => signed_psbtin,
             None => continue,
         };
-        psbtin
-            .partial_sigs
-            .extend(&mut signed_psbtin.partial_sigs.iter());
-        psbtin
-            .tap_script_sigs
-            .extend(&mut signed_psbtin.tap_script_sigs.iter());
-        if let Some(sig) = signed_psbtin.tap_key_sig {
-            psbtin.tap_key_sig = Some(sig);
-        }
+        merge_psbt_input_signing_data(psbtin, signed_psbtin);
     }
 }
 
@@ -674,15 +706,7 @@ async fn sign_psbt(
         hw.sign_tx(&mut pruned_psbt).await.map_err(Error::from)?;
         for (i, psbt_in) in psbt.inputs.iter_mut().enumerate() {
             if let Some(pruned_psbt_in) = pruned_psbt.inputs.get_mut(i) {
-                psbt_in
-                    .partial_sigs
-                    .append(&mut pruned_psbt_in.partial_sigs);
-                if let Some(tap_key_sig) = pruned_psbt_in.tap_key_sig {
-                    psbt_in.tap_key_sig = Some(tap_key_sig);
-                }
-                psbt_in
-                    .tap_script_sigs
-                    .append(&mut pruned_psbt_in.tap_script_sigs);
+                merge_psbt_input_signing_data(psbt_in, pruned_psbt_in);
             } else {
                 log::error!(
                     "Not all PSBT inputs are present in the pruned psbt. Pruned psbt: '{}'.",
@@ -706,10 +730,61 @@ mod tests {
     };
 
     use liana::descriptors::LianaDescriptor;
+    use liana::miniscript::bitcoin::{
+        absolute, psbt::raw, transaction::Version, Amount, OutPoint, ScriptBuf, Sequence,
+        Transaction, TxIn, TxOut, Witness,
+    };
     use serde_json::json;
     use std::str::FromStr;
 
     const DESC: &str = "wsh(or_d(multi(2,[f714c228/48'/1'/0'/2']tpubDEwJnTwfKoMvu8AXXBPydBVWDpzNP5tatjjZ56q4TQioGL7iL9xzTbMoCCQ3tfGihtff7vtR4xsjcRuhZ7HWARVAkGZ1HZcpBhVdou76k7j/<0;1>/*,[2522f23c/48'/1'/0'/2']tpubDEoTU4bDW1EXN1rnLXnRfue1a7DeqjJcs39PkEeLcVXhVKzCnFo9yQX2EeeXJ6kh4hgbz5o9v7YAc1EE97AEJpJbKNmDxE3ZQo4msGPSp2J/<0;1>/*),and_v(v:thresh(1,pkh([f714c228/48'/1'/0'/2']tpubDEwJnTwfKoMvu8AXXBPydBVWDpzNP5tatjjZ56q4TQioGL7iL9xzTbMoCCQ3tfGihtff7vtR4xsjcRuhZ7HWARVAkGZ1HZcpBhVdou76k7j/<2;3>/*),a:pkh([2522f23c/48'/1'/0'/2']tpubDEoTU4bDW1EXN1rnLXnRfue1a7DeqjJcs39PkEeLcVXhVKzCnFo9yQX2EeeXJ6kh4hgbz5o9v7YAc1EE97AEJpJbKNmDxE3ZQo4msGPSp2J/<2;3>/*)),older(65535))))#9s8ekrce";
+
+    fn dummy_psbt() -> Psbt {
+        Psbt::from_unsigned_tx(Transaction {
+            version: Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn merge_signatures_preserves_unknown_and_proprietary_fields() {
+        let mut psbt = dummy_psbt();
+        let mut signed_psbt = dummy_psbt();
+        signed_psbt.inputs[0].unknown.insert(
+            raw::Key {
+                type_value: 0x1a,
+                key: vec![1, 2, 3],
+            },
+            vec![4, 5, 6],
+        );
+        signed_psbt.inputs[0].proprietary.insert(
+            raw::ProprietaryKey {
+                prefix: b"musig2".to_vec(),
+                subtype: 1,
+                key: vec![7, 8],
+            },
+            vec![9, 10],
+        );
+
+        merge_signatures(&mut psbt, &signed_psbt);
+
+        assert_eq!(psbt.inputs[0].unknown, signed_psbt.inputs[0].unknown);
+        assert_eq!(
+            psbt.inputs[0].proprietary,
+            signed_psbt.inputs[0].proprietary
+        );
+    }
 
     #[tokio::test]
     async fn test_update_psbt() {

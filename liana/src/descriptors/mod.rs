@@ -175,6 +175,34 @@ fn musig2_primary_spend_info(
     }
 }
 
+fn prune_musig2_primary_derivs(
+    mut psbt: Psbt,
+    path_origins: &HashMap<bip32::Fingerprint, HashSet<bip32::DerivationPath>>,
+) -> Psbt {
+    let participant_is_for_path =
+        |fg: &bip32::Fingerprint, der_path: &bip32::DerivationPath| -> bool {
+            path_origins
+                .get(fg)
+                .map(|known_paths| known_paths.contains(der_path))
+                .unwrap_or(false)
+                || key_is_for_path(path_origins, fg, der_path)
+        };
+
+    for psbt_in in psbt.inputs.iter_mut() {
+        let tap_internal_key = psbt_in.tap_internal_key;
+        psbt_in
+            .bip32_derivation
+            .retain(|_, (fg, der_path)| key_is_for_path(path_origins, fg, der_path));
+        psbt_in
+            .tap_key_origins
+            .retain(|pubkey, (_, (fg, der_path))| {
+                Some(*pubkey) == tap_internal_key || participant_is_for_path(fg, der_path)
+            });
+    }
+
+    psbt
+}
+
 fn append_path_keys(path: &PathInfo, out: &mut Vec<DescriptorPublicKey>) {
     match path {
         PathInfo::Single(key) => out.push(key.clone()),
@@ -879,6 +907,16 @@ impl LianaDescriptor {
         psbt
     }
 
+    fn prune_primary_path_derivs(&self, psbt: Psbt, primary_path: &PrimaryPathInfo) -> Psbt {
+        match primary_path {
+            PrimaryPathInfo::KeyPath(path) => self.prune_bip32_derivs(psbt, path),
+            PrimaryPathInfo::MuSig2(_) => {
+                let (_, path_origins) = primary_path.thresh_origins();
+                prune_musig2_primary_derivs(psbt, &path_origins)
+            }
+        }
+    }
+
     /// Prune the BIP32 derivations in all the PSBT inputs for all the spending paths but the
     /// latest available one. For instance:
     /// - If there is two recovery paths, and the PSBT's first input nSequence isn't set to unlock
@@ -889,23 +927,17 @@ impl LianaDescriptor {
     pub fn prune_bip32_derivs_last_avail(&self, psbt: Psbt) -> Result<Psbt, LianaDescError> {
         let spend_info = self.partial_spend_info(&psbt)?;
         let policy = self.policy();
-        let path_info = spend_info
-            .recovery_paths
-            .iter()
-            .last()
-            .map(|(tl, _)| {
-                policy
-                    .recovery_paths
-                    .get(tl)
-                    .expect("Same timelocks must be keys in both mappings.")
-            })
-            .unwrap_or_else(|| {
-                policy
-                    .primary_path
-                    .as_key_path()
-                    .expect("Current Liana primary paths are plain key paths.")
-            });
-        Ok(self.prune_bip32_derivs(psbt, path_info))
+        let recovery_path = spend_info.recovery_paths.iter().last().map(|(tl, _)| {
+            policy
+                .recovery_paths
+                .get(tl)
+                .expect("Same timelocks must be keys in both mappings.")
+        });
+        Ok(if let Some(path_info) = recovery_path {
+            self.prune_bip32_derivs(psbt, path_info)
+        } else {
+            self.prune_primary_path_derivs(psbt, &policy.primary_path)
+        })
     }
 
     /// Maximum possible weight in weight units of an unsigned transaction, `tx`,
@@ -2804,6 +2836,69 @@ mod tests {
     #[test]
     fn musig2_partial_spend_info_aggregate_then_derive() {
         assert_musig2_partial_spend_info(aggregate_then_derive_musig_desc(), 4);
+    }
+
+    fn musig2_psbt(desc: &LianaDescriptor, child_index: u32) -> Psbt {
+        let secp = secp256k1::Secp256k1::verification_only();
+        let mut psbt = musig2_test_psbt();
+        let der_desc = desc.receive_descriptor().derive(child_index.into(), &secp);
+        der_desc.update_psbt_in(&mut psbt.inputs[0]);
+        psbt
+    }
+
+    #[test]
+    fn musig2_prune_bip32_derivs_last_avail_derive_then_aggregate() {
+        let desc = derive_then_aggregate_musig_desc();
+        let psbt = musig2_psbt(&desc, 7);
+        let tap_internal_key = psbt.inputs[0].tap_internal_key.unwrap();
+        let participant_keys = psbt.inputs[0]
+            .unknown
+            .iter()
+            .find(|(key, _)| key.type_value == 0x1a)
+            .map(|(_, value)| {
+                value
+                    .chunks_exact(33)
+                    .map(|pubkey| secp256k1::PublicKey::from_slice(pubkey).unwrap())
+                    .map(|pubkey| pubkey.x_only_public_key().0)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        let pruned = desc.prune_bip32_derivs_last_avail(psbt).unwrap();
+
+        let tap_key_origins = &pruned.inputs[0].tap_key_origins;
+        assert!(tap_key_origins.contains_key(&tap_internal_key));
+        for participant_key in participant_keys {
+            assert!(tap_key_origins.contains_key(&participant_key));
+        }
+    }
+
+    #[test]
+    fn musig2_prune_bip32_derivs_last_avail_aggregate_then_derive() {
+        let desc = aggregate_then_derive_musig_desc();
+        let psbt = musig2_psbt(&desc, 4);
+        let participant_keys = psbt.inputs[0]
+            .unknown
+            .iter()
+            .find(|(key, _)| key.type_value == 0x1a)
+            .map(|(_, value)| {
+                value
+                    .chunks_exact(33)
+                    .map(|pubkey| secp256k1::PublicKey::from_slice(pubkey).unwrap())
+                    .map(|pubkey| pubkey.x_only_public_key().0)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        let pruned = desc.prune_bip32_derivs_last_avail(psbt).unwrap();
+        let tap_internal_key = pruned.inputs[0].tap_internal_key.unwrap();
+        let tap_key_origins = &pruned.inputs[0].tap_key_origins;
+        for participant_key in participant_keys {
+            assert!(tap_key_origins.contains_key(&participant_key));
+        }
+        let (_, (_, derivation_path)) = tap_key_origins.get(&tap_internal_key).unwrap();
+        assert_eq!(
+            derivation_path,
+            &bip32::DerivationPath::from_str("0/4").unwrap()
+        );
     }
 
     #[test]

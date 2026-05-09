@@ -215,6 +215,39 @@ fn coin_to_candidate(
     }
 }
 
+fn merge_psbt_input_signing_data(
+    db_psbtin: &mut bitcoin::psbt::Input,
+    psbtin: &bitcoin::psbt::Input,
+) {
+    db_psbtin
+        .partial_sigs
+        .extend(psbtin.partial_sigs.iter().map(|(pk, sig)| (*pk, *sig)));
+    db_psbtin
+        .tap_script_sigs
+        .extend(psbtin.tap_script_sigs.iter().map(|(key, sig)| (*key, *sig)));
+    db_psbtin.tap_key_origins.extend(
+        psbtin
+            .tap_key_origins
+            .iter()
+            .map(|(key, origin)| (*key, origin.clone())),
+    );
+    db_psbtin.unknown.extend(
+        psbtin
+            .unknown
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    db_psbtin.proprietary.extend(
+        psbtin
+            .proprietary
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    if db_psbtin.tap_key_sig.is_none() {
+        db_psbtin.tap_key_sig = psbtin.tap_key_sig;
+    }
+}
+
 impl DaemonControl {
     // Get the derived descriptor for this coin
     fn derived_desc(&self, coin: &Coin) -> descriptors::DerivedSinglePathLianaDesc {
@@ -805,15 +838,7 @@ impl DaemonControl {
                     Some(db_psbtin) => db_psbtin,
                     None => continue,
                 };
-                db_psbtin
-                    .partial_sigs
-                    .extend(psbtin.partial_sigs.clone().into_iter());
-                db_psbtin
-                    .tap_script_sigs
-                    .extend(psbtin.tap_script_sigs.clone().into_iter());
-                if db_psbtin.tap_key_sig.is_none() {
-                    db_psbtin.tap_key_sig = psbtin.tap_key_sig;
-                }
+                merge_psbt_input_signing_data(db_psbtin, psbtin);
             }
             psbt = db_psbt;
         } else {
@@ -2652,6 +2677,24 @@ mod tests {
         assert_eq!(db_conn.spend_tx(&txid_b).unwrap(), psbt_b);
         control.update_spend(psbt_c.clone()).unwrap();
         assert_eq!(db_conn.spend_tx(&txid_c).unwrap(), psbt_c);
+
+        psbt_a.inputs[0].unknown.insert(
+            bitcoin::psbt::raw::Key {
+                type_value: 0x1a,
+                key: vec![1, 2, 3],
+            },
+            vec![4, 5, 6],
+        );
+        psbt_a.inputs[0].proprietary.insert(
+            bitcoin::psbt::raw::ProprietaryKey {
+                prefix: b"musig2".to_vec(),
+                subtype: 1,
+                key: vec![7, 8],
+            },
+            vec![9, 10],
+        );
+        control.update_spend(psbt_a.clone()).unwrap();
+        assert_eq!(db_conn.spend_tx(&txid_a).unwrap(), psbt_a);
 
         // We can't store a PSBT spending an external coin
         let external_op = bitcoin::OutPoint::from_str(

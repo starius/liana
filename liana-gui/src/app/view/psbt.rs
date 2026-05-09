@@ -7,7 +7,7 @@ use iced::{
 
 use liana::descriptors::LianaDescriptor;
 use liana::{
-    descriptors::{LianaPolicy, PathInfo, PathSpendInfo},
+    descriptors::{LianaPolicy, PathInfo, PathSpendInfo, PrimaryPathInfo},
     miniscript::bitcoin::{
         bip32::Fingerprint, blockdata::transaction::TxOut, Address, Network, OutPoint, Transaction,
         Txid,
@@ -512,11 +512,8 @@ pub fn signatures<'a>(
                         .spacing(10)
                         .push(text("Finalizing this transaction requires:"))
                         .push_maybe(if tx.sigs.recovery_paths().is_empty() {
-                            Some(path_view(
-                                desc_info
-                                    .primary_path()
-                                    .as_key_path()
-                                    .expect("Current Liana primary paths are plain key paths."),
+                            Some(primary_path_view(
+                                desc_info.primary_path(),
                                 tx.sigs.primary_path(),
                                 keys_aliases,
                             ))
@@ -556,15 +553,11 @@ fn container_from_fg(
     }
 }
 
-pub fn path_view<'a>(
-    path: &'a PathInfo,
+fn sigs_view<'a>(
+    mut all_fgs: Vec<Fingerprint>,
     sigs: &'a PathSpendInfo,
     key_aliases: &'a HashMap<Fingerprint, String>,
 ) -> Element<'a, Message> {
-    // We get a sorted list of all the fingerprints (which correspond to a signer) from this
-    // spending path, and from it get an iterator on those of these fingerprints for which a
-    // signature was provided in the PSBT, and those for which there isn't any.
-    let mut all_fgs: Vec<Fingerprint> = path.thresh_origins().1.into_keys().collect();
     all_fgs.sort();
     let signed_fgs = sigs.signed_pubkeys.keys();
     let non_signed_fgs = all_fgs
@@ -572,7 +565,6 @@ pub fn path_view<'a>(
         .filter(|fg| !sigs.signed_pubkeys.contains_key(fg));
     let missing_signatures = sigs.threshold.saturating_sub(sigs.sigs_count);
 
-    // From these iterators, create the appropriate rows to be displayed.
     let row_unsigned = non_signed_fgs.into_iter().fold(None, |row, fg| {
         Some(
             row.unwrap_or_else(|| Row::new().spacing(5))
@@ -622,6 +614,30 @@ pub fn path_view<'a>(
         scrollable::Scrollbar::new().width(2).scroller_width(2),
     ))
     .into()
+}
+
+pub fn primary_path_view<'a>(
+    path: &'a PrimaryPathInfo,
+    sigs: &'a PathSpendInfo,
+    key_aliases: &'a HashMap<Fingerprint, String>,
+) -> Element<'a, Message> {
+    sigs_view(
+        path.thresh_origins().1.into_keys().collect(),
+        sigs,
+        key_aliases,
+    )
+}
+
+pub fn path_view<'a>(
+    path: &'a PathInfo,
+    sigs: &'a PathSpendInfo,
+    key_aliases: &'a HashMap<Fingerprint, String>,
+) -> Element<'a, Message> {
+    sigs_view(
+        path.thresh_origins().1.into_keys().collect(),
+        sigs,
+        key_aliases,
+    )
 }
 
 pub fn inputs_view<'a>(
