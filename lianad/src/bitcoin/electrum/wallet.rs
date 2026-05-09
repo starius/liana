@@ -5,12 +5,10 @@ use std::{
 };
 
 use bdk_electrum::bdk_chain::{
-    bitcoin::{self, bip32, BlockHash, OutPoint, ScriptBuf, TxOut},
-    keychain::KeychainTxOutIndex,
+    bitcoin::{self, bip32, secp256k1, BlockHash, OutPoint, ScriptBuf, TxOut},
     local_chain::{ChangeSet as ChainChangeSet, CheckPoint, LocalChain},
-    miniscript::{Descriptor, DescriptorPublicKey},
     tx_graph::{self, TxGraph},
-    ChainOracle, ChainPosition, ConfirmationTimeHeightAnchor, IndexedTxGraph,
+    ChainOracle, ChainPosition, ConfirmationTimeHeightAnchor, IndexedTxGraph, SpkTxOutIndex,
 };
 use miniscript::bitcoin::bip32::ChildNumber;
 
@@ -18,10 +16,11 @@ use super::utils::{
     block_id_from_tip, block_info_from_anchor, height_i32_from_u32, height_u32_from_i32,
 };
 use crate::bitcoin::{Block, BlockChainTip, Coin, COINBASE_MATURITY};
-use liana::descriptors::LianaDescriptor;
+use liana::descriptors::{LianaDescriptor, SinglePathLianaDesc};
 
 // We don't want to overload the server (each SPK is separate call).
 const LOOK_AHEAD_LIMIT: u32 = 30;
+const MAX_BIP32_INDEX: u32 = (1u32 << 31) - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum KeychainType {
@@ -29,12 +28,43 @@ pub enum KeychainType {
     Change,
 }
 
+pub(super) struct DescSpkIter {
+    desc: SinglePathLianaDesc,
+    secp: secp256k1::Secp256k1<secp256k1::VerifyOnly>,
+    next_index: u32,
+}
+
+impl DescSpkIter {
+    fn new(desc: SinglePathLianaDesc) -> Self {
+        Self {
+            desc,
+            secp: secp256k1::Secp256k1::verification_only(),
+            next_index: 0,
+        }
+    }
+}
+
+impl Iterator for DescSpkIter {
+    type Item = (u32, ScriptBuf);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let index = self.next_index;
+        let child_index = bip32::ChildNumber::from_normal_idx(index).ok()?;
+        let spk = self.desc.derive(child_index, &self.secp).script_pubkey();
+        self.next_index = self.next_index.checked_add(1)?;
+        Some((index, spk))
+    }
+}
+
 pub struct BdkWallet {
-    graph: IndexedTxGraph<ConfirmationTimeHeightAnchor, KeychainTxOutIndex<KeychainType>>,
+    graph: IndexedTxGraph<ConfirmationTimeHeightAnchor, SpkTxOutIndex<(KeychainType, u32)>>,
     local_chain: LocalChain,
-    // Store descriptors for use when getting SPKs.
-    receive_desc: Descriptor<DescriptorPublicKey>,
-    change_desc: Descriptor<DescriptorPublicKey>,
+    // Store descriptors so we can derive concrete scripts for each keychain index, including
+    // MuSig2 branches that cannot be represented as standard ranged Miniscript descriptors.
+    receive_desc: SinglePathLianaDesc,
+    change_desc: SinglePathLianaDesc,
+    last_revealed: BTreeMap<KeychainType, u32>,
+    secp: secp256k1::Secp256k1<secp256k1::VerifyOnly>,
 }
 
 impl BdkWallet {
@@ -55,23 +85,16 @@ impl BdkWallet {
         change_index: ChildNumber,
     ) -> Self {
         let local_chain = LocalChain::from_genesis_hash(genesis_hash).0;
-        let receive_desc = main_descriptor
-            .receive_descriptor()
-            .as_descriptor_public_key();
-        let change_desc = main_descriptor
-            .change_descriptor()
-            .as_descriptor_public_key();
+        let receive_desc = main_descriptor.receive_descriptor().clone();
+        let change_desc = main_descriptor.change_descriptor().clone();
 
         let mut bdk_wallet = BdkWallet {
-            graph: {
-                let mut indexer = KeychainTxOutIndex::<KeychainType>::new(LOOK_AHEAD_LIMIT);
-                let _ = indexer.insert_descriptor(KeychainType::Receive, receive_desc.clone());
-                let _ = indexer.insert_descriptor(KeychainType::Change, change_desc.clone());
-                IndexedTxGraph::new(indexer)
-            },
+            graph: IndexedTxGraph::new(SpkTxOutIndex::default()),
             local_chain,
-            receive_desc: receive_desc.clone(),
-            change_desc: change_desc.clone(),
+            receive_desc,
+            change_desc,
+            last_revealed: BTreeMap::new(),
+            secp: secp256k1::Secp256k1::verification_only(),
         };
         if let Some(tip) = tip {
             // This will be our anchor for any confirmed transactions.
@@ -157,8 +180,25 @@ impl BdkWallet {
     }
 
     /// Get a reference to the transaction index.
-    pub fn index(&self) -> &KeychainTxOutIndex<KeychainType> {
+    pub fn index(&self) -> &SpkTxOutIndex<(KeychainType, u32)> {
         &self.graph.index
+    }
+
+    pub(super) fn tracked_spks(&self) -> Vec<ScriptBuf> {
+        self.graph.index.all_spks().values().cloned().collect()
+    }
+
+    pub(super) fn all_unbounded_spk_iters(&self) -> BTreeMap<KeychainType, DescSpkIter> {
+        BTreeMap::from([
+            (
+                KeychainType::Receive,
+                DescSpkIter::new(self.receive_desc.clone()),
+            ),
+            (
+                KeychainType::Change,
+                DescSpkIter::new(self.change_desc.clone()),
+            ),
+        ])
     }
 
     /// Reveal SPKs based on derivation indices set in DB.
@@ -177,7 +217,11 @@ impl BdkWallet {
         } else {
             KeychainType::Receive
         };
-        if let Some(spk) = self.graph.index.spk_at_index(chain_kind, der_index.into()) {
+        if let Some(spk) = self
+            .graph
+            .index
+            .spk_at_index(&(chain_kind, der_index.into()))
+        {
             spk.to_owned()
         } else {
             let desc = if is_change {
@@ -185,9 +229,7 @@ impl BdkWallet {
             } else {
                 &self.receive_desc
             };
-            desc.at_derivation_index(der_index.into())
-                .expect("Not multipath and index isn't hardened.")
-                .script_pubkey()
+            desc.derive(der_index, &self.secp).script_pubkey()
         }
     }
 
@@ -327,6 +369,119 @@ impl BdkWallet {
 
     /// Apply a keychain update.
     pub fn apply_keychain_update(&mut self, keychain_update: BTreeMap<KeychainType, u32>) {
-        let _ = self.graph.index.reveal_to_target_multi(&keychain_update);
+        for (keychain, target_index) in keychain_update {
+            self.reveal_to_target(keychain, target_index);
+        }
+    }
+
+    fn reveal_to_target(&mut self, keychain: KeychainType, target_index: u32) {
+        let track_until = target_index
+            .saturating_add(LOOK_AHEAD_LIMIT)
+            .min(MAX_BIP32_INDEX);
+        let next_store_index = self
+            .graph
+            .index
+            .all_spks()
+            .range((keychain, u32::MIN)..=(keychain, u32::MAX))
+            .last()
+            .map_or(0, |((_, index), _)| index.saturating_add(1));
+
+        if next_store_index <= track_until {
+            let desc = match keychain {
+                KeychainType::Receive => &self.receive_desc,
+                KeychainType::Change => &self.change_desc,
+            };
+
+            for index in next_store_index..=track_until {
+                let child_index =
+                    bip32::ChildNumber::from_normal_idx(index).expect("within normal range");
+                let spk = desc.derive(child_index, &self.secp).script_pubkey();
+                let _ = self.graph.index.insert_spk((keychain, index), spk);
+            }
+        }
+
+        let revealed = self.last_revealed.entry(keychain).or_insert(target_index);
+        *revealed = (*revealed).max(target_index);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use miniscript::descriptor::checksum::desc_checksum;
+
+    use super::*;
+
+    fn aggregate_then_derive_desc() -> LianaDescriptor {
+        let body = "tr(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM)/<0;1>/*,and_v(v:pk([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/<2;3>/*),older(10)))";
+        let desc = format!("{body}#{}", desc_checksum(body).unwrap());
+        LianaDescriptor::from_str(&desc).unwrap()
+    }
+
+    #[test]
+    fn reveal_spks_use_real_musig2_scripts() {
+        let desc = aggregate_then_derive_desc();
+        let genesis_hash =
+            BlockHash::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap();
+        let tip = BlockChainTip {
+            height: 0,
+            hash: genesis_hash,
+        };
+        let wallet = BdkWallet::new(&desc, genesis_hash, Some(tip), &[], &[], 0.into(), 0.into());
+        let tracked_spk = wallet
+            .index()
+            .spk_at_index(&(KeychainType::Receive, 0))
+            .expect("revealed receive spk")
+            .to_owned();
+        let secp = secp256k1::Secp256k1::verification_only();
+        let derived_spk = desc
+            .receive_descriptor()
+            .derive(0.into(), &secp)
+            .script_pubkey();
+        let shadow_spk = desc
+            .receive_descriptor()
+            .as_descriptor_public_key()
+            .at_derivation_index(0)
+            .expect("shadow descriptor is ranged")
+            .script_pubkey();
+
+        assert_eq!(tracked_spk, derived_spk);
+        assert_ne!(tracked_spk, shadow_spk);
+    }
+
+    #[test]
+    fn full_scan_iter_uses_real_musig2_scripts() {
+        let desc = aggregate_then_derive_desc();
+        let wallet = BdkWallet::new(
+            &desc,
+            BlockHash::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap(),
+            None,
+            &[],
+            &[],
+            0.into(),
+            0.into(),
+        );
+        let mut spk_iters = wallet.all_unbounded_spk_iters();
+        let mut receive_iter = spk_iters
+            .remove(&KeychainType::Receive)
+            .expect("receive iterator");
+        let (index, tracked_spk) = receive_iter.next().expect("first receive spk");
+        let secp = secp256k1::Secp256k1::verification_only();
+        let derived_spk = desc
+            .receive_descriptor()
+            .derive(index.into(), &secp)
+            .script_pubkey();
+        let shadow_spk = desc
+            .receive_descriptor()
+            .as_descriptor_public_key()
+            .at_derivation_index(index)
+            .expect("shadow descriptor is ranged")
+            .script_pubkey();
+
+        assert_eq!(tracked_spk, derived_spk);
+        assert_ne!(tracked_spk, shadow_spk);
     }
 }

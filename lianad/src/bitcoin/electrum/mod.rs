@@ -144,15 +144,7 @@ impl Electrum {
             log::debug!("Performing sync.");
             let mut request = SyncRequest::from_chain_tip(local_chain_tip.clone());
 
-            let all_spks: Vec<_> = self
-                .bdk_wallet
-                .index()
-                .inner() // we include lookahead SPKs
-                .all_spks()
-                .values()
-                .cloned()
-                .collect();
-            request = request.chain_spks(all_spks);
+            request = request.chain_spks(self.bdk_wallet.tracked_spks());
             log::debug!("num SPKs for sync: {}", request.spks.len());
 
             let sync_result = self
@@ -166,7 +158,7 @@ impl Electrum {
             // Either local_chain has height 0 or we want to trigger a full scan.
             let mut request = FullScanRequest::from_chain_tip(local_chain_tip.clone());
 
-            for (k, spks) in self.bdk_wallet.index().all_unbounded_spk_iters() {
+            for (k, spks) in self.bdk_wallet.all_unbounded_spk_iters() {
                 request = request.set_spks_for_keychain(k, spks);
             }
             let scan_result = self
