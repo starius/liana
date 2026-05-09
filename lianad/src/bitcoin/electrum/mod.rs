@@ -9,7 +9,7 @@ use bdk_electrum::bdk_chain::{
 
 pub mod client;
 mod utils;
-pub mod wallet;
+use crate::bitcoin::lightwallet::BdkWallet;
 use crate::bitcoin::{Block, BlockChainTip, Coin};
 
 /// An error in the Electrum interface.
@@ -41,7 +41,7 @@ impl std::fmt::Display for ElectrumError {
 /// Interface for Electrum backend.
 pub struct Electrum {
     client: client::Client,
-    bdk_wallet: wallet::BdkWallet,
+    bdk_wallet: BdkWallet,
     /// Used for setting the `last_seen` of unconfirmed transactions in a strictly
     /// increasing manner.
     sync_count: u64,
@@ -53,7 +53,7 @@ pub struct Electrum {
 impl Electrum {
     pub fn new(
         client: client::Client,
-        bdk_wallet: wallet::BdkWallet,
+        bdk_wallet: BdkWallet,
         full_scan: bool,
     ) -> Result<Self, ElectrumError> {
         Ok(Self {

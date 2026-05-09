@@ -20,7 +20,7 @@ pub use crate::bitcoin::{
 
 use crate::jsonrpc::server;
 use crate::{
-    bitcoin::{poller, BitcoinInterface},
+    bitcoin::{lightwallet::BdkWallet, poller, BitcoinInterface},
     config::Config,
     database::{
         sqlite::{FreshDbOptions, SqliteDb, SqliteDbError, MAX_DB_VERSION_NO_TX_DB},
@@ -301,7 +301,7 @@ fn setup_electrum(
         let chain_hash = ChainHash::using_genesis_block(config.bitcoin_config.network);
         BlockHash::from_byte_array(*chain_hash.as_bytes())
     };
-    let bdk_wallet = electrum::wallet::BdkWallet::new(
+    let bdk_wallet = BdkWallet::new(
         &config.main_descriptor,
         genesis_hash,
         tip,
