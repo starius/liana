@@ -10,7 +10,7 @@ use crate::bitcoin::d::{BitcoindError, CachedTxGetter, LSBlockEntry};
 pub use d::{MempoolEntry, MempoolEntryFees, SyncProgress};
 use liana::descriptors;
 
-use std::{fmt, sync};
+use std::{collections::HashSet, fmt, sync};
 
 use miniscript::bitcoin::{self, address, bip32::ChildNumber};
 
@@ -18,6 +18,19 @@ use miniscript::bitcoin::{self, address, bip32::ChildNumber};
 type SpentCoin = (bitcoin::OutPoint, bitcoin::Txid, i32, u32);
 
 const COINBASE_MATURITY: i32 = 100;
+
+fn canonical_descriptor_set(descs: &[descriptors::SinglePathLianaDesc]) -> HashSet<String> {
+    descs
+        .iter()
+        .map(descriptors::SinglePathLianaDesc::canonical_descriptor_string)
+        .collect()
+}
+
+fn parent_descs_match(descs: &HashSet<String>, parent_descs: &[String]) -> bool {
+    parent_descs
+        .iter()
+        .any(|parent_desc| descs.contains(parent_desc))
+}
 
 /// Information about a block
 #[derive(Debug, Clone, Eq, PartialEq, Copy)]
@@ -182,6 +195,7 @@ impl BitcoinInterface for d::BitcoinD {
         descs: &[descriptors::SinglePathLianaDesc],
     ) -> Vec<UTxO> {
         let lsb_res = self.list_since_block(&tip.hash);
+        let descs = canonical_descriptor_set(descs);
 
         lsb_res
             .received_coins
@@ -195,10 +209,7 @@ impl BitcoinInterface for d::BitcoinD {
                     parent_descs,
                     is_immature,
                 } = entry;
-                if parent_descs
-                    .iter()
-                    .any(|parent_desc| descs.iter().any(|desc| desc == parent_desc))
-                {
+                if parent_descs_match(&descs, &parent_descs) {
                     Some(UTxO {
                         outpoint,
                         amount,
@@ -401,6 +412,29 @@ impl BitcoinInterface for d::BitcoinD {
 
     fn mempool_entry(&self, txid: &bitcoin::Txid) -> Option<MempoolEntry> {
         self.mempool_entry(txid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use liana::descriptors::LianaDescriptor;
+    use std::str::FromStr;
+
+    #[test]
+    fn parent_descs_match_musig_receive_and_change_descriptors() {
+        let desc = LianaDescriptor::from_str("tr(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<0;1>/*,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/<0;1>/*),and_v(v:pk([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/<2;3>/*),older(10)))").unwrap();
+        let descs = vec![
+            desc.receive_descriptor().clone(),
+            desc.change_descriptor().clone(),
+        ];
+        let descs = canonical_descriptor_set(&descs);
+        let parent_descs = vec![
+            desc.receive_descriptor().canonical_descriptor_string(),
+            desc.change_descriptor().canonical_descriptor_string(),
+        ];
+
+        assert!(parent_descs_match(&descs, &parent_descs));
     }
 }
 

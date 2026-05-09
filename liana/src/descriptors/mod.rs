@@ -233,6 +233,16 @@ impl fmt::Display for SinglePathLianaDesc {
     }
 }
 
+pub fn canonical_descriptor_string(desc: &str) -> String {
+    if let Ok(parsed) = Descriptor::<DescriptorPublicKey>::from_str(desc) {
+        return parsed.to_string();
+    }
+    if let Ok(parsed) = MuSig2TaprootDescriptor::from_str(desc) {
+        return parsed.to_string();
+    }
+    desc.trim().to_owned()
+}
+
 impl PartialEq<descriptor::Descriptor<descriptor::DescriptorPublicKey>> for SinglePathLianaDesc {
     fn eq(&self, other: &descriptor::Descriptor<descriptor::DescriptorPublicKey>) -> bool {
         matches!(self, Self::Standard(desc) if desc == other)
@@ -825,6 +835,10 @@ impl LianaDescriptor {
 }
 
 impl SinglePathLianaDesc {
+    pub fn canonical_descriptor_string(&self) -> String {
+        canonical_descriptor_string(&self.to_string())
+    }
+
     /// Derive this descriptor at a given index for a receiving address.
     ///
     /// # Panics

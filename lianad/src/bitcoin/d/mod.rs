@@ -7,7 +7,7 @@ use crate::{
     bitcoin::{Block, BlockChainTip},
     config,
 };
-use liana::descriptors::LianaDescriptor;
+use liana::descriptors::{canonical_descriptor_string, LianaDescriptor};
 use utils::{block_before_date, roundup_progress};
 
 use std::{
@@ -27,10 +27,7 @@ use jsonrpc::{
     minreq_http::{self, MinreqHttpTransport},
 };
 
-use miniscript::{
-    bitcoin::{self, address, hashes::hex::FromHex},
-    descriptor::{self, Descriptor, DescriptorPublicKey},
-};
+use miniscript::bitcoin::{self, address, hashes::hex::FromHex};
 
 use serde_json::Value as Json;
 
@@ -755,24 +752,12 @@ impl BitcoinD {
         let desc_list: Vec<_> = self
             .list_descriptors()
             .into_iter()
-            .filter_map(|entry| {
-                match descriptor::Descriptor::<descriptor::DescriptorPublicKey>::from_str(
-                    &entry.desc,
-                ) {
-                    Ok(desc) => Some(desc),
-                    Err(e) => {
-                        log::error!(
-                            "Error deserializing descriptor: {}. Descriptor: {}.",
-                            e,
-                            entry.desc
-                        );
-                        None
-                    }
-                }
-            })
+            .map(|entry| canonical_descriptor_string(&entry.desc))
             .collect();
-        if !desc_list.iter().any(|desc| *receive_desc == *desc)
-            || !desc_list.iter().any(|desc| *change_desc == *desc)
+        let receive_desc = receive_desc.canonical_descriptor_string();
+        let change_desc = change_desc.canonical_descriptor_string();
+        if !desc_list.iter().any(|desc| desc == &receive_desc)
+            || !desc_list.iter().any(|desc| desc == &change_desc)
         {
             return Err(BitcoindError::Wallet(
                 self.watchonly_wallet_path.clone(),
@@ -1054,11 +1039,7 @@ impl BitcoinD {
 
     // For the given descriptor strings check if they are imported at this timestamp in the
     // watchonly wallet.
-    fn check_descs_timestamp(
-        &self,
-        descs: &[&Descriptor<DescriptorPublicKey>],
-        timestamp: u32,
-    ) -> bool {
+    fn check_descs_timestamp(&self, descs: &[String], timestamp: u32) -> bool {
         let current_descs = self.list_descriptors();
 
         for desc in descs {
@@ -1111,14 +1092,14 @@ impl BitcoinD {
                 cmp::max(range, entry.range.map(|r| r[1]).unwrap_or(0))
             });
         let descs = [
-            desc.receive_descriptor().as_descriptor_public_key(),
-            desc.change_descriptor().as_descriptor_public_key(),
+            desc.receive_descriptor().to_string(),
+            desc.change_descriptor().to_string(),
         ];
         let desc_json: Vec<Json> = descs
             .iter()
             .map(|desc| {
                 serde_json::json!({
-                    "desc": desc.to_string(),
+                    "desc": desc,
                     "timestamp": timestamp,
                     "active": false,
                     "range": max_range,
@@ -1281,23 +1262,16 @@ pub struct ListDescEntry {
 
 /// Whether `current_descs` contain the descriptor `desc` at `timestamp`.
 ///
-/// Any descriptors in `current_descs` that cannot be parsed as
-/// `Descriptor::<DescriptorPublicKey>` will be ignored.
 fn current_descs_contain_desc_timestamp(
     current_descs: &[ListDescEntry],
-    desc: &Descriptor<DescriptorPublicKey>,
+    desc: &str,
     timestamp: u32,
 ) -> bool {
+    let normalized_desc = canonical_descriptor_string(desc);
     current_descs
         .iter()
-        .filter_map(|entry| {
-            if let Ok(entry_desc) = Descriptor::<DescriptorPublicKey>::from_str(&entry.desc) {
-                Some((entry_desc, entry.timestamp))
-            } else {
-                None
-            }
-        })
-        .find(|(entry_desc, _)| entry_desc.to_string() == desc.to_string())
+        .map(|entry| (canonical_descriptor_string(&entry.desc), entry.timestamp))
+        .find(|(entry_desc, _)| entry_desc == &normalized_desc)
         .map(|(_, entry_timestamp)| entry_timestamp == timestamp)
         .unwrap_or(false)
 }
@@ -1309,7 +1283,7 @@ pub struct LSBlockEntry {
     pub amount: bitcoin::Amount,
     pub block_height: Option<i32>,
     pub address: bitcoin::Address<address::NetworkUnchecked>,
-    pub parent_descs: Vec<descriptor::Descriptor<descriptor::DescriptorPublicKey>>,
+    pub parent_descs: Vec<String>,
     pub is_immature: bool,
 }
 
@@ -1345,14 +1319,16 @@ impl From<&Json> for LSBlockEntry {
         let parent_descs = json
             .get("parent_descs")
             .and_then(Json::as_array)
-            .and_then(|descs| {
+            .map(|descs| {
                 descs
                     .iter()
                     .map(|desc| {
-                        desc.as_str()
-                            .and_then(|s| descriptor::Descriptor::<_>::from_str(s).ok())
+                        let desc = desc
+                            .as_str()
+                            .expect("bitcoind can't give invalid descriptors");
+                        canonical_descriptor_string(desc)
                     })
-                    .collect::<Option<Vec<_>>>()
+                    .collect::<Vec<_>>()
             })
             .expect("bitcoind can't give invalid descriptors");
 
@@ -1652,38 +1628,38 @@ mod tests {
         assert_eq!(desc.receive_descriptor().to_string(), "tr([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/0/*,and_v(v:pk([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/2/*),older(65535)))#xhrh0cvn".to_string());
         assert_eq!(desc.change_descriptor().to_string(), "tr([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/1/*,and_v(v:pk([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/3/*),older(65535)))#6yyu2dsu".to_string());
 
-        let recv_desc = desc.receive_descriptor().as_descriptor_public_key();
-        let change_desc = desc.change_descriptor().as_descriptor_public_key();
+        let recv_desc = desc.receive_descriptor().to_string();
+        let change_desc = desc.change_descriptor().to_string();
         // For the receive descriptor, we don't get a match unless the timestamp matches the first occurrence.
         assert!(!current_descs_contain_desc_timestamp(
             &current_descs,
-            recv_desc,
+            &recv_desc,
             1598918399
         ));
         assert!(!current_descs_contain_desc_timestamp(
             &current_descs,
-            recv_desc,
+            &recv_desc,
             1598918401
         ));
         assert!(!current_descs_contain_desc_timestamp(
             &current_descs,
-            change_desc,
+            &change_desc,
             1598918381
         ));
         assert!(!current_descs_contain_desc_timestamp(
             &current_descs,
-            recv_desc,
+            &recv_desc,
             1598918410 // this is the second timestamp for this descriptor
         ));
         // We only get a match when we use the first timestamp for each descriptor.
         assert!(current_descs_contain_desc_timestamp(
             &current_descs,
-            recv_desc,
+            &recv_desc,
             1598918400
         ));
         assert!(current_descs_contain_desc_timestamp(
             &current_descs,
-            change_desc,
+            &change_desc,
             1598918380
         ));
 
@@ -1707,12 +1683,12 @@ mod tests {
         ];
         assert!(current_descs_contain_desc_timestamp(
             &current_descs,
-            recv_desc,
+            &recv_desc,
             1598918400
         ));
         assert!(current_descs_contain_desc_timestamp(
             &current_descs,
-            change_desc,
+            &change_desc,
             1598918380
         ));
 
@@ -1736,13 +1712,60 @@ mod tests {
         ];
         assert!(current_descs_contain_desc_timestamp(
             &current_descs,
-            recv_desc,
+            &recv_desc,
             1598918400
         ));
         assert!(current_descs_contain_desc_timestamp(
             &current_descs,
-            change_desc,
+            &change_desc,
             1598918380
         ));
+
+        // MuSig2 descriptors should normalize and match the same way.
+        let current_descs = vec![
+            ListDescEntry {
+                desc: "tr(musig([9e1c1983/48h/1h/0h/2h]tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/0/*,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/0/*),and_v(v:pk([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/2/*),older(10)))".to_string(),
+                range: Some([0, 999]),
+                timestamp: 1598918400,
+            },
+            ListDescEntry {
+                desc: "tr(musig([9e1c1983/48h/1h/0h/2h]tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/1/*,[3b1913e1/48h/1h/0h/2h]tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/1/*),and_v(v:pk([1dce71b2/48h/1h/0h/2h]tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/3/*),older(10)))".to_string(),
+                range: Some([0, 999]),
+                timestamp: 1598918380,
+            },
+        ];
+        let desc = LianaDescriptor::from_str("tr(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<0;1>/*,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/<0;1>/*),and_v(v:pk([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/<2;3>/*),older(10)))").unwrap();
+        let recv_desc = desc.receive_descriptor().to_string();
+        let change_desc = desc.change_descriptor().to_string();
+        assert!(current_descs_contain_desc_timestamp(
+            &current_descs,
+            &recv_desc,
+            1598918400
+        ));
+        assert!(current_descs_contain_desc_timestamp(
+            &current_descs,
+            &change_desc,
+            1598918380
+        ));
+    }
+
+    #[test]
+    fn listsinceblock_entry_accepts_musig_parent_descs() {
+        let raw_desc = LianaDescriptor::from_str("tr(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<0;1>/*,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/<0;1>/*),and_v(v:pk([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/<2;3>/*),older(10)))").unwrap().receive_descriptor().to_string();
+        let json = serde_json::json!({
+            "txid": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "vout": 1,
+            "amount": 0.5,
+            "blockheight": 42,
+            "address": "1BoatSLRHtKNngkdXEeobR76b53LETtpyT",
+            "parent_descs": [raw_desc.clone()],
+            "category": "receive"
+        });
+
+        let entry = LSBlockEntry::from(&json);
+        assert_eq!(
+            entry.parent_descs,
+            vec![canonical_descriptor_string(&raw_desc)]
+        );
     }
 }
