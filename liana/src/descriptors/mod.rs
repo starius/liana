@@ -10,7 +10,7 @@ use miniscript::{
     miniscript::satisfy::Placeholder,
     plan::{Assets, CanSign},
     psbt::{PsbtInputExt, PsbtOutputExt},
-    translate_hash_clone, Descriptor, DescriptorPublicKey, ForEachKey, TranslatePk, Translator,
+    translate_hash_clone, Descriptor, DescriptorPublicKey, TranslatePk, Translator,
 };
 
 use std::{
@@ -20,7 +20,7 @@ use std::{
     str::{self, FromStr},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub mod keys;
 pub use keys::*;
@@ -89,23 +89,59 @@ fn key_is_for_path(
     false
 }
 
+fn append_path_keys(path: &PathInfo, out: &mut Vec<DescriptorPublicKey>) {
+    match path {
+        PathInfo::Single(key) => out.push(key.clone()),
+        PathInfo::Multi(_, keys) => out.extend(keys.iter().cloned()),
+    }
+}
+
+fn append_primary_keys(path: &PrimaryPathInfo, out: &mut Vec<DescriptorPublicKey>) {
+    match path {
+        PrimaryPathInfo::KeyPath(path) => append_path_keys(path, out),
+        PrimaryPathInfo::MuSig2(expr) => out.extend(expr.participants().iter().cloned()),
+    }
+}
+
 /// An [SinglePathLianaDesc] that contains multipath keys for (and only for) the receive keychain
 /// and the change keychain.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LianaDescriptor {
-    multi_desc: descriptor::Descriptor<descriptor::DescriptorPublicKey>,
+    multi_desc: MultipathLianaDesc,
+    policy: LianaPolicy,
     receive_desc: SinglePathLianaDesc,
     change_desc: SinglePathLianaDesc,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MultipathLianaDesc {
+    Standard(descriptor::Descriptor<descriptor::DescriptorPublicKey>),
+    MuSig2(MuSig2TaprootDescriptor),
+}
+
 /// A Miniscript descriptor with a main, unencombered, branch (the main owner of the coins)
 /// and a timelocked branch (the heir). All keys in this descriptor are singlepath.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SinglePathLianaDesc(descriptor::Descriptor<descriptor::DescriptorPublicKey>);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SinglePathLianaDesc {
+    Standard(descriptor::Descriptor<descriptor::DescriptorPublicKey>),
+    MuSig2(MuSig2SinglePathDescriptor),
+}
 
 /// Derived (containing only raw Bitcoin public keys) version of the inheritance descriptor.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DerivedSinglePathLianaDesc(descriptor::Descriptor<DerivedPublicKey>);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DerivedSinglePathLianaDesc {
+    Standard(descriptor::Descriptor<DerivedPublicKey>),
+    MuSig2(descriptor::Descriptor<descriptor::DefiniteDescriptorKey>),
+}
+
+impl fmt::Display for MultipathLianaDesc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Standard(desc) => write!(f, "{desc}"),
+            Self::MuSig2(desc) => write!(f, "{desc}"),
+        }
+    }
+}
 
 impl fmt::Display for LianaDescriptor {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -117,6 +153,25 @@ impl str::FromStr for LianaDescriptor {
     type Err = LianaDescError;
 
     fn from_str(s: &str) -> Result<LianaDescriptor, Self::Err> {
+        if s.contains("musig(") {
+            let multi_desc = MuSig2TaprootDescriptor::from_str(s)?;
+            let shadow_policy = LianaPolicy::from_multipath_descriptor(multi_desc.shadow_desc())?;
+            let policy = LianaPolicy::from_parts_uncompiled(
+                PrimaryPathInfo::MuSig2(multi_desc.expr().clone()),
+                shadow_policy.recovery_paths().clone(),
+                /* is_taproot = */ true,
+            )?;
+            let receive_desc = SinglePathLianaDesc::MuSig2(multi_desc.branch_descriptor(0)?);
+            let change_desc = SinglePathLianaDesc::MuSig2(multi_desc.branch_descriptor(1)?);
+
+            return Ok(LianaDescriptor {
+                multi_desc: MultipathLianaDesc::MuSig2(multi_desc),
+                policy,
+                receive_desc,
+                change_desc,
+            });
+        }
+
         // Parse a descriptor and check it is a multipath descriptor corresponding to a valid Liana
         // spending policy.
         // Sanity checks are not always performed when calling `Descriptor::from_str`, so we perform
@@ -124,7 +179,7 @@ impl str::FromStr for LianaDescriptor {
         let desc = descriptor::Descriptor::<descriptor::DescriptorPublicKey>::from_str(s)
             .and_then(|desc| desc.sanity_check().map(|_| desc))
             .map_err(LianaDescError::Miniscript)?;
-        LianaPolicy::from_multipath_descriptor(&desc)?;
+        let policy = LianaPolicy::from_multipath_descriptor(&desc)?;
 
         // Compute the receive and change "sub" descriptors right away. According to our pubkey
         // check above, there must be only two of those, 0 and 1.
@@ -136,26 +191,51 @@ impl str::FromStr for LianaDescriptor {
             .expect("Can't error, all paths have the same length")
             .into_iter();
         assert_eq!(singlepath_descs.len(), 2);
-        let receive_desc = SinglePathLianaDesc(singlepath_descs.next().expect("First of 2"));
-        let change_desc = SinglePathLianaDesc(singlepath_descs.next().expect("Second of 2"));
+        let receive_desc =
+            SinglePathLianaDesc::Standard(singlepath_descs.next().expect("First of 2"));
+        let change_desc =
+            SinglePathLianaDesc::Standard(singlepath_descs.next().expect("Second of 2"));
 
         Ok(LianaDescriptor {
-            multi_desc: desc,
+            multi_desc: MultipathLianaDesc::Standard(desc),
+            policy,
             receive_desc,
             change_desc,
         })
     }
 }
 
+impl Serialize for LianaDescriptor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for LianaDescriptor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let desc = String::deserialize(deserializer)?;
+        LianaDescriptor::from_str(&desc).map_err(serde::de::Error::custom)
+    }
+}
+
 impl fmt::Display for SinglePathLianaDesc {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
+        match self {
+            Self::Standard(desc) => write!(f, "{desc}"),
+            Self::MuSig2(desc) => write!(f, "{desc}"),
+        }
     }
 }
 
 impl PartialEq<descriptor::Descriptor<descriptor::DescriptorPublicKey>> for SinglePathLianaDesc {
     fn eq(&self, other: &descriptor::Descriptor<descriptor::DescriptorPublicKey>) -> bool {
-        self.0.eq(other)
+        matches!(self, Self::Standard(desc) if desc == other)
     }
 }
 
@@ -180,8 +260,35 @@ impl ChangeOutput {
 
 impl LianaDescriptor {
     pub fn new(spending_policy: LianaPolicy) -> LianaDescriptor {
+        if let Some(expr) = spending_policy.primary_path().musig().cloned() {
+            let shadow_policy = LianaPolicy::new(
+                PathInfo::Single(dummy_shadow_key()),
+                spending_policy.recovery_paths().clone(),
+            )
+            .expect("dummy shadow policy must be valid");
+            let shadow_desc = shadow_policy.compile_multipath_descriptor();
+            let multi_desc = MuSig2TaprootDescriptor::from_shadow_descriptor(shadow_desc, expr);
+            let receive_desc = SinglePathLianaDesc::MuSig2(
+                multi_desc
+                    .branch_descriptor(0)
+                    .expect("shadow descriptor always has two branches"),
+            );
+            let change_desc = SinglePathLianaDesc::MuSig2(
+                multi_desc
+                    .branch_descriptor(1)
+                    .expect("shadow descriptor always has two branches"),
+            );
+
+            return LianaDescriptor {
+                multi_desc: MultipathLianaDesc::MuSig2(multi_desc),
+                policy: spending_policy,
+                receive_desc,
+                change_desc,
+            };
+        }
+
         // Get the descriptor from the chosen spending policy.
-        let multi_desc = spending_policy.compile_multipath_descriptor();
+        let multi_desc = spending_policy.clone().compile_multipath_descriptor();
 
         // Compute the receive and change "sub" descriptors right away. According to our pubkey
         // check above, there must be only two of those, 0 and 1.
@@ -193,11 +300,14 @@ impl LianaDescriptor {
             .expect("Can't error, all paths have the same length")
             .into_iter();
         assert_eq!(singlepath_descs.len(), 2);
-        let receive_desc = SinglePathLianaDesc(singlepath_descs.next().expect("First of 2"));
-        let change_desc = SinglePathLianaDesc(singlepath_descs.next().expect("Second of 2"));
+        let receive_desc =
+            SinglePathLianaDesc::Standard(singlepath_descs.next().expect("First of 2"));
+        let change_desc =
+            SinglePathLianaDesc::Standard(singlepath_descs.next().expect("Second of 2"));
 
         LianaDescriptor {
-            multi_desc,
+            multi_desc: MultipathLianaDesc::Standard(multi_desc),
+            policy: spending_policy,
             receive_desc,
             change_desc,
         }
@@ -205,19 +315,28 @@ impl LianaDescriptor {
 
     /// Whether all xpubs contained in this descriptor are for the passed expected network.
     pub fn all_xpubs_net_is(&self, expected_net: bitcoin::Network) -> bool {
-        self.multi_desc.for_each_key(|xpub| {
-            if let descriptor::DescriptorPublicKey::MultiXPub(xpub) = xpub {
+        let mut keys = Vec::new();
+        append_primary_keys(self.policy.primary_path(), &mut keys);
+        for recovery_path in self.policy.recovery_paths().values() {
+            append_path_keys(recovery_path, &mut keys);
+        }
+        keys.into_iter().all(|xpub| match xpub {
+            descriptor::DescriptorPublicKey::MultiXPub(xpub) => {
                 xpub.xkey.network == expected_net.into()
-            } else {
-                false
             }
+            descriptor::DescriptorPublicKey::XPub(xpub) => xpub.xkey.network == expected_net.into(),
+            _ => false,
         })
     }
 
     /// Whether a key matching this fingerprint is part of this descriptor
     pub fn contains_fingerprint(&self, fg: Fingerprint) -> bool {
-        self.multi_desc
-            .for_any_key(|k| k.master_fingerprint() == fg)
+        self.contains_fingerprint_in_primary_path(fg)
+            || self
+                .policy
+                .recovery_paths()
+                .values()
+                .any(|path| path.contains_fingerprint(fg))
     }
 
     /// Determine whether the fingerprint is part of a specific path of this descriptor.
@@ -254,8 +373,11 @@ impl LianaDescriptor {
     }
 
     /// Get the multipath descriptor
-    pub fn descriptor(&self) -> &Descriptor<DescriptorPublicKey> {
-        &self.multi_desc
+    pub fn descriptor(&self) -> Option<&Descriptor<DescriptorPublicKey>> {
+        match &self.multi_desc {
+            MultipathLianaDesc::Standard(desc) => Some(desc),
+            MultipathLianaDesc::MuSig2(_) => None,
+        }
     }
 
     /// Get the descriptor for receiving addresses.
@@ -270,8 +392,7 @@ impl LianaDescriptor {
 
     /// Get the spending policy of this descriptor.
     pub fn policy(&self) -> LianaPolicy {
-        LianaPolicy::from_multipath_descriptor(&self.multi_desc)
-            .expect("We never create a Liana descriptor with an invalid Liana policy.")
+        self.policy.clone()
     }
 
     /// Get the set of Xpubs that can sign (excluding unspendable key) in the form of an
@@ -279,23 +400,37 @@ impl LianaDescriptor {
     pub fn spendable_keys(&self) -> Vec<DescriptorPublicKey> {
         let mut keys = BTreeSet::new();
         let nums = bip341_nums();
-        self.multi_desc.for_each_key(|k| {
-            if let DescriptorPublicKey::MultiXPub(multixkey) = k {
-                let key = DescriptorPublicKey::XPub(DescriptorXKey {
-                    origin: multixkey.origin.clone(),
-                    xkey: multixkey.xkey,
-                    derivation_path: DerivationPath::default(),
-                    wildcard: Wildcard::None,
-                });
-
-                if multixkey.xkey.public_key != nums {
-                    keys.insert(key.clone());
+        let mut descriptor_keys = Vec::new();
+        append_primary_keys(self.policy.primary_path(), &mut descriptor_keys);
+        for recovery_path in self.policy.recovery_paths().values() {
+            append_path_keys(recovery_path, &mut descriptor_keys);
+        }
+        for key in descriptor_keys {
+            match key {
+                DescriptorPublicKey::MultiXPub(multixkey) => {
+                    let key = DescriptorPublicKey::XPub(DescriptorXKey {
+                        origin: multixkey.origin.clone(),
+                        xkey: multixkey.xkey,
+                        derivation_path: DerivationPath::default(),
+                        wildcard: Wildcard::None,
+                    });
+                    if multixkey.xkey.public_key != nums {
+                        keys.insert(key);
+                    }
                 }
-            } else {
-                unreachable!("all keys must be of MultiXpub type");
+                DescriptorPublicKey::XPub(xpub) => {
+                    if xpub.xkey.public_key != nums {
+                        keys.insert(DescriptorPublicKey::XPub(DescriptorXKey {
+                            origin: xpub.origin.clone(),
+                            xkey: xpub.xkey,
+                            derivation_path: DerivationPath::default(),
+                            wildcard: Wildcard::None,
+                        }));
+                    }
+                }
+                _ => {}
             }
-            true
-        });
+        }
         keys.into_iter().collect()
     }
 
@@ -303,10 +438,11 @@ impl LianaDescriptor {
     /// Note: an unspendable key is always returned from a taproot descriptor even if not
     /// part of the policy.
     pub fn process_unspendable_key(&self) -> Option<DescriptorPublicKey> {
-        if let Descriptor::Tr(tr_descriptor) = &self.multi_desc {
-            unspendable_internal_key(tr_descriptor)
-        } else {
-            None
+        match &self.multi_desc {
+            MultipathLianaDesc::Standard(Descriptor::Tr(tr_descriptor)) => {
+                unspendable_internal_key(tr_descriptor)
+            }
+            _ => None,
         }
     }
 
@@ -327,6 +463,10 @@ impl LianaDescriptor {
     /// size of the witness stack length varint.
     pub fn max_sat_weight(&self, use_primary_path: bool) -> usize {
         if use_primary_path {
+            if matches!(self.policy.primary_path(), PrimaryPathInfo::MuSig2(_)) {
+                // A MuSig2 key-path spend produces a single Schnorr signature on-chain.
+                return 67;
+            }
             // Get the keys from the primary path, to get a satisfaction size estimation only
             // considering those.
             let keys = self
@@ -352,11 +492,15 @@ impl LianaDescriptor {
             // manually add the size of the witscript under P2WSH by means of the
             // `explicit_script()` helper, which gives an error for Taproot, and for Taproot
             // we add the sizes of the control block and script.
-            let der_desc = self
-                .receive_desc
-                .0
-                .at_derivation_index(0)
-                .expect("unhardened index");
+            let der_desc = match &self.receive_desc {
+                SinglePathLianaDesc::Standard(desc) => {
+                    desc.at_derivation_index(0).expect("unhardened index")
+                }
+                SinglePathLianaDesc::MuSig2(desc) => desc
+                    .shadow_desc()
+                    .at_derivation_index(0)
+                    .expect("unhardened index"),
+            };
             let witscript_size = der_desc
                 .explicit_script()
                 .map(|s| varint_len(s.len()) + s.len());
@@ -383,11 +527,12 @@ impl LianaDescriptor {
             // empty witness). But this method is used to account between a completely "nude"
             // transaction (and therefore no Segwit marker nor empty witness in inputs) and a
             // satisfied transaction.
-            (self
-                .multi_desc
-                .max_weight_to_satisfy()
-                .expect("Always satisfiable")
-                .to_wu()
+            (match &self.multi_desc {
+                MultipathLianaDesc::Standard(desc) => desc.max_weight_to_satisfy(),
+                MultipathLianaDesc::MuSig2(desc) => desc.shadow_desc().max_weight_to_satisfy(),
+            }
+            .expect("Always satisfiable")
+            .to_wu()
                 + 1)
             .try_into()
             .expect("Sat weight must fit in usize.")
@@ -416,7 +561,7 @@ impl LianaDescriptor {
 
     /// Whether this is a Taproot descriptor.
     pub fn is_taproot(&self) -> bool {
-        matches!(self.multi_desc, descriptor::Descriptor::Tr(..))
+        self.policy.is_taproot()
     }
 
     /// Get some information about a PSBT input spending Liana coins.
@@ -691,6 +836,13 @@ impl SinglePathLianaDesc {
     ) -> DerivedSinglePathLianaDesc {
         assert!(index.is_normal());
 
+        if let Self::MuSig2(desc) = self {
+            return DerivedSinglePathLianaDesc::MuSig2(
+                desc.derive_descriptor(index.into())
+                    .expect("valid MuSig2 branch descriptor"),
+            );
+        }
+
         // Unfortunately we can't just use `self.0.at_derivation_index().derived_descriptor()`
         // since it would return a raw public key, but we need the origin too.
         // TODO: upstream our DerivedPublicKey stuff to rust-miniscript.
@@ -728,9 +880,12 @@ impl SinglePathLianaDesc {
             );
         }
 
-        DerivedSinglePathLianaDesc(
-            self.0
-                .translate_pk(&mut Derivator(index.into(), secp))
+        let Self::Standard(desc) = self else {
+            unreachable!("handled MuSig2 branch above");
+        };
+
+        DerivedSinglePathLianaDesc::Standard(
+            desc.translate_pk(&mut Derivator(index.into(), secp))
                 .expect(
                     "May only fail on hardened derivation indexes, but we ruled out this case.",
                 ),
@@ -741,7 +896,10 @@ impl SinglePathLianaDesc {
     pub fn as_descriptor_public_key(
         &self,
     ) -> &descriptor::Descriptor<descriptor::DescriptorPublicKey> {
-        &self.0
+        match self {
+            Self::Standard(desc) => desc,
+            Self::MuSig2(desc) => desc.shadow_desc(),
+        }
     }
 }
 
@@ -755,23 +913,37 @@ pub type Bip32Deriv = BTreeMap<secp256k1::PublicKey, (bip32::Fingerprint, bip32:
 
 impl DerivedSinglePathLianaDesc {
     pub fn address(&self, network: bitcoin::Network) -> bitcoin::Address {
-        self.0
-            .address(network)
-            .expect("A P2WSH always has an address")
+        match self {
+            Self::Standard(desc) => desc
+                .address(network)
+                .expect("A P2WSH always has an address"),
+            Self::MuSig2(desc) => desc
+                .address(network)
+                .expect("A Taproot descriptor always has an address"),
+        }
     }
 
     pub fn script_pubkey(&self) -> bitcoin::ScriptBuf {
-        self.0.script_pubkey()
+        match self {
+            Self::Standard(desc) => desc.script_pubkey(),
+            Self::MuSig2(desc) => desc.script_pubkey(),
+        }
     }
 
     // NB: panics if called for a Taproot descriptor.
     fn witness_script(&self) -> bitcoin::ScriptBuf {
-        self.0.explicit_script().expect("Not a Taproot descriptor")
+        match self {
+            Self::Standard(desc) => desc.explicit_script().expect("Not a Taproot descriptor"),
+            Self::MuSig2(_) => panic!("Not a Taproot descriptor"),
+        }
     }
 
     // NB: panics if called for a Taproot descriptor.
     fn bip32_derivations(&self) -> Bip32Deriv {
-        let ms = match self.0 {
+        let Self::Standard(desc) = self else {
+            panic!("Must never be called for a Taproot descriptor.");
+        };
+        let ms = match desc {
             descriptor::Descriptor::Wsh(ref wsh) => match wsh.as_inner() {
                 descriptor::WshInner::Ms(ms) => ms,
                 descriptor::WshInner::SortedMulti(_) => {
@@ -791,17 +963,22 @@ impl DerivedSinglePathLianaDesc {
     // avoid having to duplicate the cumbersome logic here. Could use translate_pk() instead in the
     // future.
     fn definite_desc(&self) -> descriptor::Descriptor<descriptor::DefiniteDescriptorKey> {
-        descriptor::Descriptor::<_>::from_str(&self.0.to_string()).expect("Must roundtrip")
+        match self {
+            Self::Standard(desc) => {
+                descriptor::Descriptor::<_>::from_str(&desc.to_string()).expect("Must roundtrip")
+            }
+            Self::MuSig2(desc) => desc.clone(),
+        }
     }
 
     /// Update the PSBT input information with data from this derived descriptor.
     pub fn update_psbt_in(&self, psbtin: &mut PsbtIn) {
-        match self.0 {
-            descriptor::Descriptor::Wsh(_) => {
+        match self {
+            Self::Standard(descriptor::Descriptor::Wsh(_)) => {
                 psbtin.bip32_derivation = self.bip32_derivations();
                 psbtin.witness_script = Some(self.witness_script());
             }
-            descriptor::Descriptor::Tr(_) => {
+            Self::Standard(descriptor::Descriptor::Tr(_)) | Self::MuSig2(_) => {
                 let desc = self.definite_desc();
                 if let Err(e) = psbtin.update_with_descriptor_unchecked(&desc) {
                     log::error!("BUG! Please report this! Error when adding key origins for desc: {}. Descriptor: {}.", e, desc);
@@ -814,11 +991,11 @@ impl DerivedSinglePathLianaDesc {
     /// Update the info of a PSBT output for a change output with data from this derived
     /// descriptor.
     pub fn update_change_psbt_out(&self, psbtout: &mut PsbtOut) {
-        match self.0 {
-            descriptor::Descriptor::Wsh(_) => {
+        match self {
+            Self::Standard(descriptor::Descriptor::Wsh(_)) => {
                 psbtout.bip32_derivation = self.bip32_derivations();
             }
-            descriptor::Descriptor::Tr(_) => {
+            Self::Standard(descriptor::Descriptor::Tr(_)) | Self::MuSig2(_) => {
                 let desc = self.definite_desc();
                 if let Err(e) = psbtout.update_with_descriptor_unchecked(&desc) {
                     log::error!("BUG! Please report this! Error when adding key origins for desc: {}. Descriptor: {}.", e, desc);
@@ -876,6 +1053,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(LianaDescriptor::new(policy).to_string(), "tr([abcdef01]xpub6Eze7yAT3Y1wGrnzedCNVYDXUqa9NmHVWck5emBaTbXtURbe1NWZbK9bsz1TiVE7Cz341PMTfYgFw1KdLWdzcM1UMFTcdQfCYhhXZ2HJvTW/<0;1>/*,and_v(v:pk([abcdef01]xpub688Hn4wScQAAiYJLPg9yH27hUpfZAUnmJejRQBCiwfP5PEDzjWMNW1wChcninxr5gyavFqbbDjdV1aK5USJz8NDVjUy7FRQaaqqXHh5SbXe/<0;1>/*),older(52560)))#0mt7e93c");
+
+        // MuSig2 primary key-path with a script-path inheritance branch.
+        let musig_expr = MuSig2KeyExpr::from_str("musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<0;1>/*,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/<0;1>/*)").unwrap();
+        let recovery_keys = PathInfo::Single(descriptor::DescriptorPublicKey::from_str("[1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/<2;3>/*").unwrap());
+        let policy = LianaPolicy::new_with_primary_info(
+            PrimaryPathInfo::MuSig2(musig_expr.clone()),
+            [(10, recovery_keys.clone())].iter().cloned().collect(),
+        )
+        .unwrap();
+        let descriptor = LianaDescriptor::new(policy.clone());
+        assert!(descriptor.to_string().starts_with("tr(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<0;1>/*,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/<0;1>/*),and_v(v:pk([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/<2;3>/*),older(10)))#"));
+        assert_eq!(descriptor.policy(), policy);
 
         // A 3-of-3 multisig decaying into a 2-of-3 multisig after 6 months. Trying to mimic a
         // real situation, we use keys from 3 different origins (in practice, 3 different devices
@@ -1455,6 +1644,12 @@ mod tests {
         // A descriptor with single keys in both primary and recovery paths
         roundtrip("wsh(or_d(pk([aabbccdd]xpub6Eze7yAT3Y1wGrnzedCNVYDXUqa9NmHVWck5emBaTbXtURbe1NWZbK9bsz1TiVE7Cz341PMTfYgFw1KdLWdzcM1UMFTcdQfCYhhXZ2HJvTW/<0;1>/*),and_v(v:pkh([aabbccdd]xpub688Hn4wScQAAiYJLPg9yH27hUpfZAUnmJejRQBCiwfP5PEDzjWMNW1wChcninxr5gyavFqbbDjdV1aK5USJz8NDVjUy7FRQaaqqXHh5SbXe/<0;1>/*),older(52560))))#7437yjrs");
         roundtrip("tr([8344c025]xpub661MyMwAqRbcG2SYC6YSRsUGvcSxXEZm1kjiQRTEaAqart1PQk1N1hVTTEsGfaBx6xQ5gDYXXtbourodE6ZE5qZTnaMgmehNs8GGEEY9YK6/<0;1>/*,and_v(v:pk([158fd0ef]xpub661MyMwAqRbcF2KsCnvJ4mqWXXrwd3799wCyQrLk2iNDC6CfK8UcfnABdeTpXyoJnBhRTybmtBLDAuTuHye1eQMq43BSLtR2miA6t9KqmWU/<0;1>/*),older(4242)))#zy3kddhj");
+        let musig_desc = "tr(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<0;1>/*,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/<0;1>/*),and_v(v:pk([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/<2;3>/*),older(10)))";
+        let musig_desc = format!(
+            "{musig_desc}#{}",
+            miniscript::descriptor::checksum::desc_checksum(musig_desc).unwrap()
+        );
+        roundtrip(&musig_desc);
         // One with a multisig in both paths
         roundtrip("wsh(or_d(multi(3,[aabbccdd]xpub6Eze7yAT3Y1wGrnzedCNVYDXUqa9NmHVWck5emBaTbXtURbe1NWZbK9bsz1TiVE7Cz341PMTfYgFw1KdLWdzcM1UMFTcdQfCYhhXZ2HJvTW/<0;1>/*,[aabb0011/10/4893]xpub6Bw79HbNSeS2xXw1sngPE3ehnk1U3iSPCgLYzC9LpN8m9nDuaKLZvkg8QXxL5pDmEmQtYscmUD8B9MkAAZbh6vxPzNXMaLfGQ9Sb3z85qhR/<0;1>/*,[aabb0022]xpub67zuTXF9Ln4731avKTBSawoVVNRuMfmRvkL7kLUaLBRqma9ZqdHBJg9qx8cPUm3oNQMiXT4TmGovXNoQPuwg17RFcVJ8YrnbcooN7pxVJqC/<0;1>/*),and_v(v:multi(2,[aabbccdd]xpub69cP4Y7S9TWcbSNxmk6CEDBsoaqr3ZEdjHuZcHxEFFKGh569RsJNr2V27XGhsbH9FXgWUEmKXRN7c5wQfq2VPjt31xP9VsYnVUyU8HcVevm/<0;1>/*,[aabb0011]xpub6AA2N8RALRYgLD6jT1iXYCEDkndTeZndMtWPbtNX6sY5dPiLtf2T88ahdxrGXMUPoNadgR86sFhBXWQVgifPzDYbY9ZtwK4gqzx4y5Da1DW/<0;1>/*,[aabb0022/10/4893]xpub6AyxexvxizZJffF153evmfqHcE9MV88fCNCAtP3jQjXJHwrAKri71Tq9jWUkPxj9pja4u6AkCPHY7atgxzSEa2HtDwJfrRWKK4fsfQg4o77/<0;1>/*),older(26352))))#csjdk94l");
         roundtrip("tr(xpub661MyMwAqRbcGg7oXkMMptXXJAGxQtVM7LZeqXNNdxPiWyEmuJdoyFD3NhRpL1YTo313XRWZmiUXTkcEK9EFQHrbie6NBNAvL2CZXp941Li/<0;1>/*,{and_v(v:multi_a(2,[6b882e01]xpub661MyMwAqRbcGRU9psMcDAPd2L2ShzwoenySSSjWpkd7u8Wv7PCPtH5fi6WYYbQAqSG4U3NbuYASCRMkWVYm7yb97iTY4MUKKZ3N8XwCERJ/<0;1>/*,[66b98303]xpub661MyMwAqRbcGicAwMZ5pHCWrB4DEMBGUtvkV2KMMLypR8dbr7g2uV9vzE9w3oDKRqtTV6HYTqHHvusxNwJUXAvRH6BFhKUPTgGMiLPnSmK/<0;1>/*,[9c04a03b]xpub661MyMwAqRbcFCBt8Gjs71UqoMe8V4PSHECuCowg1TR7EkGWLLbu2WanQtcWutzwahrTcicsuL25Q7r6EyfbEKF2jSoekmnw9soZfoiLZXu/<0;1>/*),older(42421)),multi_a(3,[30188cc2]xpub661MyMwAqRbcGeoYQgqUapNKDLBiNE7fcGs6ibKi39GjuiRmV1JgXcfAwHjt7PLLofmz4PPL66NTwAxaTwGtL8YB67RhRspAzbKgneqpenb/<0;1>/*,[aea08adc]xpub661MyMwAqRbcGVL3W5qKT8pjZ3BXcDEJghDj67rKLQYwmTaJLud8RWyYwZQ9LdzkcNtCSCHVypZdUUxd4z2k5hCfb6qprGgwAKqpmaKJTnS/<0;1>/*,[85e33ca4]xpub661MyMwAqRbcFHP9bmnRofzha8c4DHADC7ToPz3kYdov5DDDtgdBEQ3kVcwdjjqAGC8eJZ65CLF2cA9XHhUsJJqKxbE9asj8RUNmGjCJErX/<0;1>/*)})#zm4kj6yd");

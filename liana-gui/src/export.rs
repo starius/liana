@@ -603,7 +603,7 @@ pub async fn export_encrypted_descriptor(
     path: PathBuf,
     descr: LianaDescriptor,
 ) -> Result<(), Error> {
-    let descriptor = descr.descriptor();
+    let descriptor = descr.descriptor().ok_or(Error::EncryptionFailed)?;
     let bytes = EncryptedBackup::new().set_payload(descriptor)?.encrypt()?;
 
     send_progress!(sender, Progress(30.0));

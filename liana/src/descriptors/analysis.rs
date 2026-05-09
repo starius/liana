@@ -18,7 +18,7 @@ use std::{
     sync,
 };
 
-use crate::descriptors::musig::MuSig2KeyExpr;
+use crate::descriptors::musig::{dummy_shadow_key, MuSig2KeyExpr};
 
 #[derive(Debug)]
 pub enum LianaPolicyError {
@@ -838,7 +838,16 @@ impl LianaPolicy {
             is_taproot,
         };
         if compile {
-            policy.clone().compile_multipath_descriptor_fallible()?;
+            if matches!(policy.primary_path, PrimaryPathInfo::MuSig2(_)) {
+                let shadow_policy = LianaPolicy {
+                    primary_path: PrimaryPathInfo::KeyPath(PathInfo::Single(dummy_shadow_key())),
+                    recovery_paths: policy.recovery_paths.clone(),
+                    is_taproot: policy.is_taproot,
+                };
+                shadow_policy.compile_multipath_descriptor_fallible()?;
+            } else {
+                policy.clone().compile_multipath_descriptor_fallible()?;
+            }
         }
         Ok(policy)
     }
@@ -860,6 +869,19 @@ impl LianaPolicy {
             recovery_paths,
             /* is_taproot = */ true,
             /* compile = */ true,
+        )
+    }
+
+    pub(crate) fn from_parts_uncompiled(
+        primary_path: PrimaryPathInfo,
+        recovery_paths: BTreeMap<u16, PathInfo>,
+        is_taproot: bool,
+    ) -> Result<LianaPolicy, LianaPolicyError> {
+        Self::_new(
+            primary_path,
+            recovery_paths,
+            is_taproot,
+            /* compile = */ false,
         )
     }
 
@@ -996,6 +1018,10 @@ impl LianaPolicy {
     pub fn recovery_paths(&self) -> &BTreeMap<u16, PathInfo> {
         assert!(!self.recovery_paths.is_empty());
         &self.recovery_paths
+    }
+
+    pub fn is_taproot(&self) -> bool {
+        self.is_taproot
     }
 
     fn into_policy(

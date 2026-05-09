@@ -161,6 +161,11 @@ impl fmt::Display for MuSig2KeyExpr {
     }
 }
 
+pub fn dummy_shadow_key() -> DescriptorPublicKey {
+    DescriptorPublicKey::from_str(&format!("{DUMMY_XPUB}{DUMMY_SHADOW_SUFFIX}"))
+        .expect("valid dummy shadow key")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MuSig2TaprootDescriptor {
     expr: MuSig2KeyExpr,
