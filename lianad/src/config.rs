@@ -556,7 +556,10 @@ mod tests {
 
         #[cfg(target_os = "linux")]
         {
-            assert!(filepath.as_path().starts_with("/home/"));
+            let home_dir = std::env::var_os("HOME").expect("HOME env var to be set");
+            assert!(filepath
+                .as_path()
+                .starts_with(std::path::Path::new(&home_dir)));
             assert!(filepath.as_path().ends_with(".liana/liana.toml"));
         }
 
