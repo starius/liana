@@ -389,29 +389,37 @@ pub enum MuSig2DerivationMode {
 /// This is kept distinct from recovery paths so Taproot-only primary path types such as MuSig2
 /// can be introduced without overloading the semantics of `PathInfo`.
 #[derive(Debug, Eq, PartialEq, Clone, Ord, PartialOrd, Hash)]
-pub struct PrimaryPathInfo(PathInfo);
+pub enum PrimaryPathInfo {
+    KeyPath(PathInfo),
+}
 
 impl PrimaryPathInfo {
     pub fn from_key_path(path: PathInfo) -> Self {
-        Self(path)
+        Self::KeyPath(path)
     }
 
     pub fn from_primary_path(
         policy: SemanticPolicy<descriptor::DescriptorPublicKey>,
     ) -> Result<Self, LianaPolicyError> {
-        PathInfo::from_primary_path(policy).map(Self)
+        PathInfo::from_primary_path(policy).map(Self::KeyPath)
     }
 
-    pub fn as_key_path(&self) -> &PathInfo {
-        &self.0
+    pub fn as_key_path(&self) -> Option<&PathInfo> {
+        match self {
+            Self::KeyPath(path) => Some(path),
+        }
     }
 
-    pub fn into_key_path(self) -> PathInfo {
-        self.0
+    pub fn into_key_path(self) -> Option<PathInfo> {
+        match self {
+            Self::KeyPath(path) => Some(path),
+        }
     }
 
     pub fn with_added_key(self, key: descriptor::DescriptorPublicKey) -> Self {
-        Self(self.0.with_added_key(key))
+        match self {
+            Self::KeyPath(path) => Self::KeyPath(path.with_added_key(key)),
+        }
     }
 
     pub fn thresh_origins(
@@ -420,24 +428,32 @@ impl PrimaryPathInfo {
         usize,
         HashMap<bip32::Fingerprint, HashSet<bip32::DerivationPath>>,
     ) {
-        self.0.thresh_origins()
+        match self {
+            Self::KeyPath(path) => path.thresh_origins(),
+        }
     }
 
     pub fn spend_info<'a>(
         &self,
         all_pubkeys_signed: impl Iterator<Item = &'a (bip32::Fingerprint, bip32::DerivationPath)>,
     ) -> PathSpendInfo {
-        self.0.spend_info(all_pubkeys_signed)
+        match self {
+            Self::KeyPath(path) => path.spend_info(all_pubkeys_signed),
+        }
     }
 
     pub fn into_ms_policy(
         self,
     ) -> Result<ConcretePolicy<descriptor::DescriptorPublicKey>, LianaPolicyError> {
-        self.0.into_ms_policy()
+        match self {
+            Self::KeyPath(path) => path.into_ms_policy(),
+        }
     }
 
     pub fn contains_fingerprint(&self, fingerprint: Fingerprint) -> bool {
-        self.0.contains_fingerprint(fingerprint)
+        match self {
+            Self::KeyPath(path) => path.contains_fingerprint(fingerprint),
+        }
     }
 }
 
@@ -449,7 +465,7 @@ impl From<PathInfo> for PrimaryPathInfo {
 
 impl PartialEq<PathInfo> for PrimaryPathInfo {
     fn eq(&self, other: &PathInfo) -> bool {
-        self.as_key_path() == other
+        self.as_key_path() == Some(other)
     }
 }
 
@@ -585,10 +601,11 @@ impl LianaPolicy {
         // "descriptor key expression" level. We don't want duplicate xpubs at all so we do it
         // ourselves here.
         let mut key_checker = DescKeyChecker::new();
-        for path in recovery_paths
-            .values()
-            .chain(std::iter::once(primary_path.as_key_path()))
-        {
+        for path in recovery_paths.values().chain(std::iter::once(
+            primary_path
+                .as_key_path()
+                .expect("Current Liana primary paths are plain key paths."),
+        )) {
             match path {
                 PathInfo::Single(ref key) => {
                     let _ = key_checker.check(key)?;

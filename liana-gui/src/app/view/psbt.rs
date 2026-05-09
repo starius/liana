@@ -513,7 +513,10 @@ pub fn signatures<'a>(
                         .push(text("Finalizing this transaction requires:"))
                         .push_maybe(if tx.sigs.recovery_paths().is_empty() {
                             Some(path_view(
-                                desc_info.primary_path().as_key_path(),
+                                desc_info
+                                    .primary_path()
+                                    .as_key_path()
+                                    .expect("Current Liana primary paths are plain key paths."),
                                 tx.sigs.primary_path(),
                                 keys_aliases,
                             ))
