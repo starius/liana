@@ -7,7 +7,7 @@ use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{container, rule, Column};
 use iced::{
     alignment,
-    widget::{radio, scrollable, tooltip as iced_tooltip, Space},
+    widget::{checkbox, radio, scrollable, tooltip as iced_tooltip, Space},
     Alignment, Length,
 };
 
@@ -37,6 +37,7 @@ use crate::{
     help,
     hw::HardwareWallet,
     node::{
+        bip157,
         bitcoind::{RpcAuthType, RpcAuthValues},
         electrum::{self, validate_domain_checkbox},
     },
@@ -822,6 +823,264 @@ pub fn electrum<'a>(
                         Row::new()
                             .push(badge::badge(icon::bitcoin_icon()))
                             .push(text("Electrum").bold())
+                            .push_maybe(if is_configured_node_type {
+                                Some(is_running_label(is_running))
+                            } else {
+                                None
+                            })
+                            .spacing(20)
+                            .align_y(Alignment::Center)
+                            .width(Length::Fill),
+                    )
+                    .push(if can_edit {
+                        Button::new(icon::pencil_icon())
+                            .style(theme::button::transparent_border)
+                            .on_press(SettingsEditMessage::Select)
+                    } else {
+                        Button::new(icon::pencil_icon()).style(theme::button::transparent_border)
+                    })
+                    .align_y(Alignment::Center),
+            )
+            .push(separation().width(Length::Fill))
+            .push(col.push(col_fields))
+            .spacing(20),
+    ))
+    .width(Length::Fill)
+    .into()
+}
+
+pub fn bip157_edit<'a>(
+    is_configured_node_type: bool,
+    network: Network,
+    blockheight: i32,
+    peers: &form::Value<String>,
+    required_peers: &form::Value<String>,
+    whitelist_only: bool,
+    proxy_addr: &form::Value<String>,
+    processing: bool,
+) -> Element<'a, SettingsEditMessage> {
+    let mut col = Column::new().spacing(20);
+    if is_configured_node_type && blockheight != 0 {
+        col = col
+            .push(
+                Row::new()
+                    .push(
+                        Row::new()
+                            .push(badge::badge(icon::network_icon()))
+                            .push(
+                                Column::new()
+                                    .push(text("Network:"))
+                                    .push(text(network.to_string()).bold()),
+                            )
+                            .spacing(10)
+                            .width(Length::FillPortion(1)),
+                    )
+                    .push(
+                        Row::new()
+                            .push(badge::badge(icon::block_icon()))
+                            .push(
+                                Column::new()
+                                    .push(text("Block Height:"))
+                                    .push(text(blockheight.to_string()).bold()),
+                            )
+                            .spacing(10)
+                            .width(Length::FillPortion(1)),
+                    ),
+            )
+            .push(separation().width(Length::Fill));
+    }
+
+    col = col
+        .push(
+            Column::new()
+                .push(text("Peers:").bold().small())
+                .push(
+                    form::Form::new_trimmed(
+                        "seed.bitcoin.sipa.be:8333, 127.0.0.1",
+                        peers,
+                        |value| SettingsEditMessage::FieldEdited("peers", value),
+                    )
+                    .size(P1_SIZE)
+                    .padding(5),
+                )
+                .push(text(bip157::PEERS_NOTES).size(P2_SIZE))
+                .spacing(5),
+        )
+        .push(
+            Row::new()
+                .push(
+                    Column::new()
+                        .push(text("Required peers:").bold().small())
+                        .push(
+                            form::Form::new_trimmed("1", required_peers, |value| {
+                                SettingsEditMessage::FieldEdited("required_peers", value)
+                            })
+                            .warning("Please enter a number between 1 and 15")
+                            .size(P1_SIZE)
+                            .padding(5),
+                        )
+                        .push(text(bip157::REQUIRED_PEERS_NOTES).size(P2_SIZE))
+                        .spacing(5)
+                        .width(Length::Fill),
+                )
+                .push(
+                    Column::new()
+                        .push(text("Socks5 proxy:").bold().small())
+                        .push(
+                            form::Form::new_trimmed("127.0.0.1:9050", proxy_addr, |value| {
+                                SettingsEditMessage::FieldEdited("proxy_addr", value)
+                            })
+                            .warning("Please enter a valid host:port or leave empty")
+                            .size(P1_SIZE)
+                            .padding(5),
+                        )
+                        .push(text(bip157::PROXY_ADDR_NOTES).size(P2_SIZE))
+                        .spacing(5)
+                        .width(Length::Fill),
+                )
+                .spacing(10),
+        )
+        .push(
+            checkbox(whitelist_only)
+                .label(bip157::WHITELIST_ONLY_LABEL)
+                .on_toggle(SettingsEditMessage::Bip157WhitelistOnlyEdited),
+        );
+
+    let mut cancel_button = button::transparent(None, " Cancel ").padding(5);
+    let mut confirm_button = button::secondary(None, " Save ").padding(5);
+    if !processing {
+        cancel_button = cancel_button.on_press(SettingsEditMessage::Cancel);
+        confirm_button = confirm_button.on_press(SettingsEditMessage::Confirm);
+    }
+
+    card::simple(Container::new(
+        Column::new()
+            .push(
+                Row::new()
+                    .push(badge::badge(icon::bitcoin_icon()))
+                    .push(text("Compact filters").bold())
+                    .padding(10)
+                    .spacing(20)
+                    .align_y(Alignment::Center)
+                    .width(Length::Fill),
+            )
+            .push(separation().width(Length::Fill))
+            .push(col)
+            .push(
+                Container::new(
+                    Row::new()
+                        .push(cancel_button)
+                        .push(confirm_button)
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .align_x(alignment::Horizontal::Right),
+            )
+            .spacing(20),
+    ))
+    .width(Length::Fill)
+    .into()
+}
+
+pub fn bip157<'a>(
+    is_configured_node_type: bool,
+    network: Network,
+    config: &lianad::config::Bip157Config,
+    blockheight: i32,
+    is_running: Option<bool>,
+    can_edit: bool,
+) -> Element<'a, SettingsEditMessage> {
+    let mut col = Column::new().spacing(20);
+    if is_configured_node_type && blockheight != 0 {
+        col = col
+            .push(
+                Row::new()
+                    .push(
+                        Row::new()
+                            .push(badge::badge(icon::network_icon()))
+                            .push(
+                                Column::new()
+                                    .push(text("Network:"))
+                                    .push(text(network.to_string()).bold()),
+                            )
+                            .spacing(10)
+                            .width(Length::FillPortion(1)),
+                    )
+                    .push(
+                        Row::new()
+                            .push(badge::badge(icon::block_icon()))
+                            .push(
+                                Column::new()
+                                    .push(text("Block Height:"))
+                                    .push(text(blockheight.to_string()).bold()),
+                            )
+                            .spacing(10)
+                            .width(Length::FillPortion(1)),
+                    ),
+            )
+            .push(separation().width(Length::Fill));
+    }
+
+    let rows = if is_configured_node_type {
+        vec![
+            ("Peers:", bip157::peers_to_string(&config.peers)),
+            ("Required peers:", config.required_peers.to_string()),
+            (
+                "Whitelist-only:",
+                if config.whitelist_only { "Yes" } else { "No" }.to_string(),
+            ),
+            (
+                "Socks5 proxy:",
+                config
+                    .proxy_addr
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_else(|| "Not set".to_string()),
+            ),
+        ]
+    } else {
+        vec![]
+    };
+
+    let mut col_fields = Column::new();
+    for (k, v) in rows {
+        col_fields = col_fields.push(
+            Row::new()
+                .push(Container::new(text(k).bold().small()).width(Length::FillPortion(1)))
+                .push(
+                    Container::new(
+                        scrollable(
+                            Column::new()
+                                .push(Space::with_height(Length::Fixed(10.0)))
+                                .push(text(v.clone()).small())
+                                .push(Space::with_height(Length::Fixed(10.0))),
+                        )
+                        .direction(scrollable::Direction::Horizontal(
+                            scrollable::Scrollbar::new().width(2).scroller_width(2),
+                        )),
+                    )
+                    .align_x(alignment::Horizontal::Right)
+                    .padding(10)
+                    .width(Length::FillPortion(3)),
+                )
+                .push(Space::with_width(10))
+                .push(
+                    Button::new(icon::clipboard_icon())
+                        .style(theme::button::transparent_border)
+                        .on_press(SettingsEditMessage::Clipboard(v.to_string())),
+                )
+                .align_y(Alignment::Center),
+        );
+    }
+
+    card::simple(Container::new(
+        Column::new()
+            .push(
+                Row::new()
+                    .push(
+                        Row::new()
+                            .push(badge::badge(icon::bitcoin_icon()))
+                            .push(text("Compact filters").bold())
                             .push_maybe(if is_configured_node_type {
                                 Some(is_running_label(is_running))
                             } else {

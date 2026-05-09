@@ -45,6 +45,7 @@ use crate::{
         Error,
     },
     node::{
+        bip157,
         bitcoind::{ConfigField, RpcAuthType, RpcAuthValues, StartInternalBitcoindError},
         electrum, NodeType,
     },
@@ -968,10 +969,7 @@ pub fn define_bitcoin_node<'a>(
                     .spacing(10),
                 |row, node_type| {
                     row.push(radio(
-                        match node_type {
-                            NodeType::Bitcoind => "Bitcoin Core",
-                            NodeType::Electrum => "Electrum",
-                        },
+                        node_type.name(),
                         node_type,
                         Some(selected_node_type),
                         |new_selection| {
@@ -1187,6 +1185,87 @@ pub fn define_electrum<'a>(
         .spacing(10);
 
     Column::new().push(col_address).spacing(50).into()
+}
+
+pub fn define_bip157<'a>(
+    peers: &form::Value<String>,
+    required_peers: &form::Value<String>,
+    whitelist_only: bool,
+    proxy_addr: &form::Value<String>,
+) -> Element<'a, Message> {
+    let whitelist_only_checkbox = checkbox(whitelist_only)
+        .label(bip157::WHITELIST_ONLY_LABEL)
+        .on_toggle(|value| {
+            Message::DefineNode(DefineNode::DefineBip157(
+                message::DefineBip157::WhitelistOnlyChanged(value),
+            ))
+        });
+    Column::new()
+        .push(
+            Column::new()
+                .push(text("Peers:").bold())
+                .push(
+                    form::Form::new_trimmed("seed.bitcoin.sipa.be:8333, 127.0.0.1", peers, |msg| {
+                        Message::DefineNode(DefineNode::DefineBip157(
+                            message::DefineBip157::ConfigFieldEdited(
+                                bip157::ConfigField::Peers,
+                                msg,
+                            ),
+                        ))
+                    })
+                    .size(text::P1_SIZE)
+                    .padding(10),
+                )
+                .push(text(bip157::PEERS_NOTES))
+                .spacing(10),
+        )
+        .push(
+            Row::new()
+                .push(
+                    Column::new()
+                        .push(text("Required peers:").bold())
+                        .push(
+                            form::Form::new_trimmed("1", required_peers, |msg| {
+                                Message::DefineNode(DefineNode::DefineBip157(
+                                    message::DefineBip157::ConfigFieldEdited(
+                                        bip157::ConfigField::RequiredPeers,
+                                        msg,
+                                    ),
+                                ))
+                            })
+                            .warning("Please enter a number between 1 and 15")
+                            .size(text::P1_SIZE)
+                            .padding(10),
+                        )
+                        .push(text(bip157::REQUIRED_PEERS_NOTES))
+                        .spacing(10)
+                        .width(Length::Fill),
+                )
+                .push(
+                    Column::new()
+                        .push(text("Socks5 proxy:").bold())
+                        .push(
+                            form::Form::new_trimmed("127.0.0.1:9050", proxy_addr, |msg| {
+                                Message::DefineNode(DefineNode::DefineBip157(
+                                    message::DefineBip157::ConfigFieldEdited(
+                                        bip157::ConfigField::ProxyAddr,
+                                        msg,
+                                    ),
+                                ))
+                            })
+                            .warning("Please enter a valid host:port or leave empty")
+                            .size(text::P1_SIZE)
+                            .padding(10),
+                        )
+                        .push(text(bip157::PROXY_ADDR_NOTES))
+                        .spacing(10)
+                        .width(Length::Fill),
+                )
+                .spacing(10),
+        )
+        .push(whitelist_only_checkbox)
+        .spacing(50)
+        .into()
 }
 
 pub fn select_bitcoind_type<'a>(progress: (usize, usize)) -> Element<'a, Message> {

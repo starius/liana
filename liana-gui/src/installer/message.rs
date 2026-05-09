@@ -26,6 +26,7 @@ use crate::{
     hw::HardwareWalletMessage,
     installer::{decrypt::Decrypt, descriptor::PathKind},
     node::{
+        bip157,
         bitcoind::{Bitcoind, ConfigField, RpcAuthType},
         electrum, NodeType,
     },
@@ -141,10 +142,17 @@ pub enum DefineElectrum {
 }
 
 #[derive(Debug, Clone)]
+pub enum DefineBip157 {
+    ConfigFieldEdited(bip157::ConfigField, String),
+    WhitelistOnlyChanged(bool),
+}
+
+#[derive(Debug, Clone)]
 pub enum DefineNode {
     NodeTypeSelected(NodeType),
     DefineBitcoind(DefineBitcoind),
     DefineElectrum(DefineElectrum),
+    DefineBip157(DefineBip157),
     PingResult((NodeType, Result<(), Error>)),
     Ping,
 }

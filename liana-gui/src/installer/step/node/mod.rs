@@ -1,3 +1,4 @@
+pub mod bip157;
 pub mod bitcoind;
 pub mod electrum;
 
@@ -7,7 +8,7 @@ use crate::{
         context::Context,
         message::{self, Message},
         step::{
-            node::{bitcoind::DefineBitcoind, electrum::DefineElectrum},
+            node::{bip157::DefineBip157, bitcoind::DefineBitcoind, electrum::DefineElectrum},
             Step,
         },
         view, Error,
@@ -22,6 +23,7 @@ use liana_ui::widget::Element;
 pub enum NodeDefinition {
     Bitcoind(DefineBitcoind),
     Electrum(DefineElectrum),
+    Bip157(DefineBip157),
 }
 
 impl NodeDefinition {
@@ -29,6 +31,7 @@ impl NodeDefinition {
         match node_type {
             NodeType::Bitcoind => NodeDefinition::Bitcoind(DefineBitcoind::new()),
             NodeType::Electrum => NodeDefinition::Electrum(DefineElectrum::new()),
+            NodeType::Bip157 => NodeDefinition::Bip157(DefineBip157::new()),
         }
     }
 
@@ -36,6 +39,7 @@ impl NodeDefinition {
         match self {
             NodeDefinition::Bitcoind(_) => NodeType::Bitcoind,
             NodeDefinition::Electrum(_) => NodeType::Electrum,
+            NodeDefinition::Bip157(_) => NodeType::Bip157,
         }
     }
 
@@ -43,6 +47,7 @@ impl NodeDefinition {
         match self {
             NodeDefinition::Bitcoind(def) => def.apply(ctx),
             NodeDefinition::Electrum(def) => def.apply(ctx),
+            NodeDefinition::Bip157(def) => def.apply(ctx),
         }
     }
 
@@ -50,15 +55,15 @@ impl NodeDefinition {
         match self {
             NodeDefinition::Bitcoind(def) => def.can_try_ping(),
             NodeDefinition::Electrum(def) => def.can_try_ping(),
+            NodeDefinition::Bip157(def) => def.can_try_ping(),
         }
     }
 
     fn load_context(&mut self, ctx: &Context) {
         match self {
             NodeDefinition::Bitcoind(def) => def.load_context(ctx),
-            NodeDefinition::Electrum(_) => {
-                // noop for now
-            }
+            NodeDefinition::Electrum(_) => {}
+            NodeDefinition::Bip157(def) => def.load_context(ctx),
         }
     }
 
@@ -66,6 +71,7 @@ impl NodeDefinition {
         match self {
             NodeDefinition::Bitcoind(def) => def.update(message),
             NodeDefinition::Electrum(def) => def.update(message),
+            NodeDefinition::Bip157(def) => def.update(message),
         }
     }
 
@@ -73,6 +79,7 @@ impl NodeDefinition {
         match self {
             NodeDefinition::Bitcoind(def) => def.view(),
             NodeDefinition::Electrum(def) => def.view(),
+            NodeDefinition::Bip157(def) => def.view(),
         }
     }
 
@@ -80,6 +87,7 @@ impl NodeDefinition {
         match self {
             NodeDefinition::Bitcoind(def) => def.ping(),
             NodeDefinition::Electrum(def) => def.ping(),
+            NodeDefinition::Bip157(def) => def.ping(),
         }
     }
 }
@@ -117,6 +125,7 @@ impl DefineNode {
             // This is the order in which the available node types will be shown to the user.
             NodeType::Bitcoind,
             NodeType::Electrum,
+            NodeType::Bip157,
         ];
         assert!(available_node_types.contains(&selected_node_type));
 
@@ -215,6 +224,9 @@ impl Step for DefineNode {
                 }
                 msg @ message::DefineNode::DefineElectrum(_) => {
                     return self.update_node(NodeType::Electrum, msg);
+                }
+                msg @ message::DefineNode::DefineBip157(_) => {
+                    return self.update_node(NodeType::Bip157, msg);
                 }
             }
         }

@@ -292,6 +292,7 @@ pub fn sync_status(
         // treat it the same as bitcoind to be sure we don't mislead the user.
         if daemon_backend == DaemonBackend::RemoteBackend
             || daemon_backend == DaemonBackend::EmbeddedLianad(Some(NodeType::Electrum))
+            || daemon_backend == DaemonBackend::EmbeddedLianad(Some(NodeType::Bip157))
         {
             return SyncStatus::WalletFullScan;
         }

@@ -10,7 +10,8 @@ use tracing::info;
 
 use liana::miniscript::bitcoin::Network;
 use lianad::config::{
-    BitcoinBackend, BitcoinConfig, BitcoindConfig, BitcoindRpcAuth, Config, ElectrumConfig,
+    Bip157Config, BitcoinBackend, BitcoinConfig, BitcoindConfig, BitcoindRpcAuth, Config,
+    ElectrumConfig,
 };
 
 use liana_ui::{component::form, widget::Element};
@@ -20,6 +21,7 @@ use crate::{
     daemon::Daemon,
     help,
     node::{
+        bip157,
         bitcoind::{RpcAuthType, RpcAuthValues},
         NodeType,
     },
@@ -32,6 +34,7 @@ pub struct BitcoindSettingsState {
 
     bitcoind_settings: Option<BitcoindSettings>,
     electrum_settings: Option<ElectrumSettings>,
+    bip157_settings: Option<Bip157Settings>,
     rescan_settings: RescanSetting,
 }
 
@@ -43,17 +46,22 @@ impl BitcoindSettingsState {
         bitcoind_is_internal: bool,
     ) -> Self {
         let mut configured_node_type = None;
-        let (bitcoind_config, electrum_config) =
+        let bitcoin_config = config.as_ref().map(|config| config.bitcoin_config.clone());
+        let (bitcoind_config, electrum_config, bip157_config) =
             match config.clone().and_then(|c| c.bitcoin_backend) {
                 Some(BitcoinBackend::Bitcoind(bitcoind_config)) => {
                     configured_node_type = Some(NodeType::Bitcoind);
-                    (Some(bitcoind_config), None)
+                    (Some(bitcoind_config), None, None)
                 }
                 Some(BitcoinBackend::Electrum(electrum_config)) => {
                     configured_node_type = Some(NodeType::Electrum);
-                    (None, Some(electrum_config))
+                    (None, Some(electrum_config), None)
                 }
-                _ => (None, None),
+                Some(BitcoinBackend::Bip157(bip157_config)) => {
+                    configured_node_type = Some(NodeType::Bip157);
+                    (None, None, Some(bip157_config))
+                }
+                _ => (None, None, None),
             };
         BitcoindSettingsState {
             warning: None,
@@ -61,10 +69,9 @@ impl BitcoindSettingsState {
             bitcoind_settings: bitcoind_config.map(|bitcoind_config| {
                 BitcoindSettings::new(
                     configured_node_type,
-                    config
+                    bitcoin_config
                         .clone()
-                        .expect("config must exist if bitcoind_config exists")
-                        .bitcoin_config,
+                        .expect("config must exist if bitcoind_config exists"),
                     bitcoind_config,
                     daemon_is_external,
                     bitcoind_is_internal,
@@ -73,10 +80,18 @@ impl BitcoindSettingsState {
             electrum_settings: electrum_config.map(|electrum_config| {
                 ElectrumSettings::new(
                     configured_node_type,
-                    config
-                        .expect("config must exist if electrum_config exists")
-                        .bitcoin_config,
+                    bitcoin_config
+                        .clone()
+                        .expect("config must exist if electrum_config exists"),
                     electrum_config,
+                    daemon_is_external,
+                )
+            }),
+            bip157_settings: bip157_config.map(|bip157_config| {
+                Bip157Settings::new(
+                    configured_node_type,
+                    bitcoin_config.expect("config must exist if bip157_config exists"),
+                    bip157_config,
                     daemon_is_external,
                 )
             }),
@@ -113,6 +128,14 @@ impl State for BitcoindSettingsState {
                             ))
                         });
                     }
+                    if let Some(settings) = &mut self.bip157_settings {
+                        settings.edited(true);
+                        return Task::perform(async {}, |_| {
+                            Message::View(view::Message::Settings(
+                                view::SettingsMessage::EditBitcoindSettings,
+                            ))
+                        });
+                    }
                 }
                 Err(e) => {
                     self.config_updated = false;
@@ -121,6 +144,9 @@ impl State for BitcoindSettingsState {
                         settings.edited(false);
                     }
                     if let Some(settings) = &mut self.electrum_settings {
+                        settings.edited(false);
+                    }
+                    if let Some(settings) = &mut self.bip157_settings {
                         settings.edited(false);
                     }
                 }
@@ -154,6 +180,11 @@ impl State for BitcoindSettingsState {
                     return settings.update(daemon, cache, msg);
                 }
             }
+            Message::View(view::Message::Settings(view::SettingsMessage::Bip157Settings(msg))) => {
+                if let Some(settings) = &mut self.bip157_settings {
+                    return settings.update(daemon, cache, msg);
+                }
+            }
             Message::View(view::Message::Settings(view::SettingsMessage::RescanSettings(msg))) => {
                 return self.rescan_settings.update(daemon, cache, msg);
             }
@@ -167,6 +198,8 @@ impl State for BitcoindSettingsState {
             self.bitcoind_settings.is_some() && !self.rescan_settings.processing;
         let can_edit_electrum_settings =
             self.electrum_settings.is_some() && !self.rescan_settings.processing;
+        let can_edit_bip157_settings =
+            self.bip157_settings.is_some() && !self.rescan_settings.processing;
         let settings_edit = self
             .bitcoind_settings
             .as_ref()
@@ -176,12 +209,16 @@ impl State for BitcoindSettingsState {
                 .electrum_settings
                 .as_ref()
                 .map(|settings| settings.edit)
-                == Some(true);
+                == Some(true)
+            || self.bip157_settings.as_ref().map(|settings| settings.edit) == Some(true);
         let can_do_rescan = !self.rescan_settings.processing && !settings_edit;
         view::settings::bitcoind_settings(
             cache,
             self.warning.as_ref(),
-            if self.bitcoind_settings.is_some() || self.electrum_settings.is_some() {
+            if self.bitcoind_settings.is_some()
+                || self.electrum_settings.is_some()
+                || self.bip157_settings.is_some()
+            {
                 let mut setting_panels = Vec::new();
                 if let Some(settings) = self.bitcoind_settings.as_ref() {
                     setting_panels.push(settings.view(cache, can_edit_bitcoind_settings).map(
@@ -194,6 +231,13 @@ impl State for BitcoindSettingsState {
                     setting_panels.push(settings.view(cache, can_edit_electrum_settings).map(
                         move |msg| {
                             view::Message::Settings(view::SettingsMessage::ElectrumSettings(msg))
+                        },
+                    ))
+                }
+                if let Some(settings) = self.bip157_settings.as_ref() {
+                    setting_panels.push(settings.view(cache, can_edit_bip157_settings).map(
+                        move |msg| {
+                            view::Message::Settings(view::SettingsMessage::Bip157Settings(msg))
                         },
                     ))
                 }
@@ -336,6 +380,7 @@ impl BitcoindSettings {
                 }
             }
             view::SettingsEditMessage::ValidateDomainEdited(_) => {}
+            view::SettingsEditMessage::Bip157WhitelistOnlyEdited(_) => {}
             view::SettingsEditMessage::BitcoindRpcAuthTypeSelected(auth_type) => {
                 if !self.processing {
                     self.selected_auth_type = auth_type;
@@ -511,6 +556,150 @@ impl ElectrumSettings {
                 is_configured_node_type,
                 self.bitcoin_config.network,
                 &self.electrum_config,
+                cache.blockheight(),
+                Some(cache.blockheight() != 0),
+                can_edit && !self.daemon_is_external,
+            )
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Bip157Settings {
+    configured_node_type: Option<NodeType>,
+    bip157_config: Bip157Config,
+    bitcoin_config: BitcoinConfig,
+    edit: bool,
+    processing: bool,
+    peers: form::Value<String>,
+    required_peers: form::Value<String>,
+    whitelist_only: bool,
+    proxy_addr: form::Value<String>,
+    daemon_is_external: bool,
+}
+
+impl Bip157Settings {
+    fn new(
+        configured_node_type: Option<NodeType>,
+        bitcoin_config: BitcoinConfig,
+        bip157_config: Bip157Config,
+        daemon_is_external: bool,
+    ) -> Bip157Settings {
+        Bip157Settings {
+            configured_node_type,
+            daemon_is_external,
+            peers: form::Value {
+                valid: true,
+                warning: None,
+                value: bip157::peers_to_string(&bip157_config.peers),
+            },
+            required_peers: form::Value {
+                valid: true,
+                warning: None,
+                value: bip157_config.required_peers.to_string(),
+            },
+            whitelist_only: bip157_config.whitelist_only,
+            proxy_addr: form::Value {
+                valid: true,
+                warning: None,
+                value: bip157_config
+                    .proxy_addr
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_default(),
+            },
+            bip157_config,
+            bitcoin_config,
+            edit: false,
+            processing: false,
+        }
+    }
+
+    fn edited(&mut self, success: bool) {
+        self.processing = false;
+        if success {
+            self.edit = false;
+        }
+    }
+
+    fn update(
+        &mut self,
+        daemon: Arc<dyn Daemon + Sync + Send>,
+        _cache: &Cache,
+        message: view::SettingsEditMessage,
+    ) -> Task<Message> {
+        match message {
+            view::SettingsEditMessage::Select => {
+                if !self.processing {
+                    self.edit = true;
+                }
+            }
+            view::SettingsEditMessage::Cancel => {
+                if !self.processing {
+                    self.edit = false;
+                }
+            }
+            view::SettingsEditMessage::FieldEdited(field, value) => {
+                if !self.processing {
+                    match field {
+                        "peers" => self.peers.value = value,
+                        "required_peers" => {
+                            self.required_peers.valid =
+                                bip157::parse_required_peers(&value).is_some();
+                            self.required_peers.value = value;
+                        }
+                        "proxy_addr" => {
+                            self.proxy_addr.valid = bip157::parse_proxy_addr(&value).is_some();
+                            self.proxy_addr.value = value;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            view::SettingsEditMessage::Bip157WhitelistOnlyEdited(value) => {
+                if !self.processing {
+                    self.whitelist_only = value;
+                }
+            }
+            view::SettingsEditMessage::Confirm => {
+                if let Ok(config) = bip157::config_from_values(
+                    &self.peers.value,
+                    &self.required_peers.value,
+                    self.whitelist_only,
+                    &self.proxy_addr.value,
+                ) {
+                    let mut daemon_config = daemon.config().cloned().unwrap();
+                    daemon_config.bitcoin_backend =
+                        Some(lianad::config::BitcoinBackend::Bip157(config));
+                    self.processing = true;
+                    return Task::perform(async move { daemon_config }, |cfg| {
+                        Message::LoadDaemonConfig(Box::new(cfg))
+                    });
+                }
+            }
+            view::SettingsEditMessage::Clipboard(text) => return clipboard::write(text),
+            _ => {}
+        };
+        Task::none()
+    }
+
+    fn view<'a>(&self, cache: &'a Cache, can_edit: bool) -> Element<'a, view::SettingsEditMessage> {
+        let is_configured_node_type = self.configured_node_type == Some(NodeType::Bip157);
+        if self.edit {
+            view::settings::bip157_edit(
+                is_configured_node_type,
+                self.bitcoin_config.network,
+                cache.blockheight(),
+                &self.peers,
+                &self.required_peers,
+                self.whitelist_only,
+                &self.proxy_addr,
+                self.processing,
+            )
+        } else {
+            view::settings::bip157(
+                is_configured_node_type,
+                self.bitcoin_config.network,
+                &self.bip157_config,
                 cache.blockheight(),
                 Some(cache.blockheight() != 0),
                 can_edit && !self.daemon_is_external,

@@ -23,6 +23,7 @@ liana = { path = "../liana" }
 liana-connect = { workspace = true }
 lianad = { path = "../lianad", default-features = false, features = ["nonblocking_shutdown"] }
 liana-ui = { path = "../liana-ui" }
+bip157 = { workspace = true }
 backtrace = { workspace = true }
 hex = { workspace = true }
 
