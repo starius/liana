@@ -739,9 +739,12 @@ impl BitcoinInterface for bip157::Bip157 {
     fn start_rescan(
         &mut self,
         _desc: &descriptors::LianaDescriptor,
-        _timestamp: u32,
+        timestamp: u32,
     ) -> Result<(), String> {
-        self.trigger_rescan();
+        let rescan_height = bip157::Bip157::block_before_date(self, timestamp)
+            .unwrap_or_else(|| bip157::Bip157::genesis_block(self))
+            .height;
+        self.trigger_rescan_from(lightwallet::height_u32_from_i32(rescan_height));
         Ok(())
     }
 
@@ -749,8 +752,8 @@ impl BitcoinInterface for bip157::Bip157 {
         bip157::Bip157::rescan_progress(self)
     }
 
-    fn block_before_date(&self, _timestamp: u32) -> Option<BlockChainTip> {
-        Some(bip157::Bip157::genesis_block(self))
+    fn block_before_date(&self, timestamp: u32) -> Option<BlockChainTip> {
+        bip157::Bip157::block_before_date(self, timestamp)
     }
 
     fn tip_time(&self) -> Option<u32> {

@@ -1,3 +1,5 @@
+mod store;
+
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap, HashSet},
@@ -26,6 +28,7 @@ use miniscript::bitcoin::{
     hashes::Hash,
 };
 use serde::{Deserialize, Serialize};
+use store::ChainStore;
 
 use crate::{
     bitcoin::{
@@ -39,12 +42,14 @@ use crate::{
 };
 
 const BIP157_DATA_DIR: &str = "bip157";
+const CHAIN_STORE_FILE: &str = "chain.sqlite3";
 const SNAPSHOT_FILE: &str = "snapshot.json";
-const RESCAN_FROM_HEIGHT: u32 = 0;
+const HEADER_FLUSH_BATCH_SIZE: usize = 512;
 
 #[derive(Debug)]
 pub enum Bip157Error {
     Client(String),
+    ChainStore(String),
     FetchBlock(String),
     InvalidPeer(String),
     Io(String),
@@ -56,12 +61,19 @@ impl fmt::Display for Bip157Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Client(e) => write!(f, "BIP157 client error: {e}"),
+            Self::ChainStore(e) => write!(f, "BIP157 chain store error: {e}"),
             Self::FetchBlock(e) => write!(f, "BIP157 block fetch error: {e}"),
             Self::InvalidPeer(e) => write!(f, "Invalid BIP157 peer configuration: {e}"),
             Self::Io(e) => write!(f, "BIP157 I/O error: {e}"),
             Self::Runtime(e) => write!(f, "BIP157 runtime error: {e}"),
             Self::Snapshot(e) => write!(f, "BIP157 snapshot error: {e}"),
         }
+    }
+}
+
+impl From<store::ChainStoreError> for Bip157Error {
+    fn from(error: store::ChainStoreError) -> Self {
+        Self::ChainStore(error.to_string())
     }
 }
 
@@ -126,15 +138,6 @@ impl StoredSnapshot {
                 height: height_i32_from_u32(indexed.height),
             }))
     }
-
-    fn tip_time(&self) -> Result<Option<u32>, Bip157Error> {
-        Ok(self
-            .headers
-            .last()
-            .map(StoredIndexedHeader::decode)
-            .transpose()?
-            .map(|indexed| indexed.header.time))
-    }
 }
 
 pub struct Bip157 {
@@ -144,12 +147,14 @@ pub struct Bip157 {
     main_descriptor: LianaDescriptor,
     db: sync::Arc<sync::Mutex<dyn DatabaseInterface>>,
     runtime: bip157::tokio::runtime::Runtime,
+    chain_store: ChainStore,
     snapshot_path: PathBuf,
     synced_tip: Cell<Option<BlockChainTip>>,
     tip_time: Cell<Option<u32>>,
     next_seen_at: Cell<u64>,
     pending_txs: RefCell<HashMap<bitcoin::Txid, (bitcoin::Transaction, u64)>>,
     full_scan: Cell<bool>,
+    rescan_from_height: Cell<Option<u32>>,
     progress: sync::Arc<sync::Mutex<Option<bip157::Progress>>>,
     genesis_hash: BlockHash,
     network: bitcoin::Network,
@@ -165,16 +170,24 @@ impl Bip157 {
         full_scan: bool,
     ) -> Result<Self, Bip157Error> {
         let network = bitcoin_config.network;
+        let genesis_header = bitcoin::constants::genesis_block(network).header;
         let genesis_hash = {
             let chain_hash = ChainHash::using_genesis_block(network);
             BlockHash::from_byte_array(*chain_hash.as_bytes())
         };
+        let chain_store = ChainStore::new(chain_store_path(data_dir));
+        chain_store.ensure_header(IndexedHeader {
+            height: 0,
+            header: genesis_header,
+        })?;
         let snapshot_path = snapshot_path(data_dir);
         let snapshot = load_snapshot(&snapshot_path)?;
+        seed_chain_store_from_snapshot(&chain_store, snapshot.as_ref())?;
         let bdk_wallet = load_wallet_from_db(
             &db,
             main_descriptor,
             genesis_hash,
+            &chain_store,
             snapshot.as_ref(),
             None,
             None,
@@ -184,13 +197,9 @@ impl Bip157 {
             let mut db_conn = db.connection();
             db_conn.chain_tip()
         };
-        let tip_time = snapshot
-            .as_ref()
-            .map(StoredSnapshot::tip_time)
-            .transpose()?
-            .flatten();
+        let tip_time = chain_store.tip_time()?;
 
-        let chain_state = chain_state_from(snapshot.as_ref(), synced_tip, network)?;
+        let chain_state = chain_state_from(&chain_store, snapshot.as_ref(), synced_tip, network)?;
         let mut builder = bip157::Builder::new(network)
             .data_dir(node_data_dir(data_dir))
             .required_peers(bip157_config.required_peers)
@@ -241,12 +250,14 @@ impl Bip157 {
             main_descriptor: main_descriptor.clone(),
             db,
             runtime,
+            chain_store,
             snapshot_path,
             synced_tip: Cell::new(synced_tip),
             tip_time: Cell::new(tip_time),
             next_seen_at: Cell::new(0),
             pending_txs: RefCell::new(HashMap::new()),
             full_scan: Cell::new(full_scan),
+            rescan_from_height: Cell::new(None),
             progress,
             genesis_hash,
             network,
@@ -289,7 +300,20 @@ impl Bip157 {
     }
 
     pub fn trigger_rescan(&mut self) {
+        self.trigger_rescan_from(0);
+    }
+
+    pub fn trigger_rescan_from(&mut self, height: u32) {
         self.full_scan.set(true);
+        self.rescan_from_height.set(Some(height));
+    }
+
+    pub fn block_before_date(&self, timestamp: u32) -> Option<BlockChainTip> {
+        self.chain_store
+            .block_before_date(timestamp)
+            .ok()
+            .flatten()
+            .or_else(|| Some(self.genesis_block()))
     }
 
     pub fn sync_wallet(
@@ -298,10 +322,12 @@ impl Bip157 {
         change_index: ChildNumber,
     ) -> Result<Option<BlockChainTip>, Bip157Error> {
         let previous_snapshot = load_snapshot(&self.snapshot_path)?;
+        let previous_headers = recent_chain_headers(&self.chain_store, previous_snapshot.as_ref())?;
         let mut bdk_wallet = load_wallet_from_db(
             &self.db,
             &self.main_descriptor,
             self.genesis_hash,
+            &self.chain_store,
             previous_snapshot.as_ref(),
             Some(receive_index),
             Some(change_index),
@@ -311,8 +337,9 @@ impl Bip157 {
 
         if self.full_scan.get() {
             clear_pending_events(&mut self.event_rx);
+            let rescan_from_height = self.rescan_from_height.take().unwrap_or(0);
             self.requester
-                .rescan_from(RESCAN_FROM_HEIGHT)
+                .rescan_from(rescan_from_height)
                 .map_err(|e| Bip157Error::Client(e.to_string()))?;
             *self.progress.lock().unwrap() = None;
         } else if Some(
@@ -326,17 +353,12 @@ impl Bip157 {
         ) == self.synced_tip.get()
         {
             *self.bdk_wallet.borrow_mut() = bdk_wallet;
-            self.tip_time.set(
-                previous_snapshot
-                    .as_ref()
-                    .map(StoredSnapshot::tip_time)
-                    .transpose()?
-                    .flatten(),
-            );
+            self.tip_time.set(self.chain_store.tip_time()?);
             return Ok(None);
         }
 
         let mut matched_blocks = Vec::new();
+        let mut pending_headers = Vec::new();
         let mut seen_block_hashes = HashSet::new();
         let mut reorg_from_height: Option<u32> = None;
         loop {
@@ -346,17 +368,31 @@ impl Bip157 {
                 .ok_or_else(|| Bip157Error::Client("the BIP157 node is not running".into()))?;
             match event {
                 Event::IndexedFilter(filter) => {
-                    if filter.contains_any(bdk_wallet.all_spks())
-                        && seen_block_hashes.insert(filter.block_hash())
-                    {
+                    let matches_wallet = filter.contains_any(bdk_wallet.all_spks());
+                    let height = filter.height();
+                    let block_hash = filter.block_hash();
+                    let filter_contents = filter.into_contents();
+                    persist_filter_commitment(&self.chain_store, height, &filter_contents)?;
+                    if matches_wallet && seen_block_hashes.insert(block_hash) {
                         let block = self
                             .runtime
-                            .block_on(self.requester.get_block(filter.block_hash()))
+                            .block_on(self.requester.get_block(block_hash))
                             .map_err(fetch_block_error)?;
                         matched_blocks.push(block);
                     }
                 }
-                Event::ChainUpdate(BlockHeaderChanges::Reorganized { reorganized, .. }) => {
+                Event::ChainUpdate(BlockHeaderChanges::Connected(header)) => {
+                    pending_headers.push(header);
+                    if pending_headers.len() >= HEADER_FLUSH_BATCH_SIZE {
+                        flush_connected_headers(&self.chain_store, &mut pending_headers)?;
+                    }
+                }
+                Event::ChainUpdate(BlockHeaderChanges::Reorganized {
+                    accepted,
+                    reorganized,
+                }) => {
+                    flush_connected_headers(&self.chain_store, &mut pending_headers)?;
+                    apply_reorg_to_store(&self.chain_store, &accepted, &reorganized)?;
                     if let Some(height) = reorganized.iter().map(|header| header.height).min() {
                         reorg_from_height = Some(
                             reorg_from_height
@@ -366,6 +402,7 @@ impl Bip157 {
                     }
                 }
                 Event::FiltersSynced(update) => {
+                    flush_connected_headers(&self.chain_store, &mut pending_headers)?;
                     let tip = BlockChainTip {
                         hash: update.tip().hash,
                         height: height_i32_from_u32(update.tip().height),
@@ -388,7 +425,8 @@ impl Bip157 {
                         .collect::<Vec<_>>();
 
                     let snapshot = StoredSnapshot::from_recent_history(update.recent_history());
-                    let local_chain = local_chain_from_snapshot(self.genesis_hash, &snapshot)?;
+                    let recent_headers = recent_chain_headers(&self.chain_store, Some(&snapshot))?;
+                    let local_chain = local_chain_from_headers(self.genesis_hash, &recent_headers)?;
                     bdk_wallet.set_local_chain(local_chain);
                     bdk_wallet.apply_relevant_confirmed_transactions(&confirmed_txs);
 
@@ -400,18 +438,14 @@ impl Bip157 {
                     });
 
                     save_snapshot(&self.snapshot_path, &snapshot)?;
-                    self.tip_time.set(snapshot.tip_time()?);
+                    self.tip_time.set(self.chain_store.tip_time()?);
                     self.synced_tip.set(Some(tip));
                     self.full_scan.set(false);
                     *self.progress.lock().unwrap() = None;
                     *self.bdk_wallet.borrow_mut() = bdk_wallet;
 
                     let common_ancestor = reorg_from_height.map(|height| {
-                        common_ancestor_from_snapshot(
-                            previous_snapshot.as_ref(),
-                            height,
-                            self.genesis_hash,
-                        )
+                        common_ancestor_from_headers(&previous_headers, height, self.genesis_hash)
                     });
                     return Ok(common_ancestor);
                 }
@@ -562,6 +596,7 @@ fn load_wallet_from_db(
     db: &sync::Arc<sync::Mutex<dyn DatabaseInterface>>,
     main_descriptor: &LianaDescriptor,
     genesis_hash: BlockHash,
+    chain_store: &ChainStore,
     snapshot: Option<&StoredSnapshot>,
     receive_index: Option<ChildNumber>,
     change_index: Option<ChildNumber>,
@@ -608,14 +643,23 @@ fn load_wallet_from_db(
         change_index,
     );
 
-    let snapshot_tip = match snapshot {
-        Some(snapshot) => snapshot.tip()?,
-        None => None,
-    };
-    if snapshot_tip == tip {
-        if let Some(snapshot) = snapshot {
-            let local_chain = local_chain_from_snapshot(genesis_hash, snapshot)?;
+    if chain_store.tip()? == tip {
+        let headers = chain_store.recent_headers(10)?;
+        if !headers.is_empty() {
+            let local_chain = local_chain_from_headers(genesis_hash, &headers)?;
             bdk_wallet.set_local_chain(local_chain);
+        }
+    } else {
+        let snapshot_tip = match snapshot {
+            Some(snapshot) => snapshot.tip()?,
+            None => None,
+        };
+        if snapshot_tip == tip {
+            if let Some(snapshot) = snapshot {
+                let local_chain =
+                    local_chain_from_headers(genesis_hash, &snapshot.indexed_headers()?)?;
+                bdk_wallet.set_local_chain(local_chain);
+            }
         }
     }
 
@@ -663,6 +707,10 @@ fn snapshot_path(data_dir: &DataDirectory) -> PathBuf {
     node_data_dir(data_dir).join(SNAPSHOT_FILE)
 }
 
+fn chain_store_path(data_dir: &DataDirectory) -> PathBuf {
+    node_data_dir(data_dir).join(CHAIN_STORE_FILE)
+}
+
 fn node_data_dir(data_dir: &DataDirectory) -> PathBuf {
     data_dir.path().join(BIP157_DATA_DIR)
 }
@@ -687,10 +735,15 @@ fn save_snapshot(path: &Path, snapshot: &StoredSnapshot) -> Result<(), Bip157Err
 }
 
 fn chain_state_from(
+    chain_store: &ChainStore,
     snapshot: Option<&StoredSnapshot>,
     db_tip: Option<BlockChainTip>,
     network: bitcoin::Network,
 ) -> Result<Option<ChainState>, Bip157Error> {
+    let headers = chain_store.contiguous_headers()?;
+    if !headers.is_empty() {
+        return Ok(Some(ChainState::Snapshot(headers)));
+    }
     if let Some(snapshot) = snapshot {
         let headers = snapshot.indexed_headers()?;
         if !headers.is_empty() {
@@ -708,11 +761,40 @@ fn chain_state_from(
     )))
 }
 
-fn local_chain_from_snapshot(
+fn seed_chain_store_from_snapshot(
+    chain_store: &ChainStore,
+    snapshot: Option<&StoredSnapshot>,
+) -> Result<(), Bip157Error> {
+    if chain_store.last_height()? != Some(0) {
+        return Ok(());
+    }
+    if let Some(snapshot) = snapshot {
+        let headers = snapshot.indexed_headers()?;
+        if let Some(start_height) = headers.first().map(|header| header.height) {
+            chain_store.replace_from(start_height, &headers)?;
+        }
+    }
+    Ok(())
+}
+
+fn recent_chain_headers(
+    chain_store: &ChainStore,
+    snapshot: Option<&StoredSnapshot>,
+) -> Result<Vec<IndexedHeader>, Bip157Error> {
+    let headers = chain_store.recent_headers(10)?;
+    if !headers.is_empty() {
+        return Ok(headers);
+    }
+    snapshot
+        .map(StoredSnapshot::indexed_headers)
+        .transpose()
+        .map(|headers| headers.unwrap_or_default())
+}
+
+fn local_chain_from_headers(
     genesis_hash: BlockHash,
-    snapshot: &StoredSnapshot,
+    headers: &[IndexedHeader],
 ) -> Result<LocalChain, Bip157Error> {
-    let headers = snapshot.indexed_headers()?;
     let mut block_ids = vec![bdk_electrum::bdk_chain::BlockId {
         height: 0,
         hash: genesis_hash,
@@ -720,37 +802,86 @@ fn local_chain_from_snapshot(
     block_ids.extend(
         headers
             .iter()
+            .filter(|indexed_header| indexed_header.height > 0)
             .map(|indexed_header| bdk_electrum::bdk_chain::BlockId {
                 height: indexed_header.height,
                 hash: indexed_header.header.block_hash(),
             }),
     );
     let checkpoint = CheckPoint::from_block_ids(block_ids.into_iter())
-        .map_err(|_| Bip157Error::Snapshot("stored headers are not strictly ordered".into()))?;
+        .map_err(|_| Bip157Error::ChainStore("stored headers are not strictly ordered".into()))?;
     LocalChain::from_tip(checkpoint).map_err(|e| Bip157Error::Snapshot(e.to_string()))
 }
 
-fn common_ancestor_from_snapshot(
-    snapshot: Option<&StoredSnapshot>,
+fn common_ancestor_from_headers(
+    headers: &[IndexedHeader],
     reorg_from_height: u32,
     genesis_hash: BlockHash,
 ) -> BlockChainTip {
-    snapshot
-        .and_then(|snapshot| snapshot.indexed_headers().ok())
-        .and_then(|headers| {
-            headers
-                .into_iter()
-                .rev()
-                .find(|header| header.height < reorg_from_height)
-                .map(|header| BlockChainTip {
-                    hash: header.header.block_hash(),
-                    height: height_i32_from_u32(header.height),
-                })
+    headers
+        .iter()
+        .rev()
+        .find(|header| header.height < reorg_from_height)
+        .map(|header| BlockChainTip {
+            hash: header.header.block_hash(),
+            height: height_i32_from_u32(header.height),
         })
         .unwrap_or(BlockChainTip {
             hash: genesis_hash,
             height: 0,
         })
+}
+
+fn flush_connected_headers(
+    chain_store: &ChainStore,
+    pending_headers: &mut Vec<IndexedHeader>,
+) -> Result<(), Bip157Error> {
+    if pending_headers.is_empty() {
+        return Ok(());
+    }
+    let start_height = pending_headers
+        .first()
+        .map(|header| header.height)
+        .expect("checked non-empty");
+    chain_store.replace_from(start_height, pending_headers)?;
+    pending_headers.clear();
+    Ok(())
+}
+
+fn apply_reorg_to_store(
+    chain_store: &ChainStore,
+    accepted: &[IndexedHeader],
+    reorganized: &[IndexedHeader],
+) -> Result<(), Bip157Error> {
+    let start_height = accepted
+        .iter()
+        .map(|header| header.height)
+        .chain(reorganized.iter().map(|header| header.height))
+        .min();
+    if let Some(start_height) = start_height {
+        let mut accepted = accepted.to_vec();
+        accepted.sort();
+        chain_store.replace_from(start_height, &accepted)?;
+    }
+    Ok(())
+}
+
+fn persist_filter_commitment(
+    chain_store: &ChainStore,
+    height: u32,
+    filter_contents: &[u8],
+) -> Result<(), Bip157Error> {
+    let filter_hash = bitcoin::FilterHash::hash(filter_contents);
+    let previous_filter_header = if height <= 1 {
+        bitcoin::FilterHeader::all_zeros()
+    } else if let Some(previous_filter_header) = chain_store.filter_header(height - 1)? {
+        previous_filter_header
+    } else {
+        return Ok(());
+    };
+    let filter_header = filter_hash.filter_header(&previous_filter_header);
+    chain_store.set_filter_commitments(&[(height, filter_hash, filter_header)])?;
+    Ok(())
 }
 
 fn clear_pending_events(event_rx: &mut bip157::UnboundedReceiver<Event>) {
@@ -819,6 +950,13 @@ mod tests {
                 height: 0,
             })
         );
-        assert_eq!(snapshot.tip_time().expect("tip time"), Some(header.time));
+        assert_eq!(
+            snapshot
+                .indexed_headers()
+                .expect("headers")
+                .last()
+                .map(|h| h.header.time),
+            Some(header.time)
+        );
     }
 }
