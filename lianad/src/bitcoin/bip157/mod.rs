@@ -1,3 +1,4 @@
+mod peer_cache;
 mod store;
 
 use std::{
@@ -43,6 +44,7 @@ use crate::{
 
 const BIP157_DATA_DIR: &str = "bip157";
 const CHAIN_STORE_FILE: &str = "chain.sqlite3";
+const PEER_CACHE_FILE: &str = "peer-cache.json";
 const SNAPSHOT_FILE: &str = "snapshot.json";
 const HEADER_FLUSH_BATCH_SIZE: usize = 512;
 
@@ -148,6 +150,8 @@ pub struct Bip157 {
     db: sync::Arc<sync::Mutex<dyn DatabaseInterface>>,
     runtime: bip157::tokio::runtime::Runtime,
     chain_store: ChainStore,
+    peer_cache_path: PathBuf,
+    peer_cache_enabled: bool,
     snapshot_path: PathBuf,
     synced_tip: Cell<Option<BlockChainTip>>,
     tip_time: Cell<Option<u32>>,
@@ -180,9 +184,20 @@ impl Bip157 {
             height: 0,
             header: genesis_header,
         })?;
+        let peer_cache_path = peer_cache_path(data_dir);
         let snapshot_path = snapshot_path(data_dir);
         let snapshot = load_snapshot(&snapshot_path)?;
         seed_chain_store_from_snapshot(&chain_store, snapshot.as_ref())?;
+        let mut bootstrap_peers = bip157_config.peers.clone();
+        if !bip157_config.whitelist_only {
+            for cached_peer in
+                peer_cache::load(&peer_cache_path).map_err(|e| Bip157Error::Io(e.to_string()))?
+            {
+                if !bootstrap_peers.contains(&cached_peer) {
+                    bootstrap_peers.push(cached_peer);
+                }
+            }
+        }
         let bdk_wallet = load_wallet_from_db(
             &db,
             main_descriptor,
@@ -215,9 +230,8 @@ impl Bip157 {
         if let Some(proxy_addr) = bip157_config.proxy_addr {
             builder = builder.socks5_proxy(Socks5Proxy::new(proxy_addr));
         }
-        if !bip157_config.peers.is_empty() {
-            let peers = bip157_config
-                .peers
+        if !bootstrap_peers.is_empty() {
+            let peers = bootstrap_peers
                 .iter()
                 .map(|peer| parse_peer(network, peer))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -251,6 +265,8 @@ impl Bip157 {
             db,
             runtime,
             chain_store,
+            peer_cache_path,
+            peer_cache_enabled: !bip157_config.whitelist_only,
             snapshot_path,
             synced_tip: Cell::new(synced_tip),
             tip_time: Cell::new(tip_time),
@@ -354,6 +370,7 @@ impl Bip157 {
         {
             *self.bdk_wallet.borrow_mut() = bdk_wallet;
             self.tip_time.set(self.chain_store.tip_time()?);
+            self.persist_peer_cache();
             return Ok(None);
         }
 
@@ -443,6 +460,7 @@ impl Bip157 {
                     self.full_scan.set(false);
                     *self.progress.lock().unwrap() = None;
                     *self.bdk_wallet.borrow_mut() = bdk_wallet;
+                    self.persist_peer_cache();
 
                     let common_ancestor = reorg_from_height.map(|height| {
                         common_ancestor_from_headers(&previous_headers, height, self.genesis_hash)
@@ -584,6 +602,31 @@ impl Bip157 {
     pub fn tip_time(&self) -> Option<u32> {
         self.tip_time.get()
     }
+
+    fn persist_peer_cache(&self) {
+        if !self.peer_cache_enabled {
+            return;
+        }
+        let peer_info = match self.runtime.block_on(self.requester.peer_info()) {
+            Ok(peer_info) => peer_info,
+            Err(error) => {
+                log::debug!("Failed to query BIP157 peers for cache persistence: {error}");
+                return;
+            }
+        };
+        let mut peers = peer_info
+            .into_iter()
+            .filter_map(|(addr, _)| peer_cache::encode_peer(addr))
+            .collect::<Vec<_>>();
+        peers.sort();
+        peers.dedup();
+        if peers.is_empty() {
+            return;
+        }
+        if let Err(error) = peer_cache::save(&self.peer_cache_path, &peers) {
+            log::warn!("Failed to persist BIP157 peer cache: {error}");
+        }
+    }
 }
 
 impl Drop for Bip157 {
@@ -709,6 +752,10 @@ fn snapshot_path(data_dir: &DataDirectory) -> PathBuf {
 
 fn chain_store_path(data_dir: &DataDirectory) -> PathBuf {
     node_data_dir(data_dir).join(CHAIN_STORE_FILE)
+}
+
+fn peer_cache_path(data_dir: &DataDirectory) -> PathBuf {
+    node_data_dir(data_dir).join(PEER_CACHE_FILE)
 }
 
 fn node_data_dir(data_dir: &DataDirectory) -> PathBuf {
