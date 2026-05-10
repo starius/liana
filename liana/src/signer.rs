@@ -22,6 +22,7 @@ use miniscript::bitcoin::{
     key::TapTweak,
     psbt::{raw, Input as PsbtIn, Psbt},
     secp256k1, sighash,
+    taproot::TapLeafHash,
 };
 use musig2::{
     secp256k1 as musig_secp256k1, AggNonce, BinaryEncoding, CompactSignature, KeyAggContext,
@@ -112,10 +113,17 @@ fn create_file(path: &path::Path) -> Result<fs::File, std::io::Error> {
     };
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Musig2ParticipantSet {
     aggregate_pubkey: secp256k1::PublicKey,
+    scope: Musig2InputScope,
     participant_pubkeys: Vec<secp256k1::PublicKey>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Musig2InputScope {
+    KeySpend,
+    ScriptSpend(TapLeafHash),
 }
 
 struct Musig2InputSession {
@@ -134,30 +142,37 @@ fn musig2_composite_key(
     type_value: u8,
     participant_pubkey: secp256k1::PublicKey,
     aggregate_pubkey: secp256k1::PublicKey,
+    scope: Musig2InputScope,
 ) -> raw::Key {
-    raw::Key {
-        type_value,
-        key: [
-            participant_pubkey.serialize().as_slice(),
-            aggregate_pubkey.serialize().as_slice(),
-        ]
-        .concat(),
+    let mut key = [
+        participant_pubkey.serialize().as_slice(),
+        aggregate_pubkey.serialize().as_slice(),
+    ]
+    .concat();
+    if let Musig2InputScope::ScriptSpend(leaf_hash) = scope {
+        key.extend_from_slice(leaf_hash.as_byte_array());
     }
+    raw::Key { type_value, key }
 }
 
 fn musig2_input_proprietary_key(
     subtype: u8,
     participant_pubkey: secp256k1::PublicKey,
     aggregate_pubkey: secp256k1::PublicKey,
+    scope: Musig2InputScope,
 ) -> raw::ProprietaryKey {
+    let mut key = [
+        participant_pubkey.serialize().as_slice(),
+        aggregate_pubkey.serialize().as_slice(),
+    ]
+    .concat();
+    if let Musig2InputScope::ScriptSpend(leaf_hash) = scope {
+        key.extend_from_slice(leaf_hash.as_byte_array());
+    }
     raw::ProprietaryKey {
         prefix: PSBT_PROPRIETARY_PREFIX_LIANA.to_vec(),
         subtype,
-        key: [
-            participant_pubkey.serialize().as_slice(),
-            aggregate_pubkey.serialize().as_slice(),
-        ]
-        .concat(),
+        key,
     }
 }
 
@@ -188,11 +203,18 @@ fn parse_musig2_participant_sets(
         if key.type_value != PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS {
             continue;
         }
-        if key.key.len() != 33 || value.is_empty() || value.len() % 33 != 0 {
+        if !matches!(key.key.len(), 33 | 65) || value.is_empty() || value.len() % 33 != 0 {
             return Err(SignerError::InsanePsbt);
         }
-        let aggregate_pubkey =
-            secp256k1::PublicKey::from_slice(&key.key).map_err(|_| SignerError::InsanePsbt)?;
+        let aggregate_pubkey = secp256k1::PublicKey::from_slice(&key.key[..33])
+            .map_err(|_| SignerError::InsanePsbt)?;
+        let scope = if key.key.len() == 33 {
+            Musig2InputScope::KeySpend
+        } else {
+            Musig2InputScope::ScriptSpend(
+                TapLeafHash::from_slice(&key.key[33..]).map_err(|_| SignerError::InsanePsbt)?,
+            )
+        };
         let participant_pubkeys = value
             .chunks_exact(33)
             .map(|pubkey| {
@@ -201,6 +223,7 @@ fn parse_musig2_participant_sets(
             .collect::<Result<Vec<_>, _>>()?;
         sets.push(Musig2ParticipantSet {
             aggregate_pubkey,
+            scope,
             participant_pubkeys,
         });
     }
@@ -209,21 +232,30 @@ fn parse_musig2_participant_sets(
 
 fn parse_musig2_pubnonces(
     psbt_in: &PsbtIn,
-    aggregate_pubkey: secp256k1::PublicKey,
+    participant_set: &Musig2ParticipantSet,
 ) -> Result<Vec<(secp256k1::PublicKey, PubNonce)>, SignerError> {
     let mut pubnonces = Vec::new();
     for (key, value) in &psbt_in.unknown {
         if key.type_value != PSBT_IN_MUSIG2_PUB_NONCE {
             continue;
         }
-        if key.key.len() != 66 {
+        if !matches!(key.key.len(), 66 | 98) {
             continue;
         }
         let participant_pubkey = secp256k1::PublicKey::from_slice(&key.key[..33])
             .map_err(|_| SignerError::InsanePsbt)?;
-        let key_aggregate_pubkey = secp256k1::PublicKey::from_slice(&key.key[33..])
+        let key_aggregate_pubkey = secp256k1::PublicKey::from_slice(&key.key[33..66])
             .map_err(|_| SignerError::InsanePsbt)?;
-        if key_aggregate_pubkey != aggregate_pubkey {
+        let key_scope = if key.key.len() == 66 {
+            Musig2InputScope::KeySpend
+        } else {
+            Musig2InputScope::ScriptSpend(
+                TapLeafHash::from_slice(&key.key[66..]).map_err(|_| SignerError::InsanePsbt)?,
+            )
+        };
+        if key_aggregate_pubkey != participant_set.aggregate_pubkey
+            || key_scope != participant_set.scope
+        {
             continue;
         }
         let pubnonce =
@@ -235,21 +267,30 @@ fn parse_musig2_pubnonces(
 
 fn parse_musig2_partial_signatures(
     psbt_in: &PsbtIn,
-    aggregate_pubkey: secp256k1::PublicKey,
+    participant_set: &Musig2ParticipantSet,
 ) -> Result<Vec<(secp256k1::PublicKey, PartialSignature)>, SignerError> {
     let mut partial_signatures = Vec::new();
     for (key, value) in &psbt_in.unknown {
         if key.type_value != PSBT_IN_MUSIG2_PARTIAL_SIG {
             continue;
         }
-        if key.key.len() != 66 {
+        if !matches!(key.key.len(), 66 | 98) {
             continue;
         }
         let participant_pubkey = secp256k1::PublicKey::from_slice(&key.key[..33])
             .map_err(|_| SignerError::InsanePsbt)?;
-        let key_aggregate_pubkey = secp256k1::PublicKey::from_slice(&key.key[33..])
+        let key_aggregate_pubkey = secp256k1::PublicKey::from_slice(&key.key[33..66])
             .map_err(|_| SignerError::InsanePsbt)?;
-        if key_aggregate_pubkey != aggregate_pubkey {
+        let key_scope = if key.key.len() == 66 {
+            Musig2InputScope::KeySpend
+        } else {
+            Musig2InputScope::ScriptSpend(
+                TapLeafHash::from_slice(&key.key[66..]).map_err(|_| SignerError::InsanePsbt)?,
+            )
+        };
+        if key_aggregate_pubkey != participant_set.aggregate_pubkey
+            || key_scope != participant_set.scope
+        {
             continue;
         }
         let partial_signature =
@@ -262,12 +303,13 @@ fn parse_musig2_partial_signatures(
 fn read_musig2_nonce_seed(
     psbt_in: &PsbtIn,
     participant_pubkey: secp256k1::PublicKey,
-    aggregate_pubkey: secp256k1::PublicKey,
+    participant_set: &Musig2ParticipantSet,
 ) -> Result<Option<[u8; 32]>, SignerError> {
     let key = musig2_input_proprietary_key(
         PSBT_IN_LIANA_MUSIG2_NONCE_SEED,
         participant_pubkey,
-        aggregate_pubkey,
+        participant_set.aggregate_pubkey,
+        participant_set.scope,
     );
     psbt_in
         .proprietary
@@ -284,12 +326,13 @@ fn read_musig2_nonce_seed(
 fn read_musig2_aggnonce(
     psbt_in: &PsbtIn,
     participant_pubkey: secp256k1::PublicKey,
-    aggregate_pubkey: secp256k1::PublicKey,
+    participant_set: &Musig2ParticipantSet,
 ) -> Result<Option<AggNonce>, SignerError> {
     let key = musig2_input_proprietary_key(
         PSBT_IN_LIANA_MUSIG2_AGGNONCE,
         participant_pubkey,
-        aggregate_pubkey,
+        participant_set.aggregate_pubkey,
+        participant_set.scope,
     );
     psbt_in
         .proprietary
@@ -584,212 +627,240 @@ impl HotSigner {
         if participant_sets.is_empty() {
             return Ok(false);
         }
-        if participant_sets.len() != 1 {
-            return Err(SignerError::InsanePsbt);
-        }
-
-        let session =
-            self.reconstruct_musig2_session(secp, psbt_in, participant_sets[0].clone())?;
-        let owned_participants =
-            self.owned_musig2_participants(secp, psbt_in, &session, master_fingerprint)?;
-
-        let participant_pubkeys = session.participant_pubkeys.clone();
-        let expected_participant_count = participant_pubkeys.len();
-        let aggregate_pubkey = session.participant_set.aggregate_pubkey;
-        let participant_index = participant_pubkeys
+        let has_musig2_keyspend = participant_sets
             .iter()
-            .cloned()
-            .map(|pubkey| (pubkey, ()))
-            .collect::<BTreeMap<_, _>>();
+            .any(|participant_set| matches!(participant_set.scope, Musig2InputScope::KeySpend));
+        for participant_set in participant_sets {
+            let session =
+                self.reconstruct_musig2_session(secp, psbt_in, participant_set.clone())?;
+            let owned_participants =
+                self.owned_musig2_participants(secp, psbt_in, &session, master_fingerprint)?;
 
-        let mut pubnonces = parse_musig2_pubnonces(psbt_in, aggregate_pubkey)?
-            .into_iter()
-            .map(|(participant_pubkey, pubnonce)| {
-                if !participant_index.contains_key(&participant_pubkey) {
-                    Err(SignerError::InsanePsbt)
-                } else {
-                    Ok((participant_pubkey, pubnonce))
-                }
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let mut partial_signatures = parse_musig2_partial_signatures(psbt_in, aggregate_pubkey)?
-            .into_iter()
-            .map(|(participant_pubkey, partial_signature)| {
-                if !participant_index.contains_key(&participant_pubkey) {
-                    Err(SignerError::InsanePsbt)
-                } else {
-                    Ok((participant_pubkey, partial_signature))
-                }
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
+            let participant_pubkeys = session.participant_pubkeys.clone();
+            let expected_participant_count = participant_pubkeys.len();
+            let aggregate_pubkey = session.participant_set.aggregate_pubkey;
+            let participant_index = participant_pubkeys
+                .iter()
+                .cloned()
+                .map(|pubkey| (pubkey, ()))
+                .collect::<BTreeMap<_, _>>();
 
-        if !partial_signatures.is_empty() && pubnonces.len() != expected_participant_count {
-            return Err(SignerError::InsanePsbt);
-        }
+            let mut pubnonces = parse_musig2_pubnonces(psbt_in, &session.participant_set)?
+                .into_iter()
+                .map(|(participant_pubkey, pubnonce)| {
+                    if !participant_index.contains_key(&participant_pubkey) {
+                        Err(SignerError::InsanePsbt)
+                    } else {
+                        Ok((participant_pubkey, pubnonce))
+                    }
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            let mut partial_signatures =
+                parse_musig2_partial_signatures(psbt_in, &session.participant_set)?
+                    .into_iter()
+                    .map(|(participant_pubkey, partial_signature)| {
+                        if !participant_index.contains_key(&participant_pubkey) {
+                            Err(SignerError::InsanePsbt)
+                        } else {
+                            Ok((participant_pubkey, partial_signature))
+                        }
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()?;
 
-        let prevouts = sighash::Prevouts::All(prevouts);
-        let sighash = sighash_cache
-            .taproot_key_spend_signature_hash(input_index, &prevouts, sighash_type)
-            .map_err(|_| SignerError::InsanePsbt)?;
-        let sighash_bytes = sighash.to_byte_array();
-        let signing_pubkey = session
-            .key_agg_ctx
-            .aggregated_pubkey::<musig_secp256k1::PublicKey>();
-
-        for owned_participant in &owned_participants {
-            if pubnonces.contains_key(&owned_participant.participant_pubkey) {
-                continue;
+            if !partial_signatures.is_empty() && pubnonces.len() != expected_participant_count {
+                return Err(SignerError::InsanePsbt);
             }
 
-            let nonce_seed = if let Some(nonce_seed) = read_musig2_nonce_seed(
-                psbt_in,
-                owned_participant.participant_pubkey,
-                aggregate_pubkey,
-            )? {
-                nonce_seed
-            } else {
-                let nonce_seed = random::random_bytes().map_err(SignerError::Randomness)?;
-                psbt_in.proprietary.insert(
-                    musig2_input_proprietary_key(
-                        PSBT_IN_LIANA_MUSIG2_NONCE_SEED,
-                        owned_participant.participant_pubkey,
-                        aggregate_pubkey,
-                    ),
-                    nonce_seed.to_vec(),
-                );
-                nonce_seed
+            let prevouts = sighash::Prevouts::All(prevouts);
+            let sighash = match session.participant_set.scope {
+                Musig2InputScope::KeySpend => sighash_cache
+                    .taproot_key_spend_signature_hash(input_index, &prevouts, sighash_type)
+                    .map_err(|_| SignerError::InsanePsbt)?,
+                Musig2InputScope::ScriptSpend(leaf_hash) => sighash_cache
+                    .taproot_script_spend_signature_hash(
+                        input_index,
+                        &prevouts,
+                        leaf_hash,
+                        sighash_type,
+                    )
+                    .map_err(|_| SignerError::InsanePsbt)?,
             };
+            let sighash_bytes = sighash.to_byte_array();
+            let signing_pubkey = session
+                .key_agg_ctx
+                .aggregated_pubkey::<musig_secp256k1::PublicKey>();
 
-            let seckey = self.musig2_participant_secret_key(
-                secp,
-                owned_participant.participant_pubkey,
-                &owned_participant.derivation_path,
-            )?;
-            let musig_seckey = bitcoin_to_musig_secret_key(seckey)?;
-            let secnonce = SecNonce::generate(
-                nonce_seed,
-                musig_seckey,
-                signing_pubkey.clone(),
-                sighash_bytes,
-                [],
-            );
-            let pubnonce = secnonce.public_nonce();
-            psbt_in.unknown.insert(
-                musig2_composite_key(
-                    PSBT_IN_MUSIG2_PUB_NONCE,
+            for owned_participant in &owned_participants {
+                if pubnonces.contains_key(&owned_participant.participant_pubkey) {
+                    continue;
+                }
+
+                let nonce_seed = if let Some(nonce_seed) = read_musig2_nonce_seed(
+                    psbt_in,
                     owned_participant.participant_pubkey,
-                    aggregate_pubkey,
-                ),
-                pubnonce.to_bytes().to_vec(),
-            );
-            pubnonces.insert(owned_participant.participant_pubkey, pubnonce);
-        }
+                    &session.participant_set,
+                )? {
+                    nonce_seed
+                } else {
+                    let nonce_seed = random::random_bytes().map_err(SignerError::Randomness)?;
+                    psbt_in.proprietary.insert(
+                        musig2_input_proprietary_key(
+                            PSBT_IN_LIANA_MUSIG2_NONCE_SEED,
+                            owned_participant.participant_pubkey,
+                            aggregate_pubkey,
+                            session.participant_set.scope,
+                        ),
+                        nonce_seed.to_vec(),
+                    );
+                    nonce_seed
+                };
 
-        if pubnonces.len() != expected_participant_count {
-            return Ok(true);
-        }
+                let seckey = self.musig2_participant_secret_key(
+                    secp,
+                    owned_participant.participant_pubkey,
+                    &owned_participant.derivation_path,
+                )?;
+                let musig_seckey = bitcoin_to_musig_secret_key(seckey)?;
+                let secnonce = SecNonce::generate(
+                    nonce_seed,
+                    musig_seckey,
+                    signing_pubkey.clone(),
+                    sighash_bytes,
+                    [],
+                );
+                let pubnonce = secnonce.public_nonce();
+                psbt_in.unknown.insert(
+                    musig2_composite_key(
+                        PSBT_IN_MUSIG2_PUB_NONCE,
+                        owned_participant.participant_pubkey,
+                        aggregate_pubkey,
+                        session.participant_set.scope,
+                    ),
+                    pubnonce.to_bytes().to_vec(),
+                );
+                pubnonces.insert(owned_participant.participant_pubkey, pubnonce);
+            }
 
-        let aggregated_nonce =
-            AggNonce::sum(participant_pubkeys.iter().map(|pubkey| &pubnonces[pubkey]));
-
-        for owned_participant in &owned_participants {
-            if partial_signatures.contains_key(&owned_participant.participant_pubkey) {
+            if pubnonces.len() != expected_participant_count {
                 continue;
             }
 
-            let nonce_seed = read_musig2_nonce_seed(
-                psbt_in,
-                owned_participant.participant_pubkey,
-                aggregate_pubkey,
-            )?
-            .ok_or(SignerError::IncompletePsbt)?;
+            let aggregated_nonce =
+                AggNonce::sum(participant_pubkeys.iter().map(|pubkey| &pubnonces[pubkey]));
 
-            if let Some(stored_nonce) = read_musig2_aggnonce(
-                psbt_in,
-                owned_participant.participant_pubkey,
-                aggregate_pubkey,
-            )? {
-                if stored_nonce != aggregated_nonce {
-                    return Err(SignerError::InsanePsbt);
+            for owned_participant in &owned_participants {
+                if partial_signatures.contains_key(&owned_participant.participant_pubkey) {
+                    continue;
                 }
-            } else {
-                psbt_in.proprietary.insert(
-                    musig2_input_proprietary_key(
-                        PSBT_IN_LIANA_MUSIG2_AGGNONCE,
-                        owned_participant.participant_pubkey,
-                        aggregate_pubkey,
-                    ),
-                    aggregated_nonce.to_bytes().to_vec(),
-                );
-            }
 
-            let seckey = self.musig2_participant_secret_key(
-                secp,
-                owned_participant.participant_pubkey,
-                &owned_participant.derivation_path,
-            )?;
-            let musig_seckey = bitcoin_to_musig_secret_key(seckey)?;
-            let secnonce = SecNonce::generate(
-                nonce_seed,
-                musig_seckey.clone(),
-                signing_pubkey.clone(),
-                sighash_bytes,
-                [],
-            );
-            let partial_signature: PartialSignature = musig2::sign_partial(
-                &session.key_agg_ctx,
-                musig_seckey,
-                secnonce,
-                &aggregated_nonce,
-                sighash_bytes,
-            )
-            .map_err(|_| SignerError::InsanePsbt)?;
-            psbt_in.unknown.insert(
-                musig2_composite_key(
-                    PSBT_IN_MUSIG2_PARTIAL_SIG,
+                let nonce_seed = read_musig2_nonce_seed(
+                    psbt_in,
                     owned_participant.participant_pubkey,
-                    aggregate_pubkey,
-                ),
-                partial_signature.serialize().to_vec(),
-            );
-            partial_signatures.insert(owned_participant.participant_pubkey, partial_signature);
-        }
+                    &session.participant_set,
+                )?
+                .ok_or(SignerError::IncompletePsbt)?;
 
-        for participant_pubkey in &participant_pubkeys {
-            if let Some(partial_signature) = partial_signatures.get(participant_pubkey) {
-                musig2::verify_partial(
+                if let Some(stored_nonce) = read_musig2_aggnonce(
+                    psbt_in,
+                    owned_participant.participant_pubkey,
+                    &session.participant_set,
+                )? {
+                    if stored_nonce != aggregated_nonce {
+                        return Err(SignerError::InsanePsbt);
+                    }
+                } else {
+                    psbt_in.proprietary.insert(
+                        musig2_input_proprietary_key(
+                            PSBT_IN_LIANA_MUSIG2_AGGNONCE,
+                            owned_participant.participant_pubkey,
+                            aggregate_pubkey,
+                            session.participant_set.scope,
+                        ),
+                        aggregated_nonce.to_bytes().to_vec(),
+                    );
+                }
+
+                let seckey = self.musig2_participant_secret_key(
+                    secp,
+                    owned_participant.participant_pubkey,
+                    &owned_participant.derivation_path,
+                )?;
+                let musig_seckey = bitcoin_to_musig_secret_key(seckey)?;
+                let secnonce = SecNonce::generate(
+                    nonce_seed,
+                    musig_seckey.clone(),
+                    signing_pubkey.clone(),
+                    sighash_bytes,
+                    [],
+                );
+                let partial_signature: PartialSignature = musig2::sign_partial(
                     &session.key_agg_ctx,
-                    partial_signature.clone(),
+                    musig_seckey,
+                    secnonce,
                     &aggregated_nonce,
-                    bitcoin_to_musig_pubkey(participant_pubkey.clone())?,
-                    &pubnonces[participant_pubkey],
                     sighash_bytes,
                 )
                 .map_err(|_| SignerError::InsanePsbt)?;
+                psbt_in.unknown.insert(
+                    musig2_composite_key(
+                        PSBT_IN_MUSIG2_PARTIAL_SIG,
+                        owned_participant.participant_pubkey,
+                        aggregate_pubkey,
+                        session.participant_set.scope,
+                    ),
+                    partial_signature.serialize().to_vec(),
+                );
+                partial_signatures.insert(owned_participant.participant_pubkey, partial_signature);
+            }
+
+            for participant_pubkey in &participant_pubkeys {
+                if let Some(partial_signature) = partial_signatures.get(participant_pubkey) {
+                    musig2::verify_partial(
+                        &session.key_agg_ctx,
+                        partial_signature.clone(),
+                        &aggregated_nonce,
+                        bitcoin_to_musig_pubkey(*participant_pubkey)?,
+                        &pubnonces[participant_pubkey],
+                        sighash_bytes,
+                    )
+                    .map_err(|_| SignerError::InsanePsbt)?;
+                }
+            }
+
+            if partial_signatures.len() == expected_participant_count {
+                let signature = musig2::aggregate_partial_signatures::<_, CompactSignature>(
+                    &session.key_agg_ctx,
+                    &aggregated_nonce,
+                    participant_pubkeys.iter().map(|participant_pubkey| {
+                        partial_signatures
+                            .get(participant_pubkey)
+                            .cloned()
+                            .expect("present after count check")
+                    }),
+                    sighash_bytes,
+                )
+                .map_err(|_| SignerError::InsanePsbt)?;
+                let sig = bitcoin::taproot::Signature {
+                    signature: secp256k1::schnorr::Signature::from_slice(&signature.to_bytes())
+                        .map_err(|_| SignerError::InsanePsbt)?,
+                    sighash_type,
+                };
+                match session.participant_set.scope {
+                    Musig2InputScope::KeySpend => {
+                        if psbt_in.tap_key_sig.is_none() {
+                            psbt_in.tap_key_sig = Some(sig);
+                        }
+                    }
+                    Musig2InputScope::ScriptSpend(leaf_hash) => {
+                        psbt_in
+                            .tap_script_sigs
+                            .insert((aggregate_pubkey.x_only_public_key().0, leaf_hash), sig);
+                    }
+                }
             }
         }
 
-        if partial_signatures.len() == expected_participant_count && psbt_in.tap_key_sig.is_none() {
-            let signature = musig2::aggregate_partial_signatures::<_, CompactSignature>(
-                &session.key_agg_ctx,
-                &aggregated_nonce,
-                participant_pubkeys.iter().map(|participant_pubkey| {
-                    partial_signatures
-                        .get(participant_pubkey)
-                        .cloned()
-                        .expect("present after count check")
-                }),
-                sighash_bytes,
-            )
-            .map_err(|_| SignerError::InsanePsbt)?;
-            psbt_in.tap_key_sig = Some(bitcoin::taproot::Signature {
-                signature: secp256k1::schnorr::Signature::from_slice(&signature.to_bytes())
-                    .map_err(|_| SignerError::InsanePsbt)?,
-                sighash_type,
-            });
-        }
-
-        Ok(true)
+        Ok(has_musig2_keyspend)
     }
 
     fn reconstruct_musig2_session(
@@ -798,9 +869,6 @@ impl HotSigner {
         psbt_in: &PsbtIn,
         participant_set: Musig2ParticipantSet,
     ) -> Result<Musig2InputSession, SignerError> {
-        let tap_internal_key = psbt_in
-            .tap_internal_key
-            .ok_or(SignerError::IncompletePsbt)?;
         let mut participant_pubkeys = participant_set.participant_pubkeys.clone();
         participant_pubkeys.sort();
 
@@ -818,59 +886,87 @@ impl HotSigner {
             return Err(SignerError::InsanePsbt);
         }
 
-        if let Some((_, (_, derivation_path))) = psbt_in.tap_key_origins.get(&tap_internal_key) {
-            // The network prefix does not affect the BIP328 synthetic xpub fingerprint or child
-            // tweak computation, so any consistent xpub version is fine here.
-            let mut synthetic_xpub = crate::descriptors::bip328_synthetic_xpub(
-                participant_set.aggregate_pubkey,
-                bitcoin::Network::Bitcoin,
-            );
-            let synthetic_fingerprint = synthetic_xpub.fingerprint();
-            let internal_key_fingerprint = psbt_in
+        let mut synthetic_xpub = crate::descriptors::bip328_synthetic_xpub(
+            participant_set.aggregate_pubkey,
+            bitcoin::Network::Bitcoin,
+        );
+        let synthetic_fingerprint = synthetic_xpub.fingerprint();
+
+        let maybe_bip328_derivation = match participant_set.scope {
+            Musig2InputScope::KeySpend => {
+                let tap_internal_key = psbt_in
+                    .tap_internal_key
+                    .ok_or(SignerError::IncompletePsbt)?;
+                psbt_in.tap_key_origins.get(&tap_internal_key).and_then(
+                    |(_, (fg, derivation_path))| {
+                        (*fg == synthetic_fingerprint).then(|| derivation_path.clone())
+                    },
+                )
+            }
+            Musig2InputScope::ScriptSpend(leaf_hash) => psbt_in
                 .tap_key_origins
-                .get(&tap_internal_key)
-                .ok_or(SignerError::InsanePsbt)?
-                .1
-                 .0;
-            if synthetic_fingerprint == internal_key_fingerprint {
-                for child in derivation_path {
-                    let (tweak, chain_code) = synthetic_xpub
-                        .ckd_pub_tweak(*child)
-                        .map_err(|_| SignerError::InsanePsbt)?;
-                    let tweak_scalar: secp256k1::Scalar = tweak.clone().into();
-                    key_agg_ctx = key_agg_ctx
-                        .with_tweak(bitcoin_to_musig_secret_key(tweak)?, false)
-                        .map_err(|_| SignerError::InsanePsbt)?;
-                    let public_key = synthetic_xpub
-                        .public_key
-                        .add_exp_tweak(secp, &tweak_scalar)
-                        .map_err(|_| SignerError::InsanePsbt)?;
-                    synthetic_xpub = bip32::Xpub {
-                        network: synthetic_xpub.network,
-                        depth: synthetic_xpub.depth + 1,
-                        parent_fingerprint: synthetic_xpub.fingerprint(),
-                        child_number: *child,
-                        chain_code,
-                        public_key,
-                    };
+                .iter()
+                .find_map(|(pubkey, (leaf_hashes, (fg, derivation_path)))| {
+                    (*fg == synthetic_fingerprint && leaf_hashes.contains(&leaf_hash))
+                        .then_some((*pubkey, derivation_path.clone()))
+                })
+                .map(|(_, derivation_path)| derivation_path),
+        };
+
+        if let Some(derivation_path) = maybe_bip328_derivation {
+            for child in &derivation_path {
+                let (tweak, chain_code) = synthetic_xpub
+                    .ckd_pub_tweak(*child)
+                    .map_err(|_| SignerError::InsanePsbt)?;
+                let tweak_scalar: secp256k1::Scalar = tweak.clone().into();
+                key_agg_ctx = key_agg_ctx
+                    .with_tweak(bitcoin_to_musig_secret_key(tweak)?, false)
+                    .map_err(|_| SignerError::InsanePsbt)?;
+                let public_key = synthetic_xpub
+                    .public_key
+                    .add_exp_tweak(secp, &tweak_scalar)
+                    .map_err(|_| SignerError::InsanePsbt)?;
+                synthetic_xpub = bip32::Xpub {
+                    network: synthetic_xpub.network,
+                    depth: synthetic_xpub.depth + 1,
+                    parent_fingerprint: synthetic_xpub.fingerprint(),
+                    child_number: *child,
+                    chain_code,
+                    public_key,
+                };
+            }
+            internal_pubkey = synthetic_xpub.public_key;
+        }
+
+        match participant_set.scope {
+            Musig2InputScope::KeySpend => {
+                let tap_internal_key = psbt_in
+                    .tap_internal_key
+                    .ok_or(SignerError::IncompletePsbt)?;
+                if internal_pubkey.x_only_public_key().0 != tap_internal_key {
+                    return Err(SignerError::InsanePsbt);
                 }
-                internal_pubkey = synthetic_xpub.public_key;
+
+                key_agg_ctx = if let Some(tap_merkle_root) = psbt_in.tap_merkle_root {
+                    key_agg_ctx
+                        .with_taproot_tweak(tap_merkle_root.as_byte_array())
+                        .map_err(|_| SignerError::InsanePsbt)?
+                } else {
+                    key_agg_ctx
+                        .with_unspendable_taproot_tweak()
+                        .map_err(|_| SignerError::InsanePsbt)?
+                };
+            }
+            Musig2InputScope::ScriptSpend(leaf_hash) => {
+                let aggregate_xonly = internal_pubkey.x_only_public_key().0;
+                let Some((leaf_hashes, _)) = psbt_in.tap_key_origins.get(&aggregate_xonly) else {
+                    return Err(SignerError::IncompletePsbt);
+                };
+                if !leaf_hashes.contains(&leaf_hash) {
+                    return Err(SignerError::InsanePsbt);
+                }
             }
         }
-
-        if internal_pubkey.x_only_public_key().0 != tap_internal_key {
-            return Err(SignerError::InsanePsbt);
-        }
-
-        key_agg_ctx = if let Some(tap_merkle_root) = psbt_in.tap_merkle_root {
-            key_agg_ctx
-                .with_taproot_tweak(tap_merkle_root.as_byte_array())
-                .map_err(|_| SignerError::InsanePsbt)?
-        } else {
-            key_agg_ctx
-                .with_unspendable_taproot_tweak()
-                .map_err(|_| SignerError::InsanePsbt)?
-        };
 
         Ok(Musig2InputSession {
             participant_set,
@@ -1178,6 +1274,51 @@ mod tests {
         descriptors::LianaDescriptor::new(policy)
     }
 
+    fn musig2_recovery_test_descriptor(
+        secp: &secp256k1::Secp256k1<secp256k1::All>,
+        primary_signer: &HotSigner,
+        recovery_signer_a: &HotSigner,
+        recovery_signer_b: &HotSigner,
+        derivation_mode: descriptors::MuSig2DerivationMode,
+    ) -> descriptors::LianaDescriptor {
+        let primary_key = multi_xpub_key(primary_signer, secp, "m/84'/1'/0'/0'", "m/0", "m/1");
+        let recovery_key_a = match derivation_mode {
+            descriptors::MuSig2DerivationMode::DeriveThenAggregate => {
+                multi_xpub_key(recovery_signer_a, secp, "m/48'/1'/0'/2'", "m/2", "m/3")
+            }
+            descriptors::MuSig2DerivationMode::AggregateThenDeriveBip328 => {
+                plain_xpub_key(recovery_signer_a, secp, "m/48'/1'/0'/2'")
+            }
+        };
+        let recovery_key_b = match derivation_mode {
+            descriptors::MuSig2DerivationMode::DeriveThenAggregate => {
+                multi_xpub_key(recovery_signer_b, secp, "m/48'/1'/1'/2'", "m/2", "m/3")
+            }
+            descriptors::MuSig2DerivationMode::AggregateThenDeriveBip328 => {
+                plain_xpub_key(recovery_signer_b, secp, "m/48'/1'/1'/2'")
+            }
+        };
+
+        let musig_expr = match derivation_mode {
+            descriptors::MuSig2DerivationMode::DeriveThenAggregate => {
+                format!("musig({recovery_key_a},{recovery_key_b})")
+            }
+            descriptors::MuSig2DerivationMode::AggregateThenDeriveBip328 => {
+                format!("musig({recovery_key_a},{recovery_key_b})/<2;3>/*")
+            }
+        };
+        let musig_expr = descriptors::MuSig2KeyExpr::from_str(&musig_expr).unwrap();
+        let policy = descriptors::LianaPolicy::new_with_all_path_info(
+            descriptors::PrimaryPathInfo::from_key_path(descriptors::PathInfo::Single(primary_key)),
+            [(10, descriptors::RecoveryPathInfo::MuSig2(musig_expr))]
+                .iter()
+                .cloned()
+                .collect(),
+        )
+        .unwrap();
+        descriptors::LianaDescriptor::new(policy)
+    }
+
     fn musig2_test_psbt(
         descriptor: &descriptors::LianaDescriptor,
         secp: &secp256k1::Secp256k1<secp256k1::All>,
@@ -1253,7 +1394,6 @@ mod tests {
         );
         assert!(psbt.inputs[0].tap_key_sig.is_none());
         assert!(psbt.inputs[0].tap_script_sigs.is_empty());
-
         let psbt = primary_signer_a.sign_psbt(psbt, &secp).unwrap();
         assert_eq!(
             count_unknown_entries(&psbt.inputs[0], PSBT_IN_MUSIG2_PUB_NONCE),
@@ -1291,6 +1431,74 @@ mod tests {
         assert!(psbt.inputs[0].tap_script_sigs.is_empty());
 
         let psbt = recovery_signer.sign_psbt(psbt, &secp).unwrap();
+        assert!(psbt.inputs[0].tap_key_sig.is_some());
+        assert_eq!(psbt.inputs[0].tap_script_sigs.len(), 1);
+    }
+
+    fn assert_hot_signer_signs_musig2_recovery(derivation_mode: descriptors::MuSig2DerivationMode) {
+        let secp = secp256k1::Secp256k1::new();
+        let network = bitcoin::Network::Bitcoin;
+        let primary_signer = HotSigner::generate(network).unwrap();
+        let recovery_signer_a = HotSigner::generate(network).unwrap();
+        let recovery_signer_b = HotSigner::generate(network).unwrap();
+        let descriptor = musig2_recovery_test_descriptor(
+            &secp,
+            &primary_signer,
+            &recovery_signer_a,
+            &recovery_signer_b,
+            derivation_mode,
+        );
+
+        let mut psbt = musig2_test_psbt(&descriptor, &secp);
+        psbt.unsigned_tx.input[0].sequence = bitcoin::Sequence::from_height(10);
+
+        assert_eq!(
+            count_unknown_entries(&psbt.inputs[0], PSBT_IN_MUSIG2_PUB_NONCE),
+            0
+        );
+        assert_eq!(
+            count_unknown_entries(&psbt.inputs[0], PSBT_IN_MUSIG2_PARTIAL_SIG),
+            0
+        );
+        assert!(psbt.inputs[0].tap_key_sig.is_none());
+        assert!(psbt.inputs[0].tap_script_sigs.is_empty());
+        let psbt = recovery_signer_a.sign_psbt(psbt, &secp).unwrap();
+        assert_eq!(
+            count_unknown_entries(&psbt.inputs[0], PSBT_IN_MUSIG2_PUB_NONCE),
+            1
+        );
+        assert_eq!(
+            count_unknown_entries(&psbt.inputs[0], PSBT_IN_MUSIG2_PARTIAL_SIG),
+            0
+        );
+        assert!(psbt.inputs[0].tap_key_sig.is_none());
+        assert!(psbt.inputs[0].tap_script_sigs.is_empty());
+
+        let psbt = recovery_signer_b.sign_psbt(psbt, &secp).unwrap();
+        assert_eq!(
+            count_unknown_entries(&psbt.inputs[0], PSBT_IN_MUSIG2_PUB_NONCE),
+            2
+        );
+        assert_eq!(
+            count_unknown_entries(&psbt.inputs[0], PSBT_IN_MUSIG2_PARTIAL_SIG),
+            1
+        );
+        assert!(psbt.inputs[0].tap_key_sig.is_none());
+        assert!(psbt.inputs[0].tap_script_sigs.is_empty());
+
+        let psbt = recovery_signer_a.sign_psbt(psbt, &secp).unwrap();
+        assert_eq!(
+            count_unknown_entries(&psbt.inputs[0], PSBT_IN_MUSIG2_PUB_NONCE),
+            2
+        );
+        assert_eq!(
+            count_unknown_entries(&psbt.inputs[0], PSBT_IN_MUSIG2_PARTIAL_SIG),
+            2
+        );
+        assert!(psbt.inputs[0].tap_key_sig.is_none());
+        assert_eq!(psbt.inputs[0].tap_script_sigs.len(), 1);
+
+        let psbt = primary_signer.sign_psbt(psbt, &secp).unwrap();
         assert!(psbt.inputs[0].tap_key_sig.is_some());
         assert_eq!(psbt.inputs[0].tap_script_sigs.len(), 1);
     }
@@ -1934,6 +2142,20 @@ mod tests {
     #[test]
     fn hot_signer_signs_musig2_aggregate_then_derive() {
         assert_hot_signer_signs_musig2(
+            descriptors::MuSig2DerivationMode::AggregateThenDeriveBip328,
+        );
+    }
+
+    #[test]
+    fn hot_signer_signs_musig2_recovery_derive_then_aggregate() {
+        assert_hot_signer_signs_musig2_recovery(
+            descriptors::MuSig2DerivationMode::DeriveThenAggregate,
+        );
+    }
+
+    #[test]
+    fn hot_signer_signs_musig2_recovery_aggregate_then_derive() {
+        assert_hot_signer_signs_musig2_recovery(
             descriptors::MuSig2DerivationMode::AggregateThenDeriveBip328,
         );
     }
