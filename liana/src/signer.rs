@@ -804,7 +804,7 @@ impl HotSigner {
                         musig2_composite_key(
                             PSBT_IN_MUSIG2_PUB_NONCE,
                             owned_participant.participant_pubkey,
-                            aggregate_pubkey,
+                            session.spend_pubkey,
                             session.scope,
                         ),
                         pubnonce.to_bytes().to_vec(),
@@ -876,7 +876,7 @@ impl HotSigner {
                         musig2_composite_key(
                             PSBT_IN_MUSIG2_PARTIAL_SIG,
                             owned_participant.participant_pubkey,
-                            aggregate_pubkey,
+                            session.spend_pubkey,
                             session.scope,
                         ),
                         partial_signature.serialize().to_vec(),
@@ -924,9 +924,10 @@ impl HotSigner {
                             }
                         }
                         Musig2InputScope::ScriptSpend(leaf_hash) => {
-                            psbt_in
-                                .tap_script_sigs
-                                .insert((aggregate_pubkey.x_only_public_key().0, leaf_hash), sig);
+                            psbt_in.tap_script_sigs.insert(
+                                (session.spend_pubkey.x_only_public_key().0, leaf_hash),
+                                sig,
+                            );
                         }
                     }
                 }
@@ -1473,6 +1474,56 @@ mod tests {
         }
     }
 
+    fn musig2_unknown_keys(psbt_in: &PsbtIn, type_value: u8) -> Vec<&raw::Key> {
+        psbt_in
+            .unknown
+            .keys()
+            .filter(|key| key.type_value == type_value)
+            .collect()
+    }
+
+    fn assert_keyspend_unknown_keys_reference_output_key(psbt_in: &PsbtIn, type_value: u8) {
+        let script_pubkey = psbt_in
+            .witness_utxo
+            .as_ref()
+            .expect("test PSBTs contain a witness utxo")
+            .script_pubkey
+            .as_bytes()
+            .to_vec();
+        assert_eq!(script_pubkey.len(), 34);
+        assert_eq!(script_pubkey[0], 0x51);
+        assert_eq!(script_pubkey[1], 0x20);
+        let output_key = &script_pubkey[2..34];
+        for key in musig2_unknown_keys(psbt_in, type_value) {
+            assert_eq!(key.key.len(), 66);
+            assert_eq!(&key.key[34..66], output_key);
+        }
+    }
+
+    fn assert_script_unknown_keys_reference_leaf_keys(psbt_in: &PsbtIn, type_value: u8) {
+        for key in musig2_unknown_keys(psbt_in, type_value) {
+            assert_eq!(key.key.len(), 98);
+            let pubkey = secp256k1::PublicKey::from_slice(&key.key[33..66]).unwrap();
+            let leaf_hash = TapLeafHash::from_slice(&key.key[66..]).unwrap();
+            let xonly = pubkey.x_only_public_key().0;
+            let (leaf_hashes, _) = psbt_in
+                .tap_key_origins
+                .get(&xonly)
+                .expect("script-spend identifier pubkey is present in tap_key_origins");
+            assert!(leaf_hashes.contains(&leaf_hash));
+        }
+    }
+
+    fn assert_tap_script_sigs_reference_leaf_keys(psbt_in: &PsbtIn) {
+        for ((xonly, leaf_hash), _) in &psbt_in.tap_script_sigs {
+            let (leaf_hashes, _) = psbt_in
+                .tap_key_origins
+                .get(xonly)
+                .expect("script signature pubkey is present in tap_key_origins");
+            assert!(leaf_hashes.contains(leaf_hash));
+        }
+    }
+
     fn assert_hot_signer_signs_musig2(derivation_mode: descriptors::MuSig2DerivationMode) {
         let secp = secp256k1::Secp256k1::new();
         let network = bitcoin::Network::Bitcoin;
@@ -1510,6 +1561,10 @@ mod tests {
         );
         assert!(psbt.inputs[0].tap_key_sig.is_none());
         assert!(psbt.inputs[0].tap_script_sigs.is_empty());
+        assert_keyspend_unknown_keys_reference_output_key(
+            &psbt.inputs[0],
+            PSBT_IN_MUSIG2_PUB_NONCE,
+        );
 
         let psbt = primary_signer_b.sign_psbt(psbt, &secp).unwrap();
         assert_eq!(
@@ -1522,6 +1577,14 @@ mod tests {
         );
         assert!(psbt.inputs[0].tap_key_sig.is_none());
         assert!(psbt.inputs[0].tap_script_sigs.is_empty());
+        assert_keyspend_unknown_keys_reference_output_key(
+            &psbt.inputs[0],
+            PSBT_IN_MUSIG2_PUB_NONCE,
+        );
+        assert_keyspend_unknown_keys_reference_output_key(
+            &psbt.inputs[0],
+            PSBT_IN_MUSIG2_PARTIAL_SIG,
+        );
 
         let psbt = primary_signer_a.sign_psbt(psbt, &secp).unwrap();
         assert_eq!(
@@ -1534,6 +1597,14 @@ mod tests {
         );
         assert!(psbt.inputs[0].tap_key_sig.is_some());
         assert!(psbt.inputs[0].tap_script_sigs.is_empty());
+        assert_keyspend_unknown_keys_reference_output_key(
+            &psbt.inputs[0],
+            PSBT_IN_MUSIG2_PUB_NONCE,
+        );
+        assert_keyspend_unknown_keys_reference_output_key(
+            &psbt.inputs[0],
+            PSBT_IN_MUSIG2_PARTIAL_SIG,
+        );
 
         let psbt = recovery_signer.sign_psbt(psbt, &secp).unwrap();
         assert!(psbt.inputs[0].tap_key_sig.is_some());
@@ -1579,6 +1650,7 @@ mod tests {
         );
         assert!(psbt.inputs[0].tap_key_sig.is_none());
         assert!(psbt.inputs[0].tap_script_sigs.is_empty());
+        assert_script_unknown_keys_reference_leaf_keys(&psbt.inputs[0], PSBT_IN_MUSIG2_PUB_NONCE);
 
         let psbt = recovery_signer_b.sign_psbt(psbt, &secp).unwrap();
         assert_eq!(
@@ -1591,6 +1663,8 @@ mod tests {
         );
         assert!(psbt.inputs[0].tap_key_sig.is_none());
         assert!(psbt.inputs[0].tap_script_sigs.is_empty());
+        assert_script_unknown_keys_reference_leaf_keys(&psbt.inputs[0], PSBT_IN_MUSIG2_PUB_NONCE);
+        assert_script_unknown_keys_reference_leaf_keys(&psbt.inputs[0], PSBT_IN_MUSIG2_PARTIAL_SIG);
 
         let psbt = recovery_signer_a.sign_psbt(psbt, &secp).unwrap();
         assert_eq!(
@@ -1603,10 +1677,14 @@ mod tests {
         );
         assert!(psbt.inputs[0].tap_key_sig.is_none());
         assert_eq!(psbt.inputs[0].tap_script_sigs.len(), 1);
+        assert_script_unknown_keys_reference_leaf_keys(&psbt.inputs[0], PSBT_IN_MUSIG2_PUB_NONCE);
+        assert_script_unknown_keys_reference_leaf_keys(&psbt.inputs[0], PSBT_IN_MUSIG2_PARTIAL_SIG);
+        assert_tap_script_sigs_reference_leaf_keys(&psbt.inputs[0]);
 
         let psbt = primary_signer.sign_psbt(psbt, &secp).unwrap();
         assert!(psbt.inputs[0].tap_key_sig.is_some());
         assert_eq!(psbt.inputs[0].tap_script_sigs.len(), 1);
+        assert_tap_script_sigs_reference_leaf_keys(&psbt.inputs[0]);
     }
 
     #[test]
