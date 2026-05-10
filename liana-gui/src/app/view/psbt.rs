@@ -7,7 +7,7 @@ use iced::{
 
 use liana::descriptors::LianaDescriptor;
 use liana::{
-    descriptors::{LianaPolicy, PathInfo, PathSpendInfo, PrimaryPathInfo},
+    descriptors::{LianaPolicy, PathSpendInfo, PrimaryPathInfo, RecoveryPathInfo},
     miniscript::bitcoin::{
         bip32::Fingerprint, blockdata::transaction::TxOut, Address, Network, OutPoint, Transaction,
         Txid,
@@ -629,7 +629,7 @@ pub fn primary_path_view<'a>(
 }
 
 pub fn path_view<'a>(
-    path: &'a PathInfo,
+    path: &'a RecoveryPathInfo,
     sigs: &'a PathSpendInfo,
     key_aliases: &'a HashMap<Fingerprint, String>,
 ) -> Element<'a, Message> {

@@ -3,8 +3,10 @@ use miniscript::{
         self,
         bip32::{self, DerivationPath, Fingerprint},
         constants::WITNESS_SCALE_FACTOR,
+        hashes::Hash,
         psbt::{Input as PsbtIn, Output as PsbtOut, Psbt},
         secp256k1,
+        taproot::TapLeafHash,
     },
     descriptor::{self, DescriptorXKey, Wildcard},
     miniscript::satisfy::Placeholder,
@@ -89,10 +91,11 @@ fn key_is_for_path(
     false
 }
 
-fn musig2_primary_spend_info(
+fn musig2_spend_info(
     psbt_in: &PsbtIn,
     threshold: usize,
     path_origins: &HashMap<bip32::Fingerprint, HashSet<bip32::DerivationPath>>,
+    keyspend: bool,
 ) -> PathSpendInfo {
     let participant_is_for_path =
         |fg: &bip32::Fingerprint, der_path: &bip32::DerivationPath| -> bool {
@@ -103,19 +106,30 @@ fn musig2_primary_spend_info(
                 || key_is_for_path(path_origins, fg, der_path)
         };
 
-    let participant_set_aggregate = psbt_in
+    #[derive(Clone)]
+    struct MatchingSet {
+        aggregate_pubkey: secp256k1::PublicKey,
+        leaf_hash: Option<TapLeafHash>,
+    }
+
+    let matching_sets = psbt_in
         .unknown
         .iter()
         .filter_map(|(key, value)| {
             if key.type_value != 0x1a
-                || key.key.len() != 33
+                || !matches!(key.key.len(), 33 | 65)
+                || (keyspend && key.key.len() != 33)
+                || (!keyspend && key.key.len() != 65)
                 || value.is_empty()
                 || value.len() % 33 != 0
             {
                 return None;
             }
 
-            let aggregate_pubkey = secp256k1::PublicKey::from_slice(&key.key).ok()?;
+            let aggregate_pubkey = secp256k1::PublicKey::from_slice(&key.key[..33]).ok()?;
+            let leaf_hash = (key.key.len() == 65)
+                .then(|| TapLeafHash::from_slice(&key.key[33..]).ok())
+                .flatten();
             let participant_pubkeys = value
                 .chunks_exact(33)
                 .map(secp256k1::PublicKey::from_slice)
@@ -131,51 +145,82 @@ fn musig2_primary_spend_info(
                         .map(|(_, (fg, der_path))| participant_is_for_path(fg, der_path))
                         .unwrap_or(false)
                 })
-                .then_some(aggregate_pubkey)
+                .then_some(MatchingSet {
+                    aggregate_pubkey,
+                    leaf_hash,
+                })
         })
-        .next();
+        .collect::<Vec<_>>();
 
-    let mut signed_pubkeys = HashMap::new();
-    if let Some(aggregate_pubkey) = participant_set_aggregate {
-        for key in psbt_in.unknown.keys() {
-            if key.type_value != 0x1c || key.key.len() != 66 {
-                continue;
-            }
+    matching_sets
+        .into_iter()
+        .map(|matching_set| {
+            let mut signed_pubkeys = HashMap::new();
+            for key in psbt_in.unknown.keys() {
+                if key.type_value != 0x1c || !matches!(key.key.len(), 66 | 98) {
+                    continue;
+                }
+                if keyspend && key.key.len() != 66 {
+                    continue;
+                }
+                if !keyspend && key.key.len() != 98 {
+                    continue;
+                }
 
-            let Ok(participant_pubkey) = secp256k1::PublicKey::from_slice(&key.key[..33]) else {
-                continue;
-            };
-            let Ok(partial_sig_aggregate) = secp256k1::PublicKey::from_slice(&key.key[33..]) else {
-                continue;
-            };
-            if partial_sig_aggregate != aggregate_pubkey {
-                continue;
-            }
+                let Ok(participant_pubkey) = secp256k1::PublicKey::from_slice(&key.key[..33])
+                else {
+                    continue;
+                };
+                let Ok(partial_sig_aggregate) = secp256k1::PublicKey::from_slice(&key.key[33..66])
+                else {
+                    continue;
+                };
+                if partial_sig_aggregate != matching_set.aggregate_pubkey
+                    || (!keyspend
+                        && TapLeafHash::from_slice(&key.key[66..]).ok() != matching_set.leaf_hash)
+                {
+                    continue;
+                }
 
-            if let Some((_, (fg, der_path))) = psbt_in
-                .tap_key_origins
-                .get(&participant_pubkey.x_only_public_key().0)
-            {
-                if participant_is_for_path(fg, der_path) {
-                    *signed_pubkeys.entry(*fg).or_insert(0) += 1;
+                if let Some((_, (fg, der_path))) = psbt_in
+                    .tap_key_origins
+                    .get(&participant_pubkey.x_only_public_key().0)
+                {
+                    if participant_is_for_path(fg, der_path) {
+                        *signed_pubkeys.entry(*fg).or_insert(0) += 1;
+                    }
                 }
             }
-        }
-    }
 
-    let mut sigs_count: usize = signed_pubkeys.values().copied().sum();
-    if psbt_in.tap_key_sig.is_some() {
-        sigs_count = threshold;
-    }
+            let mut sigs_count: usize = signed_pubkeys.values().copied().sum();
+            if keyspend {
+                if psbt_in.tap_key_sig.is_some() {
+                    sigs_count = threshold;
+                }
+            } else if let Some(leaf_hash) = matching_set.leaf_hash {
+                if psbt_in.tap_script_sigs.contains_key(&(
+                    matching_set.aggregate_pubkey.x_only_public_key().0,
+                    leaf_hash,
+                )) {
+                    sigs_count = threshold;
+                }
+            }
 
-    PathSpendInfo {
-        threshold,
-        sigs_count,
-        signed_pubkeys,
-    }
+            PathSpendInfo {
+                threshold,
+                sigs_count,
+                signed_pubkeys,
+            }
+        })
+        .max_by_key(|info| (info.sigs_count, info.signed_pubkeys.len()))
+        .unwrap_or(PathSpendInfo {
+            threshold,
+            sigs_count: 0,
+            signed_pubkeys: HashMap::new(),
+        })
 }
 
-fn prune_musig2_primary_derivs(
+fn prune_musig2_path_derivs(
     mut psbt: Psbt,
     path_origins: &HashMap<bip32::Fingerprint, HashSet<bip32::DerivationPath>>,
 ) -> Psbt {
@@ -207,6 +252,13 @@ fn append_path_keys(path: &PathInfo, out: &mut Vec<DescriptorPublicKey>) {
     match path {
         PathInfo::Single(key) => out.push(key.clone()),
         PathInfo::Multi(_, keys) => out.extend(keys.iter().cloned()),
+    }
+}
+
+fn append_recovery_path_keys(path: &RecoveryPathInfo, out: &mut Vec<DescriptorPublicKey>) {
+    match path {
+        RecoveryPathInfo::Script(path) => append_path_keys(path, out),
+        RecoveryPathInfo::MuSig2(expr) => out.extend(expr.participants().iter().cloned()),
     }
 }
 
@@ -270,11 +322,35 @@ impl str::FromStr for LianaDescriptor {
         if s.contains("musig(") {
             let multi_desc = MuSig2TaprootDescriptor::from_str(s)?;
             let shadow_policy = LianaPolicy::from_multipath_descriptor(multi_desc.shadow_desc())?;
-            let policy = LianaPolicy::from_parts_uncompiled(
-                PrimaryPathInfo::MuSig2(multi_desc.expr().clone()),
-                shadow_policy.recovery_paths().clone(),
-                /* is_taproot = */ true,
-            )?;
+            let placeholder_exprs = multi_desc
+                .placeholders()
+                .iter()
+                .map(|placeholder| (placeholder.shadow_key().clone(), placeholder.expr().clone()))
+                .collect::<BTreeMap<_, _>>();
+            let primary_path = match shadow_policy.primary_path().as_key_path() {
+                Some(PathInfo::Single(key)) => placeholder_exprs
+                    .get(key)
+                    .cloned()
+                    .map(PrimaryPathInfo::MuSig2)
+                    .unwrap_or_else(|| shadow_policy.primary_path().clone()),
+                _ => shadow_policy.primary_path().clone(),
+            };
+            let recovery_paths = shadow_policy
+                .recovery_paths()
+                .iter()
+                .map(|(timelock, path)| {
+                    let recovery_path = match path {
+                        RecoveryPathInfo::Script(PathInfo::Single(key)) => placeholder_exprs
+                            .get(key)
+                            .cloned()
+                            .map(RecoveryPathInfo::MuSig2)
+                            .unwrap_or_else(|| path.clone()),
+                        _ => path.clone(),
+                    };
+                    (*timelock, recovery_path)
+                })
+                .collect();
+            let policy = LianaPolicy::from_parts_uncompiled(primary_path, recovery_paths, true)?;
             let receive_desc = SinglePathLianaDesc::MuSig2(multi_desc.branch_descriptor(0)?);
             let change_desc = SinglePathLianaDesc::MuSig2(multi_desc.branch_descriptor(1)?);
 
@@ -384,14 +460,22 @@ impl ChangeOutput {
 
 impl LianaDescriptor {
     pub fn new(spending_policy: LianaPolicy) -> LianaDescriptor {
-        if let Some(expr) = spending_policy.primary_path().musig().cloned() {
-            let shadow_policy = LianaPolicy::new(
-                PathInfo::Single(dummy_shadow_key()),
-                spending_policy.recovery_paths().clone(),
-            )
-            .expect("dummy shadow policy must be valid");
+        if spending_policy.primary_path().musig().is_some()
+            || spending_policy
+                .recovery_paths()
+                .values()
+                .any(|path| path.musig().is_some())
+        {
+            let (shadow_primary_path, shadow_recovery_paths, placeholders) = shadow_musig2_paths(
+                spending_policy.primary_path(),
+                spending_policy.recovery_paths(),
+            );
+            let shadow_policy =
+                LianaPolicy::new_with_all_path_info(shadow_primary_path, shadow_recovery_paths)
+                    .expect("dummy shadow policy must be valid");
             let shadow_desc = shadow_policy.compile_multipath_descriptor();
-            let multi_desc = MuSig2TaprootDescriptor::from_shadow_descriptor(shadow_desc, expr);
+            let multi_desc =
+                MuSig2TaprootDescriptor::from_shadow_descriptor(shadow_desc, placeholders);
             let receive_desc = SinglePathLianaDesc::MuSig2(
                 multi_desc
                     .branch_descriptor(0)
@@ -442,7 +526,7 @@ impl LianaDescriptor {
         let mut keys = Vec::new();
         append_primary_keys(self.policy.primary_path(), &mut keys);
         for recovery_path in self.policy.recovery_paths().values() {
-            append_path_keys(recovery_path, &mut keys);
+            append_recovery_path_keys(recovery_path, &mut keys);
         }
         keys.into_iter().all(|xpub| match xpub {
             descriptor::DescriptorPublicKey::MultiXPub(xpub) => {
@@ -527,7 +611,7 @@ impl LianaDescriptor {
         let mut descriptor_keys = Vec::new();
         append_primary_keys(self.policy.primary_path(), &mut descriptor_keys);
         for recovery_path in self.policy.recovery_paths().values() {
-            append_path_keys(recovery_path, &mut descriptor_keys);
+            append_recovery_path_keys(recovery_path, &mut descriptor_keys);
         }
         for key in descriptor_keys {
             match key {
@@ -738,7 +822,7 @@ impl LianaDescriptor {
             PrimaryPathInfo::KeyPath(path) => path.spend_info(pubkeys_signed.clone()),
             PrimaryPathInfo::MuSig2(_) => {
                 let (threshold, path_origins) = desc_info.primary_path.thresh_origins();
-                musig2_primary_spend_info(psbt_in, threshold, &path_origins)
+                musig2_spend_info(psbt_in, threshold, &path_origins, true)
             }
         };
         let recovery_paths = desc_info
@@ -746,7 +830,14 @@ impl LianaDescriptor {
             .iter()
             .filter_map(|(timelock, path_info)| {
                 if txin.sequence.is_height_locked() && txin.sequence.0 >= *timelock as u32 {
-                    Some((*timelock, path_info.spend_info(pubkeys_signed.clone())))
+                    let spend_info = match path_info {
+                        RecoveryPathInfo::Script(path) => path.spend_info(pubkeys_signed.clone()),
+                        RecoveryPathInfo::MuSig2(_) => {
+                            let (threshold, path_origins) = path_info.thresh_origins();
+                            musig2_spend_info(psbt_in, threshold, &path_origins, false)
+                        }
+                    };
+                    Some((*timelock, spend_info))
                 } else {
                     None
                 }
@@ -912,7 +1003,17 @@ impl LianaDescriptor {
             PrimaryPathInfo::KeyPath(path) => self.prune_bip32_derivs(psbt, path),
             PrimaryPathInfo::MuSig2(_) => {
                 let (_, path_origins) = primary_path.thresh_origins();
-                prune_musig2_primary_derivs(psbt, &path_origins)
+                prune_musig2_path_derivs(psbt, &path_origins)
+            }
+        }
+    }
+
+    fn prune_recovery_path_derivs(&self, psbt: Psbt, recovery_path: &RecoveryPathInfo) -> Psbt {
+        match recovery_path {
+            RecoveryPathInfo::Script(path) => self.prune_bip32_derivs(psbt, path),
+            RecoveryPathInfo::MuSig2(_) => {
+                let (_, path_origins) = recovery_path.thresh_origins();
+                prune_musig2_path_derivs(psbt, &path_origins)
             }
         }
     }
@@ -934,7 +1035,7 @@ impl LianaDescriptor {
                 .expect("Same timelocks must be keys in both mappings.")
         });
         Ok(if let Some(path_info) = recovery_path {
-            self.prune_bip32_derivs(psbt, path_info)
+            self.prune_recovery_path_derivs(psbt, path_info)
         } else {
             self.prune_primary_path_derivs(psbt, &policy.primary_path)
         })
@@ -1815,6 +1916,18 @@ mod tests {
             miniscript::descriptor::checksum::desc_checksum(musig_desc).unwrap()
         );
         roundtrip(&musig_desc);
+        let musig_recovery_desc = "tr([8344c025]xpub661MyMwAqRbcG2SYC6YSRsUGvcSxXEZm1kjiQRTEaAqart1PQk1N1hVTTEsGfaBx6xQ5gDYXXtbourodE6ZE5qZTnaMgmehNs8GGEEY9YK6/<0;1>/*,and_v(v:pk(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<2;3>/*,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/<2;3>/*)),older(10)))";
+        let musig_recovery_desc = format!(
+            "{musig_recovery_desc}#{}",
+            miniscript::descriptor::checksum::desc_checksum(musig_recovery_desc).unwrap()
+        );
+        roundtrip(&musig_recovery_desc);
+        let musig_recovery_desc = "tr([8344c025]xpub661MyMwAqRbcG2SYC6YSRsUGvcSxXEZm1kjiQRTEaAqart1PQk1N1hVTTEsGfaBx6xQ5gDYXXtbourodE6ZE5qZTnaMgmehNs8GGEEY9YK6/<0;1>/*,and_v(v:pk(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM)/<2;3>/*),older(10)))";
+        let musig_recovery_desc = format!(
+            "{musig_recovery_desc}#{}",
+            miniscript::descriptor::checksum::desc_checksum(musig_recovery_desc).unwrap()
+        );
+        roundtrip(&musig_recovery_desc);
         // One with a multisig in both paths
         roundtrip("wsh(or_d(multi(3,[aabbccdd]xpub6Eze7yAT3Y1wGrnzedCNVYDXUqa9NmHVWck5emBaTbXtURbe1NWZbK9bsz1TiVE7Cz341PMTfYgFw1KdLWdzcM1UMFTcdQfCYhhXZ2HJvTW/<0;1>/*,[aabb0011/10/4893]xpub6Bw79HbNSeS2xXw1sngPE3ehnk1U3iSPCgLYzC9LpN8m9nDuaKLZvkg8QXxL5pDmEmQtYscmUD8B9MkAAZbh6vxPzNXMaLfGQ9Sb3z85qhR/<0;1>/*,[aabb0022]xpub67zuTXF9Ln4731avKTBSawoVVNRuMfmRvkL7kLUaLBRqma9ZqdHBJg9qx8cPUm3oNQMiXT4TmGovXNoQPuwg17RFcVJ8YrnbcooN7pxVJqC/<0;1>/*),and_v(v:multi(2,[aabbccdd]xpub69cP4Y7S9TWcbSNxmk6CEDBsoaqr3ZEdjHuZcHxEFFKGh569RsJNr2V27XGhsbH9FXgWUEmKXRN7c5wQfq2VPjt31xP9VsYnVUyU8HcVevm/<0;1>/*,[aabb0011]xpub6AA2N8RALRYgLD6jT1iXYCEDkndTeZndMtWPbtNX6sY5dPiLtf2T88ahdxrGXMUPoNadgR86sFhBXWQVgifPzDYbY9ZtwK4gqzx4y5Da1DW/<0;1>/*,[aabb0022/10/4893]xpub6AyxexvxizZJffF153evmfqHcE9MV88fCNCAtP3jQjXJHwrAKri71Tq9jWUkPxj9pja4u6AkCPHY7atgxzSEa2HtDwJfrRWKK4fsfQg4o77/<0;1>/*),older(26352))))#csjdk94l");
         roundtrip("tr(xpub661MyMwAqRbcGg7oXkMMptXXJAGxQtVM7LZeqXNNdxPiWyEmuJdoyFD3NhRpL1YTo313XRWZmiUXTkcEK9EFQHrbie6NBNAvL2CZXp941Li/<0;1>/*,{and_v(v:multi_a(2,[6b882e01]xpub661MyMwAqRbcGRU9psMcDAPd2L2ShzwoenySSSjWpkd7u8Wv7PCPtH5fi6WYYbQAqSG4U3NbuYASCRMkWVYm7yb97iTY4MUKKZ3N8XwCERJ/<0;1>/*,[66b98303]xpub661MyMwAqRbcGicAwMZ5pHCWrB4DEMBGUtvkV2KMMLypR8dbr7g2uV9vzE9w3oDKRqtTV6HYTqHHvusxNwJUXAvRH6BFhKUPTgGMiLPnSmK/<0;1>/*,[9c04a03b]xpub661MyMwAqRbcFCBt8Gjs71UqoMe8V4PSHECuCowg1TR7EkGWLLbu2WanQtcWutzwahrTcicsuL25Q7r6EyfbEKF2jSoekmnw9soZfoiLZXu/<0;1>/*),older(42421)),multi_a(3,[30188cc2]xpub661MyMwAqRbcGeoYQgqUapNKDLBiNE7fcGs6ibKi39GjuiRmV1JgXcfAwHjt7PLLofmz4PPL66NTwAxaTwGtL8YB67RhRspAzbKgneqpenb/<0;1>/*,[aea08adc]xpub661MyMwAqRbcGVL3W5qKT8pjZ3BXcDEJghDj67rKLQYwmTaJLud8RWyYwZQ9LdzkcNtCSCHVypZdUUxd4z2k5hCfb6qprGgwAKqpmaKJTnS/<0;1>/*,[85e33ca4]xpub661MyMwAqRbcFHP9bmnRofzha8c4DHADC7ToPz3kYdov5DDDtgdBEQ3kVcwdjjqAGC8eJZ65CLF2cA9XHhUsJJqKxbE9asj8RUNmGjCJErX/<0;1>/*)})#zm4kj6yd");
@@ -1841,6 +1954,18 @@ mod tests {
 
     fn aggregate_then_derive_musig_desc() -> LianaDescriptor {
         let body = "tr(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM)/<0;1>/*,and_v(v:pk([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/<2;3>/*),older(10)))";
+        let desc = format!("{body}#{}", desc_checksum(body).unwrap());
+        LianaDescriptor::from_str(&desc).unwrap()
+    }
+
+    fn derive_then_aggregate_musig_recovery_desc() -> LianaDescriptor {
+        let body = "tr([8344c025]xpub661MyMwAqRbcG2SYC6YSRsUGvcSxXEZm1kjiQRTEaAqart1PQk1N1hVTTEsGfaBx6xQ5gDYXXtbourodE6ZE5qZTnaMgmehNs8GGEEY9YK6/<0;1>/*,and_v(v:pk(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<2;3>/*,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/<2;3>/*)),older(10)))";
+        let desc = format!("{body}#{}", desc_checksum(body).unwrap());
+        LianaDescriptor::from_str(&desc).unwrap()
+    }
+
+    fn aggregate_then_derive_musig_recovery_desc() -> LianaDescriptor {
+        let body = "tr([8344c025]xpub661MyMwAqRbcG2SYC6YSRsUGvcSxXEZm1kjiQRTEaAqart1PQk1N1hVTTEsGfaBx6xQ5gDYXXtbourodE6ZE5qZTnaMgmehNs8GGEEY9YK6/<0;1>/*,and_v(v:pk(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM)/<2;3>/*),older(10)))";
         let desc = format!("{body}#{}", desc_checksum(body).unwrap());
         LianaDescriptor::from_str(&desc).unwrap()
     }
@@ -2045,12 +2170,14 @@ mod tests {
                 descriptor::DescriptorPublicKey::from_str("[ffd63c8d/48'/1'/0'/2']tpubDExA3EC3iAsPxPhFn4j6gMiVup6V2eH3qKyk69RcTc9TTNRfFYVPad8bJD5FCHVQxyBT4izKsvr7Btd2R4xmQ1hZkvsqGBaeE82J71uTK4N/<0;1>/*").unwrap(),
             ],
         ));
-        assert_eq!(info.recovery_paths, [(2, PathInfo::Multi(
-            2,
-            vec![
-                descriptor::DescriptorPublicKey::from_str("[636adf3f/48'/1'/1'/2']tpubDDvF2khuoBBj8vcSjQfa7iKaxsQZE7YjJ7cJL8A8eaneadMPKbHSpoSr4JD1F5LUvWD82HCxdtSppGfrMUmiNbFxrA2EHEVLnrdCFNFe75D/<0;1>/*").unwrap(),
-                descriptor::DescriptorPublicKey::from_str("[ffd63c8d/48'/1'/1'/2']tpubDFMs44FD4kFt3M7Z317cFh5tdKEGN8tyQRY6Q5gcSha4NtxZfGmTVRMbsD1bWN469LstXU4aVSARDxrvxFCUjHeegfEY2cLSazMBkNCmDPD/<0;1>/*").unwrap(),
-            ],
+        assert_eq!(info.recovery_paths, [(2, RecoveryPathInfo::Script(
+            PathInfo::Multi(
+                2,
+                vec![
+                    descriptor::DescriptorPublicKey::from_str("[636adf3f/48'/1'/1'/2']tpubDDvF2khuoBBj8vcSjQfa7iKaxsQZE7YjJ7cJL8A8eaneadMPKbHSpoSr4JD1F5LUvWD82HCxdtSppGfrMUmiNbFxrA2EHEVLnrdCFNFe75D/<0;1>/*").unwrap(),
+                    descriptor::DescriptorPublicKey::from_str("[ffd63c8d/48'/1'/1'/2']tpubDFMs44FD4kFt3M7Z317cFh5tdKEGN8tyQRY6Q5gcSha4NtxZfGmTVRMbsD1bWN469LstXU4aVSARDxrvxFCUjHeegfEY2cLSazMBkNCmDPD/<0;1>/*").unwrap(),
+                ],
+            ),
         ))].iter().cloned().collect());
         let mut psbt = psbt_from_str("cHNidP8BAIkCAAAAAWi3OFgkj1CqCDT3Swm8kbxZS9lxz4L3i4W2v9KGC7nqAQAAAAD9////AkANAwAAAAAAIgAg27lNc1rog+dOq80ohRuds4Hgg/RcpxVun2XwgpuLSrFYMwwAAAAAACIAIDyWveqaElWmFGkTbFojg1zXWHODtiipSNjfgi2DqBy9AAAAAAABAOoCAAAAAAEBsRWl70USoAFFozxc86pC7Dovttdg4kvja//3WMEJskEBAAAAAP7///8CWKmCIk4GAAAWABRKBWYWkCNS46jgF0r69Ehdnq+7T0BCDwAAAAAAIgAgTt5fs+CiB+FRzNC8lHcgWLH205sNjz1pT59ghXlG5tQCRzBEAiBXK9MF8z3bX/VnY2aefgBBmiAHPL4tyDbUOe7+KpYA4AIgL5kU0DFG8szKd+szRzz/OTUWJ0tZqij41h2eU9rSe1IBIQNBB1hy+jKsg1TihMT0dXw7etpu9TkO3NuvhBDFJlBj1cP2AQABAStAQg8AAAAAACIAIE7eX7PgogfhUczQvJR3IFix9tObDY89aU+fYIV5RubUIgICSKJsNs0zFJN58yd2aYQ+C3vhMbi0x7k0FV3wBhR4THlIMEUCIQCPWWWOhs2lThxOq/G8X2fYBRvM9MXSm7qPH+dRVYQZEwIgfut2vx3RvwZWcgEj4ohQJD5lNJlwOkA4PAiN1fjx6dABIgID3mvj1zerZKohOVhKCiskYk+3qrCum6PIwDhQ16ePACpHMEQCICZNR+0/1hPkrDQwPFmg5VjUHkh6aK9cXUu3kPbM8hirAiAyE/5NUXKfmFKij30isuyysJbq8HrURjivd+S9vdRGKQEBBZNSIQJIomw2zTMUk3nzJ3ZphD4Le+ExuLTHuTQVXfAGFHhMeSEC9OfCXl+sJOrxUFLBuMV4ZUlJYjuzNGZSld5ioY14y8FSrnNkUSED3mvj1zerZKohOVhKCiskYk+3qrCum6PIwDhQ16ePACohA+ECH+HlR+8Sf3pumaXH3IwSsoqSLCH7H1THiBP93z3ZUq9SsmgiBgJIomw2zTMUk3nzJ3ZphD4Le+ExuLTHuTQVXfAGFHhMeRxjat8/MAAAgAEAAIAAAACAAgAAgAAAAAABAAAAIgYC9OfCXl+sJOrxUFLBuMV4ZUlJYjuzNGZSld5ioY14y8Ec/9Y8jTAAAIABAACAAAAAgAIAAIAAAAAAAQAAACIGA95r49c3q2SqITlYSgorJGJPt6qwrpujyMA4UNenjwAqHGNq3z8wAACAAQAAgAEAAIACAACAAAAAAAEAAAAiBgPhAh/h5UfvEn96bpmlx9yMErKKkiwh+x9Ux4gT/d892Rz/1jyNMAAAgAEAAIABAACAAgAAgAAAAAABAAAAACICAlBQ7gGocg7eF3sXrCio+zusAC9+xfoyIV95AeR69DWvHGNq3z8wAACAAQAAgAEAAIACAACAAAAAAAMAAAAiAgMvVy984eg8Kgvj058PBHetFayWbRGb7L0DMnS9KHSJzBxjat8/MAAAgAEAAIAAAACAAgAAgAAAAAADAAAAIgIDSRIG1dn6njdjsDXenHa2lUvQHWGPLKBVrSzbQOhiIxgc/9Y8jTAAAIABAACAAAAAgAIAAIAAAAAAAwAAACICA0/epE59sVEj7Et0I4R9qJQNuX23RNvDZKCRL7eUps9FHP/WPI0wAACAAQAAgAEAAIACAACAAAAAAAMAAAAAIgICgldCOK6iHscv//2NipgaMABLV5TICU/zlP7HlQmlg08cY2rfPzAAAIABAACAAQAAgAIAAIABAAAAAQAAACICApb0p9rfpJshB3J186PGWrvzQdixcwQZWmebOUMdkquZHP/WPI0wAACAAQAAgAAAAIACAACAAQAAAAEAAAAiAgLY5q+unoDxC/HI5BaNiPq12ei1REZIcUAN304JfKXUwxz/1jyNMAAAgAEAAIABAACAAgAAgAEAAAABAAAAIgIDg6cUVCJB79cMcofiURHojxFARWyS4YEhJNRixuOZZRgcY2rfPzAAAIABAACAAAAAgAIAAIABAAAAAQAAAAA=");
         let partial_info = desc.partial_spend_info(&psbt).unwrap();
@@ -2604,7 +2731,7 @@ mod tests {
                 .expect("Test descriptor primary path is a plain key path."),
         );
         assert_eq!(tap_psbt.inputs[0].tap_key_origins.len(), 1);
-        let mut tap_psbt = tap_desc.prune_bip32_derivs(tap_psbt, rec_path_info);
+        let mut tap_psbt = tap_desc.prune_recovery_path_derivs(tap_psbt, rec_path_info);
         assert!(tap_psbt.inputs[0].tap_key_origins.is_empty());
 
         // Do the opposite.
@@ -2615,7 +2742,7 @@ mod tests {
                 .cloned()
                 .collect();
         assert_eq!(tap_psbt.inputs[0].tap_key_origins.len(), 1);
-        let tap_psbt = tap_desc.prune_bip32_derivs(tap_psbt, rec_path_info);
+        let tap_psbt = tap_desc.prune_recovery_path_derivs(tap_psbt, rec_path_info);
         assert_eq!(tap_psbt.inputs[0].tap_key_origins.len(), 1);
         let tap_psbt = tap_desc.prune_bip32_derivs(
             tap_psbt,
@@ -2777,6 +2904,107 @@ mod tests {
         );
     }
 
+    #[test]
+    fn musig2_update_psbt_input_adds_recovery_bip373_participants() {
+        let secp = secp256k1::Secp256k1::verification_only();
+        let desc = derive_then_aggregate_musig_recovery_desc();
+        let mut psbt_in = PsbtIn::default();
+        let der_desc = desc.receive_descriptor().derive(7.into(), &secp);
+        der_desc.update_psbt_in(&mut psbt_in);
+
+        let policy = desc.policy();
+        let expr = policy
+            .recovery_paths()
+            .values()
+            .next()
+            .and_then(|path| path.musig())
+            .unwrap();
+        let aggregate_pubkey = derive_aggregate_pubkey(expr, 0, 7).unwrap();
+        let leaf_hash = *psbt_in
+            .tap_key_origins
+            .get(&aggregate_pubkey.x_only_public_key().0)
+            .and_then(|(leaf_hashes, _)| leaf_hashes.first())
+            .unwrap();
+        let expected_participants = expected_musig_participants(expr, 7);
+        let raw_key = raw::Key {
+            type_value: 0x1a,
+            key: [
+                aggregate_pubkey.serialize().as_slice(),
+                leaf_hash.as_byte_array(),
+            ]
+            .concat(),
+        };
+        let expected_value: Vec<u8> = expected_participants
+            .iter()
+            .flat_map(|participant| participant.serialize())
+            .collect();
+
+        assert_eq!(psbt_in.unknown.get(&raw_key), Some(&expected_value));
+        for participant in expected_participants {
+            assert!(psbt_in
+                .tap_key_origins
+                .contains_key(&participant.x_only_public_key().0));
+        }
+    }
+
+    #[test]
+    fn musig2_update_psbt_output_adds_recovery_bip373_participants() {
+        let secp = secp256k1::Secp256k1::verification_only();
+        let desc = aggregate_then_derive_musig_recovery_desc();
+        let mut psbt_out = PsbtOut::default();
+        let der_desc = desc.change_descriptor().derive(4.into(), &secp);
+        der_desc.update_change_psbt_out(&mut psbt_out);
+
+        let policy = desc.policy();
+        let expr = policy
+            .recovery_paths()
+            .values()
+            .next()
+            .and_then(|path| path.musig())
+            .unwrap();
+        let mut participant_pubkeys = expected_musig_participants(expr, 0);
+        participant_pubkeys.sort();
+        let aggregate_pubkey = aggregate_plain_pubkey(participant_pubkeys.clone()).unwrap();
+        let output_aggregate_pubkey = derive_aggregate_pubkey(expr, 1, 4).unwrap();
+        let leaf_hash = *psbt_out
+            .tap_key_origins
+            .get(&output_aggregate_pubkey.x_only_public_key().0)
+            .and_then(|(leaf_hashes, _)| leaf_hashes.first())
+            .unwrap();
+        let raw_key = raw::Key {
+            type_value: 0x08,
+            key: [
+                aggregate_pubkey.serialize().as_slice(),
+                leaf_hash.as_byte_array(),
+            ]
+            .concat(),
+        };
+        let expected_value: Vec<u8> = participant_pubkeys
+            .iter()
+            .flat_map(|participant| participant.serialize())
+            .collect();
+
+        assert_eq!(psbt_out.unknown.get(&raw_key), Some(&expected_value));
+        for participant in participant_pubkeys {
+            assert!(psbt_out
+                .tap_key_origins
+                .contains_key(&participant.x_only_public_key().0));
+        }
+        let (leaf_hashes, (fingerprint, derivation_path)) = psbt_out
+            .tap_key_origins
+            .get(&output_aggregate_pubkey.x_only_public_key().0)
+            .unwrap();
+        assert_eq!(leaf_hashes, &vec![leaf_hash]);
+        assert_eq!(
+            *fingerprint,
+            bip328_synthetic_xpub(aggregate_pubkey, bitcoin::Network::Bitcoin).fingerprint()
+        );
+        assert_eq!(
+            derivation_path,
+            &bip32::DerivationPath::from_str("3/4").unwrap()
+        );
+    }
+
     fn assert_musig2_partial_spend_info(desc: LianaDescriptor, child_index: u32) {
         let secp = secp256k1::Secp256k1::verification_only();
         let mut psbt = musig2_test_psbt();
@@ -2845,6 +3073,85 @@ mod tests {
     #[test]
     fn musig2_partial_spend_info_aggregate_then_derive() {
         assert_musig2_partial_spend_info(aggregate_then_derive_musig_desc(), 4);
+    }
+
+    fn assert_musig2_recovery_partial_spend_info(desc: LianaDescriptor, child_index: u32) {
+        let secp = secp256k1::Secp256k1::verification_only();
+        let mut psbt = musig2_test_psbt();
+        psbt.unsigned_tx.input[0].sequence = Sequence::from_height(10);
+        let der_desc = desc.receive_descriptor().derive(child_index.into(), &secp);
+        der_desc.update_psbt_in(&mut psbt.inputs[0]);
+
+        let info = desc.partial_spend_info(&psbt).unwrap();
+        assert_eq!(info.primary_path.threshold, 1);
+        assert_eq!(info.primary_path.sigs_count, 0);
+        let recovery_info = info.recovery_paths.get(&10).unwrap();
+        assert_eq!(recovery_info.threshold, 2);
+        assert_eq!(recovery_info.sigs_count, 0);
+        assert!(recovery_info.signed_pubkeys.is_empty());
+
+        let participant_set_key = psbt.inputs[0]
+            .unknown
+            .keys()
+            .find(|key| key.type_value == 0x1a && key.key.len() == 65)
+            .cloned()
+            .unwrap();
+        let aggregate_pubkey =
+            secp256k1::PublicKey::from_slice(&participant_set_key.key[..33]).unwrap();
+        let leaf_hash = TapLeafHash::from_slice(&participant_set_key.key[33..]).unwrap();
+        let participants = psbt.inputs[0].unknown[&participant_set_key]
+            .chunks_exact(33)
+            .map(secp256k1::PublicKey::from_slice)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        let first_fg = *psbt.inputs[0]
+            .tap_key_origins
+            .get(&participants[0].x_only_public_key().0)
+            .map(|(_, origin)| &origin.0)
+            .unwrap();
+        psbt.inputs[0].unknown.insert(
+            raw::Key {
+                type_value: 0x1c,
+                key: [
+                    participants[0].serialize().as_slice(),
+                    aggregate_pubkey.serialize().as_slice(),
+                    leaf_hash.as_byte_array(),
+                ]
+                .concat(),
+            },
+            vec![0; 32],
+        );
+
+        let info = desc.partial_spend_info(&psbt).unwrap();
+        let recovery_info = info.recovery_paths.get(&10).unwrap();
+        assert_eq!(recovery_info.threshold, 2);
+        assert_eq!(recovery_info.sigs_count, 1);
+        assert_eq!(recovery_info.signed_pubkeys, HashMap::from([(first_fg, 1)]));
+
+        let dummy_sig = bitcoin::taproot::Signature::from_slice(&[0; 64]).unwrap();
+        psbt.inputs[0]
+            .unknown
+            .retain(|key, _| key.type_value != 0x1c);
+        psbt.inputs[0].tap_script_sigs.insert(
+            (aggregate_pubkey.x_only_public_key().0, leaf_hash),
+            dummy_sig,
+        );
+
+        let info = desc.partial_spend_info(&psbt).unwrap();
+        let recovery_info = info.recovery_paths.get(&10).unwrap();
+        assert_eq!(recovery_info.threshold, 2);
+        assert_eq!(recovery_info.sigs_count, 2);
+    }
+
+    #[test]
+    fn musig2_recovery_partial_spend_info_derive_then_aggregate() {
+        assert_musig2_recovery_partial_spend_info(derive_then_aggregate_musig_recovery_desc(), 7);
+    }
+
+    #[test]
+    fn musig2_recovery_partial_spend_info_aggregate_then_derive() {
+        assert_musig2_recovery_partial_spend_info(aggregate_then_derive_musig_recovery_desc(), 4);
     }
 
     fn musig2_psbt(desc: &LianaDescriptor, child_index: u32) -> Psbt {

@@ -18,7 +18,7 @@ use std::{
     sync,
 };
 
-use crate::descriptors::musig::{dummy_shadow_key, MuSig2KeyExpr};
+use crate::descriptors::musig::{indexed_dummy_shadow_key, MuSig2KeyExpr, MuSig2Placeholder};
 
 #[derive(Debug)]
 pub enum LianaPolicyError {
@@ -70,7 +70,7 @@ impl std::fmt::Display for LianaPolicyError {
             }
             Self::MixedMuSig2DerivationModes => write!(
                 f,
-                "Mixed MuSig2 derivation modes are not allowed within a single musig() expression."
+                "Mixed MuSig2 derivation modes are not allowed within a single descriptor."
             ),
             Self::TaprootOnlyMuSig2 => {
                 write!(f, "MuSig2 primary paths are only supported for Taproot descriptors.")
@@ -92,6 +92,46 @@ impl std::fmt::Display for LianaPolicyError {
 }
 
 impl error::Error for LianaPolicyError {}
+
+fn validate_musig_expr(
+    expr: &MuSig2KeyExpr,
+    is_taproot: bool,
+    musig_mode: &mut Option<MuSig2DerivationMode>,
+    key_checker: &mut DescKeyChecker,
+) -> Result<(), LianaPolicyError> {
+    if !is_taproot {
+        return Err(LianaPolicyError::TaprootOnlyMuSig2);
+    }
+    if expr.derivation_mode() == MuSig2DerivationMode::AggregateThenDeriveBip328 {
+        let aggregate_derivation = expr
+            .aggregate_derivation()
+            .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+        let valid_liana_receive_change = aggregate_derivation.wildcard()
+            == descriptor::Wildcard::Unhardened
+            && aggregate_derivation.derivation_paths().paths().len() == 2;
+        if !valid_liana_receive_change {
+            return Err(LianaPolicyError::InvalidMuSig2Expression);
+        }
+    }
+    if let Some(existing_mode) = musig_mode {
+        if *existing_mode != expr.derivation_mode() {
+            return Err(LianaPolicyError::MixedMuSig2DerivationModes);
+        }
+    } else {
+        *musig_mode = Some(expr.derivation_mode());
+    }
+    let mut origin_fingerprints = HashSet::with_capacity(expr.participants().len());
+    for key in expr.participants() {
+        let fg = key_checker.check_musig_participant(key, expr.derivation_mode())?;
+        if origin_fingerprints.contains(&fg) {
+            return Err(LianaPolicyError::DuplicateOriginSamePath(
+                key.clone().into(),
+            ));
+        }
+        origin_fingerprints.insert(fg);
+    }
+    Ok(())
+}
 
 // Whether a Miniscript policy node represents a key check (or several of them).
 fn is_single_key_or_multisig(policy: &SemanticPolicy<descriptor::DescriptorPublicKey>) -> bool {
@@ -485,6 +525,87 @@ impl PathInfo {
     }
 }
 
+/// Information about a recovery spending path in a Taproot descriptor.
+#[derive(Debug, Eq, PartialEq, Clone, Ord, PartialOrd, Hash)]
+pub enum RecoveryPathInfo {
+    Script(PathInfo),
+    MuSig2(MuSig2KeyExpr),
+}
+
+impl RecoveryPathInfo {
+    pub fn from_script_path(path: PathInfo) -> Self {
+        Self::Script(path)
+    }
+
+    pub fn as_script_path(&self) -> Option<&PathInfo> {
+        match self {
+            Self::Script(path) => Some(path),
+            Self::MuSig2(_) => None,
+        }
+    }
+
+    pub fn into_script_path(self) -> Option<PathInfo> {
+        match self {
+            Self::Script(path) => Some(path),
+            Self::MuSig2(_) => None,
+        }
+    }
+
+    pub fn musig(&self) -> Option<&MuSig2KeyExpr> {
+        match self {
+            Self::MuSig2(expr) => Some(expr),
+            Self::Script(_) => None,
+        }
+    }
+
+    pub fn thresh_origins(
+        &self,
+    ) -> (
+        usize,
+        HashMap<bip32::Fingerprint, HashSet<bip32::DerivationPath>>,
+    ) {
+        match self {
+            Self::Script(path) => path.thresh_origins(),
+            Self::MuSig2(expr) => {
+                let mut origins: HashMap<_, HashSet<_>> =
+                    HashMap::with_capacity(expr.participants().len());
+                for key in expr.participants() {
+                    if let Some((fg, der_paths)) = key_origins(key) {
+                        origins.entry(fg).or_default().extend(der_paths);
+                    }
+                }
+                (expr.participants().len(), origins)
+            }
+        }
+    }
+
+    pub fn into_ms_policy(
+        self,
+    ) -> Result<ConcretePolicy<descriptor::DescriptorPublicKey>, LianaPolicyError> {
+        match self {
+            Self::Script(path) => path.into_ms_policy(),
+            Self::MuSig2(_) => Err(LianaPolicyError::InvalidMuSig2Expression),
+        }
+    }
+
+    pub fn contains_fingerprint(&self, fingerprint: Fingerprint) -> bool {
+        match self {
+            Self::Script(path) => path.contains_fingerprint(fingerprint),
+            Self::MuSig2(expr) => expr
+                .participants()
+                .iter()
+                .filter_map(|key| key_origins(key))
+                .any(|(fg, _)| fg == fingerprint),
+        }
+    }
+}
+
+impl From<PathInfo> for RecoveryPathInfo {
+    fn from(path: PathInfo) -> Self {
+        Self::from_script_path(path)
+    }
+}
+
 /// The two MuSig2 derivation modes Liana will support for a primary Taproot key path.
 #[derive(Debug, Eq, PartialEq, Clone, Copy, Ord, PartialOrd, Hash)]
 pub enum MuSig2DerivationMode {
@@ -726,7 +847,7 @@ pub fn unspendable_internal_key(
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub struct LianaPolicy {
     pub(super) primary_path: PrimaryPathInfo,
-    pub(super) recovery_paths: BTreeMap<u16, PathInfo>,
+    pub(super) recovery_paths: BTreeMap<u16, RecoveryPathInfo>,
     is_taproot: bool,
 }
 
@@ -737,7 +858,7 @@ impl LianaPolicy {
     /// to miniscript before returning.
     fn _new(
         primary_path: PrimaryPathInfo,
-        recovery_paths: BTreeMap<u16, PathInfo>,
+        recovery_paths: BTreeMap<u16, RecoveryPathInfo>,
         is_taproot: bool,
         compile: bool,
     ) -> Result<LianaPolicy, LianaPolicyError> {
@@ -761,27 +882,34 @@ impl LianaPolicy {
         // "descriptor key expression" level. We don't want duplicate xpubs at all so we do it
         // ourselves here.
         let mut key_checker = DescKeyChecker::new();
+        let mut musig_mode = None;
+
         for path in recovery_paths.values() {
             match path {
-                PathInfo::Single(ref key) => {
-                    let _ = key_checker.check(key)?;
-                }
-                PathInfo::Multi(_, ref keys) => {
-                    // Record the origins of the keys for this spending path. If any two keys share
-                    // the same origin, they are from the same signer. We restrict using a signer
-                    // more than once within a single spending path as it can lead to surprising
-                    // behaviour. For details see:
-                    // https://github.com/wizardsardine/liana/pull/706#issuecomment-1744705808
-                    let mut origin_fingerprints = HashSet::with_capacity(keys.len());
-                    for key in keys {
-                        let fg = key_checker.check(key)?;
-                        if origin_fingerprints.contains(&fg) {
-                            return Err(LianaPolicyError::DuplicateOriginSamePath(
-                                key.clone().into(),
-                            ));
-                        }
-                        origin_fingerprints.insert(fg);
+                RecoveryPathInfo::Script(path) => match path {
+                    PathInfo::Single(ref key) => {
+                        let _ = key_checker.check(key)?;
                     }
+                    PathInfo::Multi(_, ref keys) => {
+                        // Record the origins of the keys for this spending path. If any two keys share
+                        // the same origin, they are from the same signer. We restrict using a signer
+                        // more than once within a single spending path as it can lead to surprising
+                        // behaviour. For details see:
+                        // https://github.com/wizardsardine/liana/pull/706#issuecomment-1744705808
+                        let mut origin_fingerprints = HashSet::with_capacity(keys.len());
+                        for key in keys {
+                            let fg = key_checker.check(key)?;
+                            if origin_fingerprints.contains(&fg) {
+                                return Err(LianaPolicyError::DuplicateOriginSamePath(
+                                    key.clone().into(),
+                                ));
+                            }
+                            origin_fingerprints.insert(fg);
+                        }
+                    }
+                },
+                RecoveryPathInfo::MuSig2(expr) => {
+                    validate_musig_expr(expr, is_taproot, &mut musig_mode, &mut key_checker)?
                 }
             }
         }
@@ -804,30 +932,7 @@ impl LianaPolicy {
                 }
             },
             PrimaryPathInfo::MuSig2(expr) => {
-                if !is_taproot {
-                    return Err(LianaPolicyError::TaprootOnlyMuSig2);
-                }
-                if expr.derivation_mode() == MuSig2DerivationMode::AggregateThenDeriveBip328 {
-                    let aggregate_derivation = expr
-                        .aggregate_derivation()
-                        .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
-                    let valid_liana_receive_change = aggregate_derivation.wildcard()
-                        == descriptor::Wildcard::Unhardened
-                        && aggregate_derivation.derivation_paths().paths().len() == 2;
-                    if !valid_liana_receive_change {
-                        return Err(LianaPolicyError::InvalidMuSig2Expression);
-                    }
-                }
-                let mut origin_fingerprints = HashSet::with_capacity(expr.participants().len());
-                for key in expr.participants() {
-                    let fg = key_checker.check_musig_participant(key, expr.derivation_mode())?;
-                    if origin_fingerprints.contains(&fg) {
-                        return Err(LianaPolicyError::DuplicateOriginSamePath(
-                            key.clone().into(),
-                        ));
-                    }
-                    origin_fingerprints.insert(fg);
-                }
+                validate_musig_expr(expr, is_taproot, &mut musig_mode, &mut key_checker)?
             }
         }
 
@@ -838,10 +943,12 @@ impl LianaPolicy {
             is_taproot,
         };
         if compile {
-            if matches!(policy.primary_path, PrimaryPathInfo::MuSig2(_)) {
+            if policy.contains_musig2() {
+                let (shadow_primary_path, shadow_recovery_paths, _) =
+                    shadow_musig2_paths(&policy.primary_path, &policy.recovery_paths);
                 let shadow_policy = LianaPolicy {
-                    primary_path: PrimaryPathInfo::KeyPath(PathInfo::Single(dummy_shadow_key())),
-                    recovery_paths: policy.recovery_paths.clone(),
+                    primary_path: shadow_primary_path,
+                    recovery_paths: shadow_recovery_paths,
                     is_taproot: policy.is_taproot,
                 };
                 shadow_policy.compile_multipath_descriptor_fallible()?;
@@ -864,6 +971,19 @@ impl LianaPolicy {
         primary_path: PrimaryPathInfo,
         recovery_paths: BTreeMap<u16, PathInfo>,
     ) -> Result<LianaPolicy, LianaPolicyError> {
+        Self::new_with_all_path_info(
+            primary_path,
+            recovery_paths
+                .into_iter()
+                .map(|(timelock, path)| (timelock, RecoveryPathInfo::from(path)))
+                .collect(),
+        )
+    }
+
+    pub fn new_with_all_path_info(
+        primary_path: PrimaryPathInfo,
+        recovery_paths: BTreeMap<u16, RecoveryPathInfo>,
+    ) -> Result<LianaPolicy, LianaPolicyError> {
         Self::_new(
             primary_path,
             recovery_paths,
@@ -874,7 +994,7 @@ impl LianaPolicy {
 
     pub(crate) fn from_parts_uncompiled(
         primary_path: PrimaryPathInfo,
-        recovery_paths: BTreeMap<u16, PathInfo>,
+        recovery_paths: BTreeMap<u16, RecoveryPathInfo>,
         is_taproot: bool,
     ) -> Result<LianaPolicy, LianaPolicyError> {
         Self::_new(
@@ -896,6 +1016,19 @@ impl LianaPolicy {
     pub fn new_legacy_with_primary_info(
         primary_path: PrimaryPathInfo,
         recovery_paths: BTreeMap<u16, PathInfo>,
+    ) -> Result<LianaPolicy, LianaPolicyError> {
+        Self::new_legacy_with_all_path_info(
+            primary_path,
+            recovery_paths
+                .into_iter()
+                .map(|(timelock, path)| (timelock, RecoveryPathInfo::from(path)))
+                .collect(),
+        )
+    }
+
+    pub fn new_legacy_with_all_path_info(
+        primary_path: PrimaryPathInfo,
+        recovery_paths: BTreeMap<u16, RecoveryPathInfo>,
     ) -> Result<LianaPolicy, LianaPolicyError> {
         Self::_new(
             primary_path,
@@ -960,7 +1093,10 @@ impl LianaPolicy {
 
         // Fetch all spending paths' semantic policies. The primary path is identified as the only
         // one that isn't timelocked.
-        let (mut primary_path, mut recovery_paths) = (None::<PrimaryPathInfo>, BTreeMap::new());
+        let (mut primary_path, mut recovery_paths) = (
+            None::<PrimaryPathInfo>,
+            BTreeMap::<u16, RecoveryPathInfo>::new(),
+        );
         for sub in subs {
             // Rust-Miniscript now forces the policy in thresholds to be wrapped into an Arc. Since
             // we lift the policy from the descriptor right above, there is necessarily a single
@@ -991,7 +1127,7 @@ impl LianaPolicy {
                 if recovery_paths.contains_key(&timelock) {
                     return Err(LianaPolicyError::IncompatibleDesc);
                 }
-                recovery_paths.insert(timelock, path_info);
+                recovery_paths.insert(timelock, RecoveryPathInfo::from(path_info));
             }
         }
 
@@ -1015,7 +1151,7 @@ impl LianaPolicy {
 
     /// Timelocks and path info of the recovery paths. Note we guarantee this mapping is never
     /// empty, as there is always at least one recovery path.
-    pub fn recovery_paths(&self) -> &BTreeMap<u16, PathInfo> {
+    pub fn recovery_paths(&self) -> &BTreeMap<u16, RecoveryPathInfo> {
         assert!(!self.recovery_paths.is_empty());
         &self.recovery_paths
     }
@@ -1132,6 +1268,55 @@ impl LianaPolicy {
     ) -> descriptor::Descriptor<descriptor::DescriptorPublicKey> {
         self.compile_multipath_descriptor()
     }
+
+    fn contains_musig2(&self) -> bool {
+        self.primary_path.musig().is_some()
+            || self
+                .recovery_paths
+                .values()
+                .any(|path| path.musig().is_some())
+    }
+}
+
+pub(crate) fn shadow_musig2_paths(
+    primary_path: &PrimaryPathInfo,
+    recovery_paths: &BTreeMap<u16, RecoveryPathInfo>,
+) -> (
+    PrimaryPathInfo,
+    BTreeMap<u16, RecoveryPathInfo>,
+    Vec<MuSig2Placeholder>,
+) {
+    let mut placeholders = Vec::new();
+    let shadow_primary_path = match primary_path {
+        PrimaryPathInfo::KeyPath(path) => PrimaryPathInfo::KeyPath(path.clone()),
+        PrimaryPathInfo::MuSig2(expr) => {
+            let placeholder =
+                MuSig2Placeholder::new(indexed_dummy_shadow_key(placeholders.len()), expr.clone());
+            let shadow_key = placeholder.shadow_key().clone();
+            placeholders.push(placeholder);
+            PrimaryPathInfo::KeyPath(PathInfo::Single(shadow_key))
+        }
+    };
+    let shadow_recovery_paths = recovery_paths
+        .iter()
+        .map(|(timelock, path)| {
+            let shadow_path = match path {
+                RecoveryPathInfo::Script(path) => RecoveryPathInfo::Script(path.clone()),
+                RecoveryPathInfo::MuSig2(expr) => {
+                    let placeholder = MuSig2Placeholder::new(
+                        indexed_dummy_shadow_key(placeholders.len()),
+                        expr.clone(),
+                    );
+                    let shadow_key = placeholder.shadow_key().clone();
+                    placeholders.push(placeholder);
+                    RecoveryPathInfo::Script(PathInfo::Single(shadow_key))
+                }
+            };
+            (*timelock, shadow_path)
+        })
+        .collect();
+
+    (shadow_primary_path, shadow_recovery_paths, placeholders)
 }
 
 /// Partial spend information for a specific spending path within a descriptor.
@@ -1174,15 +1359,15 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
-    fn recovery_paths() -> BTreeMap<u16, PathInfo> {
+    fn recovery_paths() -> BTreeMap<u16, RecoveryPathInfo> {
         BTreeMap::from([(
             42,
-            PathInfo::Single(
+            RecoveryPathInfo::Script(PathInfo::Single(
                 descriptor::DescriptorPublicKey::from_str(
                     "[1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/<0;1>/*",
                 )
                 .unwrap(),
-            ),
+            )),
         )])
     }
 
@@ -1307,6 +1492,54 @@ mod tests {
         assert!(matches!(
             LianaPolicy::_new(PrimaryPathInfo::MuSig2(expr), recovery_paths(), true, false),
             Err(LianaPolicyError::InvalidMuSig2Expression)
+        ));
+    }
+
+    #[test]
+    fn valid_musig_recovery_path() {
+        let expr = MuSig2KeyExpr::from_str(
+            "musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<2;3>/*,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/<2;3>/*)"
+        )
+        .unwrap();
+        let recovery_paths = BTreeMap::from([(42, RecoveryPathInfo::MuSig2(expr.clone()))]);
+        let policy = LianaPolicy::_new(
+            PrimaryPathInfo::from_key_path(PathInfo::Single(
+                descriptor::DescriptorPublicKey::from_str(
+                    "[1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/<0;1>/*",
+                )
+                .unwrap(),
+            )),
+            recovery_paths,
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.recovery_paths().get(&42).unwrap().musig(),
+            Some(&expr)
+        );
+    }
+
+    #[test]
+    fn reject_mixed_musig_derivation_modes_across_paths() {
+        let primary_expr = MuSig2KeyExpr::from_str(
+            "musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<0;1>/*,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/<0;1>/*)"
+        )
+        .unwrap();
+        let recovery_expr = MuSig2KeyExpr::from_str(
+            "musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM)/<2;3>/*"
+        )
+        .unwrap();
+
+        assert!(matches!(
+            LianaPolicy::_new(
+                PrimaryPathInfo::MuSig2(primary_expr),
+                BTreeMap::from([(42, RecoveryPathInfo::MuSig2(recovery_expr))]),
+                true,
+                false,
+            ),
+            Err(LianaPolicyError::MixedMuSig2DerivationModes)
         ));
     }
 }

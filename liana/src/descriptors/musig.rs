@@ -1,10 +1,12 @@
-use std::{fmt, str::FromStr};
+use std::{convert::TryFrom, fmt, str::FromStr};
 
 use miniscript::{
     bitcoin::{
         self, bip32,
+        hashes::Hash,
         psbt::{raw, Input as PsbtIn, Output as PsbtOut},
         secp256k1,
+        taproot::TapLeafHash,
     },
     descriptor::{
         self, checksum::desc_checksum, DefiniteDescriptorKey, Descriptor, DescriptorPublicKey,
@@ -173,34 +175,87 @@ pub fn dummy_shadow_key() -> DescriptorPublicKey {
         .expect("valid dummy shadow key")
 }
 
+pub fn indexed_dummy_shadow_key(index: usize) -> DescriptorPublicKey {
+    let first = index
+        .checked_mul(2)
+        .and_then(|n| u32::try_from(n).ok())
+        .expect("shadow key index must fit in u32");
+    let second = first
+        .checked_add(1)
+        .expect("shadow key branch index must fit in u32");
+    DescriptorPublicKey::from_str(&format!("{DUMMY_XPUB}/<{first};{second}>/*"))
+        .expect("valid indexed dummy shadow key")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuSig2Placeholder {
+    shadow_key: DescriptorPublicKey,
+    expr: MuSig2KeyExpr,
+}
+
+impl MuSig2Placeholder {
+    pub fn new(shadow_key: DescriptorPublicKey, expr: MuSig2KeyExpr) -> Self {
+        Self { shadow_key, expr }
+    }
+
+    pub fn shadow_key(&self) -> &DescriptorPublicKey {
+        &self.shadow_key
+    }
+
+    pub fn expr(&self) -> &MuSig2KeyExpr {
+        &self.expr
+    }
+
+    pub fn branch(&self, path_index: usize) -> Result<Self, LianaPolicyError> {
+        let shadow_key = self
+            .shadow_key
+            .clone()
+            .into_single_keys()
+            .into_iter()
+            .nth(path_index)
+            .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+        let expr = branch_expr(&self.expr, path_index)?;
+        Ok(Self { shadow_key, expr })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MuSig2PlaceholderScope {
+    KeySpend,
+    ScriptSpend(TapLeafHash),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MuSig2TaprootDescriptor {
-    expr: MuSig2KeyExpr,
+    placeholders: Vec<MuSig2Placeholder>,
     shadow_desc: Descriptor<DescriptorPublicKey>,
 }
 
 impl MuSig2TaprootDescriptor {
     pub fn from_str(descriptor: &str) -> Result<Self, LianaPolicyError> {
         let body = descriptor_body(descriptor)?;
-        let (primary_expr, tap_tree) = split_tr_descriptor(body)?;
-        let expr = MuSig2KeyExpr::from_str(primary_expr)?;
-        let shadow_desc = Descriptor::<DescriptorPublicKey>::from_str(&with_checksum(
-            &render_tr_descriptor(&format!("{DUMMY_XPUB}{DUMMY_SHADOW_SUFFIX}"), tap_tree),
-        ))
-        .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?;
+        let (shadow_body, placeholders) = shadow_descriptor_body_with_musig_placeholders(body)?;
+        let shadow_desc = Descriptor::<DescriptorPublicKey>::from_str(&with_checksum(&shadow_body))
+            .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?;
 
-        Ok(Self { expr, shadow_desc })
+        Ok(Self {
+            placeholders,
+            shadow_desc,
+        })
     }
 
     pub fn from_shadow_descriptor(
         shadow_desc: Descriptor<DescriptorPublicKey>,
-        expr: MuSig2KeyExpr,
+        placeholders: Vec<MuSig2Placeholder>,
     ) -> Self {
-        Self { expr, shadow_desc }
+        Self {
+            placeholders,
+            shadow_desc,
+        }
     }
 
-    pub fn expr(&self) -> &MuSig2KeyExpr {
-        &self.expr
+    pub fn placeholders(&self) -> &[MuSig2Placeholder] {
+        &self.placeholders
     }
 
     pub fn shadow_desc(&self) -> &Descriptor<DescriptorPublicKey> {
@@ -219,40 +274,51 @@ impl MuSig2TaprootDescriptor {
             .into_iter()
             .nth(path_index)
             .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
-        let expr = branch_expr(&self.expr, path_index)?;
-        Ok(MuSig2SinglePathDescriptor { expr, shadow_desc })
+        let placeholders = self
+            .placeholders
+            .iter()
+            .map(|placeholder| placeholder.branch(path_index))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(MuSig2SinglePathDescriptor {
+            placeholders,
+            shadow_desc,
+        })
     }
 }
 
 impl fmt::Display for MuSig2TaprootDescriptor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let shadow_string = self.shadow_desc.to_string();
-        let body = descriptor_body(&shadow_string).map_err(|_| fmt::Error)?;
-        let (_, tap_tree) = split_tr_descriptor(body).map_err(|_| fmt::Error)?;
-        f.write_str(&with_checksum(&render_tr_descriptor(
-            &self.expr.to_string(),
-            tap_tree,
-        )))
+        let rendered =
+            render_descriptor_with_musig_placeholders(&self.shadow_desc, &self.placeholders)
+                .map_err(|_| fmt::Error)?;
+        f.write_str(&rendered)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MuSig2SinglePathDescriptor {
-    expr: MuSig2KeyExpr,
+    placeholders: Vec<MuSig2Placeholder>,
     shadow_desc: Descriptor<DescriptorPublicKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MuSig2DerivedDescriptor {
     desc: Descriptor<DefiniteDescriptorKey>,
-    aggregate_pubkey: secp256k1::PublicKey,
+    paths: Vec<MuSig2DerivedPath>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MuSig2DerivedPath {
+    participant_set_pubkey: secp256k1::PublicKey,
+    output_pubkey: secp256k1::PublicKey,
     participant_origins: Vec<(secp256k1::PublicKey, bip32::KeySource)>,
     output_key_origin: Option<bip32::KeySource>,
+    scopes: Vec<MuSig2PlaceholderScope>,
 }
 
 impl MuSig2SinglePathDescriptor {
-    pub fn expr(&self) -> &MuSig2KeyExpr {
-        &self.expr
+    pub fn placeholders(&self) -> &[MuSig2Placeholder] {
+        &self.placeholders
     }
 
     pub fn shadow_desc(&self) -> &Descriptor<DescriptorPublicKey> {
@@ -269,13 +335,20 @@ impl MuSig2SinglePathDescriptor {
             .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?;
         let shadow_string = shadow_desc.to_string();
         let body = descriptor_body(&shadow_string)?;
-        let (_, tap_tree) = split_tr_descriptor(body)?;
-        let aggregate_pubkey = derive_aggregate_pubkey(&self.expr, 0, child_index)?;
-        Descriptor::<DefiniteDescriptorKey>::from_str(&with_checksum(&render_tr_descriptor(
-            &aggregate_pubkey.to_string(),
-            tap_tree,
-        )))
-        .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)
+        let mut rendered_body = body.to_owned();
+        for placeholder in &self.placeholders {
+            let definite_placeholder = placeholder
+                .shadow_key()
+                .clone()
+                .at_derivation_index(child_index)
+                .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?;
+            rendered_body = rendered_body.replace(
+                &definite_placeholder.to_string(),
+                &derive_aggregate_pubkey(placeholder.expr(), 0, child_index)?.to_string(),
+            );
+        }
+        Descriptor::<DefiniteDescriptorKey>::from_str(&with_checksum(&rendered_body))
+            .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)
     }
 
     pub fn derive_psbt_descriptor(
@@ -283,86 +356,67 @@ impl MuSig2SinglePathDescriptor {
         child_index: u32,
     ) -> Result<MuSig2DerivedDescriptor, LianaPolicyError> {
         let desc = self.derive_descriptor(child_index)?;
-        let participant_origins = match self.expr.derivation_mode() {
-            MuSig2DerivationMode::DeriveThenAggregate => self
-                .expr
-                .participants()
-                .iter()
-                .cloned()
-                .map(|participant| derive_participant_origin(participant, 0, child_index))
-                .collect::<Result<Vec<_>, _>>()?,
-            MuSig2DerivationMode::AggregateThenDeriveBip328 => self
-                .expr
-                .participants()
-                .iter()
-                .cloned()
-                .map(|participant| derive_participant_origin(participant, 0, 0))
-                .collect::<Result<Vec<_>, _>>()?,
-        };
-        let aggregate_pubkey = match self.expr.derivation_mode() {
-            MuSig2DerivationMode::DeriveThenAggregate => {
-                derive_aggregate_pubkey(&self.expr, 0, child_index)?
-            }
-            MuSig2DerivationMode::AggregateThenDeriveBip328 => aggregate_sorted_pubkey(
-                participant_origins
-                    .iter()
-                    .map(|(participant, _)| *participant)
-                    .collect::<Vec<_>>()
-                    .into_iter(),
-            )
-            .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?,
-        };
-        let output_key_origin = match self.expr.derivation_mode() {
-            MuSig2DerivationMode::DeriveThenAggregate => None,
-            MuSig2DerivationMode::AggregateThenDeriveBip328 => {
-                let network = participant_network(
-                    self.expr
+        let mut desc_psbt_in = PsbtIn::default();
+        desc_psbt_in
+            .update_with_descriptor_unchecked(&desc)
+            .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?;
+        let paths = self
+            .placeholders
+            .iter()
+            .map(|placeholder| {
+                let participant_origins = match placeholder.expr().derivation_mode() {
+                    MuSig2DerivationMode::DeriveThenAggregate => placeholder
+                        .expr()
                         .participants()
-                        .first()
-                        .ok_or(LianaPolicyError::InvalidMuSig2ParticipantCount(0))?,
-                )
-                .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
-                let synthetic_xpub = bip328_synthetic_xpub(aggregate_pubkey, network);
-                let aggregate_derivation = self
-                    .expr
-                    .aggregate_derivation()
-                    .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
-                let branch_path = aggregate_derivation
-                    .derivation_paths()
-                    .paths()
-                    .first()
-                    .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
-                let derivation_path =
-                    if aggregate_derivation.wildcard() == descriptor::Wildcard::None {
-                        branch_path.clone()
-                    } else {
-                        branch_path.clone().into_child(
-                            bip32::ChildNumber::from_normal_idx(child_index)
-                                .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?,
-                        )
-                    };
-                Some((synthetic_xpub.fingerprint(), derivation_path))
-            }
-        };
+                        .iter()
+                        .cloned()
+                        .map(|participant| derive_participant_origin(participant, 0, child_index))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    MuSig2DerivationMode::AggregateThenDeriveBip328 => placeholder
+                        .expr()
+                        .participants()
+                        .iter()
+                        .cloned()
+                        .map(|participant| derive_participant_origin(participant, 0, 0))
+                        .collect::<Result<Vec<_>, _>>()?,
+                };
+                let participant_set_pubkey = match placeholder.expr().derivation_mode() {
+                    MuSig2DerivationMode::DeriveThenAggregate => {
+                        derive_aggregate_pubkey(placeholder.expr(), 0, child_index)?
+                    }
+                    MuSig2DerivationMode::AggregateThenDeriveBip328 => aggregate_sorted_pubkey(
+                        participant_origins
+                            .iter()
+                            .map(|(participant, _)| *participant)
+                            .collect::<Vec<_>>()
+                            .into_iter(),
+                    )
+                    .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?,
+                };
+                let output_pubkey = derive_aggregate_pubkey(placeholder.expr(), 0, child_index)?;
+                let output_key_origin =
+                    output_key_origin(placeholder.expr(), participant_set_pubkey, child_index)?;
+                let scopes = derived_placeholder_scopes(&desc_psbt_in, output_pubkey)?;
+                Ok(MuSig2DerivedPath {
+                    participant_set_pubkey,
+                    output_pubkey,
+                    participant_origins,
+                    output_key_origin,
+                    scopes,
+                })
+            })
+            .collect::<Result<Vec<_>, LianaPolicyError>>()?;
 
-        Ok(MuSig2DerivedDescriptor {
-            desc,
-            aggregate_pubkey,
-            participant_origins,
-            output_key_origin,
-        })
+        Ok(MuSig2DerivedDescriptor { desc, paths })
     }
 }
 
 impl fmt::Display for MuSig2SinglePathDescriptor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let shadow_string = self.shadow_desc.to_string();
-        let body = descriptor_body(&shadow_string).map_err(|_| fmt::Error)?;
-        let (_, tap_tree) = split_tr_descriptor(body).map_err(|_| fmt::Error)?;
-        f.write_str(&with_checksum(&render_tr_descriptor(
-            &self.expr.to_string(),
-            tap_tree,
-        )))
+        let rendered =
+            render_descriptor_with_musig_placeholders(&self.shadow_desc, &self.placeholders)
+                .map_err(|_| fmt::Error)?;
+        f.write_str(&rendered)
     }
 }
 
@@ -389,34 +443,59 @@ impl MuSig2DerivedDescriptor {
                 self.desc
             );
         }
-        if let (Some(key_origin), Some(tap_internal_key)) =
-            (&self.output_key_origin, psbt_in.tap_internal_key)
-        {
-            let leaf_hashes = psbt_in
-                .tap_key_origins
-                .get(&tap_internal_key)
-                .map(|(leaf_hashes, _)| leaf_hashes.clone())
-                .unwrap_or_default();
-            psbt_in
-                .tap_key_origins
-                .insert(tap_internal_key, (leaf_hashes, key_origin.clone()));
-        }
-        for (participant, origin) in &self.participant_origins {
-            psbt_in
-                .tap_key_origins
-                .entry(participant.x_only_public_key().0)
-                .or_insert((vec![], origin.clone()));
-        }
-        psbt_in.unknown.insert(
-            raw::Key {
-                type_value: PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
-                key: self.aggregate_pubkey.serialize().to_vec(),
-            },
-            self.participant_origins
+        for path in &self.paths {
+            if let Some(key_origin) = &path.output_key_origin {
+                for scope in &path.scopes {
+                    match scope {
+                        MuSig2PlaceholderScope::KeySpend => {
+                            if let Some(tap_internal_key) = psbt_in.tap_internal_key {
+                                let leaf_hashes = psbt_in
+                                    .tap_key_origins
+                                    .get(&tap_internal_key)
+                                    .map(|(leaf_hashes, _)| leaf_hashes.clone())
+                                    .unwrap_or_default();
+                                psbt_in
+                                    .tap_key_origins
+                                    .insert(tap_internal_key, (leaf_hashes, key_origin.clone()));
+                            }
+                        }
+                        MuSig2PlaceholderScope::ScriptSpend(leaf_hash) => {
+                            let aggregate_key = path.output_pubkey.x_only_public_key().0;
+                            if let Some((leaf_hashes, _)) =
+                                psbt_in.tap_key_origins.get(&aggregate_key).cloned()
+                            {
+                                if leaf_hashes.contains(leaf_hash) {
+                                    psbt_in
+                                        .tap_key_origins
+                                        .insert(aggregate_key, (leaf_hashes, key_origin.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (participant, origin) in &path.participant_origins {
+                psbt_in
+                    .tap_key_origins
+                    .entry(participant.x_only_public_key().0)
+                    .or_insert((vec![], origin.clone()));
+            }
+            let participant_bytes: Vec<u8> = path
+                .participant_origins
                 .iter()
                 .flat_map(|(participant, _)| participant.serialize())
-                .collect(),
-        );
+                .collect();
+            for scope in &path.scopes {
+                psbt_in.unknown.insert(
+                    musig2_participant_set_key(
+                        PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
+                        path.participant_set_pubkey,
+                        Some(*scope),
+                    ),
+                    participant_bytes.clone(),
+                );
+            }
+        }
     }
 
     pub fn update_change_psbt_out(&self, psbt_out: &mut PsbtOut) {
@@ -427,35 +506,206 @@ impl MuSig2DerivedDescriptor {
                 self.desc
             );
         }
-        if let (Some(key_origin), Some(tap_internal_key)) =
-            (&self.output_key_origin, psbt_out.tap_internal_key)
-        {
-            let leaf_hashes = psbt_out
-                .tap_key_origins
-                .get(&tap_internal_key)
-                .map(|(leaf_hashes, _)| leaf_hashes.clone())
-                .unwrap_or_default();
-            psbt_out
-                .tap_key_origins
-                .insert(tap_internal_key, (leaf_hashes, key_origin.clone()));
-        }
-        for (participant, origin) in &self.participant_origins {
-            psbt_out
-                .tap_key_origins
-                .entry(participant.x_only_public_key().0)
-                .or_insert((vec![], origin.clone()));
-        }
-        psbt_out.unknown.insert(
-            raw::Key {
-                type_value: PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS,
-                key: self.aggregate_pubkey.serialize().to_vec(),
-            },
-            self.participant_origins
+        for path in &self.paths {
+            if let Some(key_origin) = &path.output_key_origin {
+                for scope in &path.scopes {
+                    match scope {
+                        MuSig2PlaceholderScope::KeySpend => {
+                            if let Some(tap_internal_key) = psbt_out.tap_internal_key {
+                                let leaf_hashes = psbt_out
+                                    .tap_key_origins
+                                    .get(&tap_internal_key)
+                                    .map(|(leaf_hashes, _)| leaf_hashes.clone())
+                                    .unwrap_or_default();
+                                psbt_out
+                                    .tap_key_origins
+                                    .insert(tap_internal_key, (leaf_hashes, key_origin.clone()));
+                            }
+                        }
+                        MuSig2PlaceholderScope::ScriptSpend(leaf_hash) => {
+                            let aggregate_key = path.output_pubkey.x_only_public_key().0;
+                            if let Some((leaf_hashes, _)) =
+                                psbt_out.tap_key_origins.get(&aggregate_key).cloned()
+                            {
+                                if leaf_hashes.contains(leaf_hash) {
+                                    psbt_out
+                                        .tap_key_origins
+                                        .insert(aggregate_key, (leaf_hashes, key_origin.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (participant, origin) in &path.participant_origins {
+                psbt_out
+                    .tap_key_origins
+                    .entry(participant.x_only_public_key().0)
+                    .or_insert((vec![], origin.clone()));
+            }
+            let participant_bytes: Vec<u8> = path
+                .participant_origins
                 .iter()
                 .flat_map(|(participant, _)| participant.serialize())
-                .collect(),
+                .collect();
+            for scope in &path.scopes {
+                psbt_out.unknown.insert(
+                    musig2_participant_set_key(
+                        PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS,
+                        path.participant_set_pubkey,
+                        Some(*scope),
+                    ),
+                    participant_bytes.clone(),
+                );
+            }
+        }
+    }
+}
+
+fn render_descriptor_with_musig_placeholders(
+    shadow_desc: &Descriptor<DescriptorPublicKey>,
+    placeholders: &[MuSig2Placeholder],
+) -> Result<String, LianaPolicyError> {
+    let shadow_string = shadow_desc.to_string();
+    let body = descriptor_body(&shadow_string)?;
+    let rendered_body = replace_shadow_keys(body, placeholders, |placeholder| {
+        Ok(placeholder.expr().to_string())
+    })?;
+    Ok(with_checksum(&rendered_body))
+}
+
+fn shadow_descriptor_body_with_musig_placeholders(
+    descriptor_body: &str,
+) -> Result<(String, Vec<MuSig2Placeholder>), LianaPolicyError> {
+    replace_musig_expressions(descriptor_body)
+}
+
+fn replace_musig_expressions(
+    descriptor_body: &str,
+) -> Result<(String, Vec<MuSig2Placeholder>), LianaPolicyError> {
+    let mut rendered = String::with_capacity(descriptor_body.len());
+    let mut placeholders = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative_start) = descriptor_body[cursor..].find("musig(") {
+        let start = cursor + relative_start;
+        rendered.push_str(&descriptor_body[cursor..start]);
+        let end = musig_expression_end(descriptor_body, start)?;
+        let expr = MuSig2KeyExpr::from_str(&descriptor_body[start..end])?;
+        let placeholder =
+            MuSig2Placeholder::new(indexed_dummy_shadow_key(placeholders.len()), expr);
+        rendered.push_str(&placeholder.shadow_key().to_string());
+        placeholders.push(placeholder);
+        cursor = end;
+    }
+    rendered.push_str(&descriptor_body[cursor..]);
+    Ok((rendered, placeholders))
+}
+
+fn replace_shadow_keys<F>(
+    descriptor_body: &str,
+    placeholders: &[MuSig2Placeholder],
+    mut replacement: F,
+) -> Result<String, LianaPolicyError>
+where
+    F: FnMut(&MuSig2Placeholder) -> Result<String, LianaPolicyError>,
+{
+    let mut rendered = descriptor_body.to_owned();
+    for placeholder in placeholders {
+        rendered = rendered.replace(
+            &placeholder.shadow_key().to_string(),
+            &replacement(placeholder)?,
         );
     }
+    Ok(rendered)
+}
+
+fn musig_expression_end(descriptor: &str, start: usize) -> Result<usize, LianaPolicyError> {
+    let tail = &descriptor[start..];
+    let inner = tail
+        .strip_prefix("musig(")
+        .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+    let closing = inner
+        .find(')')
+        .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+    let mut end = start + "musig(".len() + closing + 1;
+    while let Some(ch) = descriptor[end..].chars().next() {
+        if matches!(ch, ',' | ')' | '}') {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    Ok(end)
+}
+
+fn derived_placeholder_scopes(
+    psbt_in: &PsbtIn,
+    aggregate_pubkey: secp256k1::PublicKey,
+) -> Result<Vec<MuSig2PlaceholderScope>, LianaPolicyError> {
+    let xonly = aggregate_pubkey.x_only_public_key().0;
+    let mut scopes = Vec::new();
+    if psbt_in.tap_internal_key == Some(xonly) {
+        scopes.push(MuSig2PlaceholderScope::KeySpend);
+    }
+    if let Some((leaf_hashes, _)) = psbt_in.tap_key_origins.get(&xonly) {
+        scopes.extend(
+            leaf_hashes
+                .iter()
+                .copied()
+                .map(MuSig2PlaceholderScope::ScriptSpend),
+        );
+    }
+    if scopes.is_empty() {
+        return Err(LianaPolicyError::InvalidMuSig2Expression);
+    }
+    Ok(scopes)
+}
+
+fn output_key_origin(
+    expr: &MuSig2KeyExpr,
+    aggregate_pubkey: secp256k1::PublicKey,
+    child_index: u32,
+) -> Result<Option<bip32::KeySource>, LianaPolicyError> {
+    match expr.derivation_mode() {
+        MuSig2DerivationMode::DeriveThenAggregate => Ok(None),
+        MuSig2DerivationMode::AggregateThenDeriveBip328 => {
+            let network = participant_network(
+                expr.participants()
+                    .first()
+                    .ok_or(LianaPolicyError::InvalidMuSig2ParticipantCount(0))?,
+            )
+            .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+            let synthetic_xpub = bip328_synthetic_xpub(aggregate_pubkey, network);
+            let aggregate_derivation = expr
+                .aggregate_derivation()
+                .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+            let branch_path = aggregate_derivation
+                .derivation_paths()
+                .paths()
+                .first()
+                .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+            let derivation_path = if aggregate_derivation.wildcard() == descriptor::Wildcard::None {
+                branch_path.clone()
+            } else {
+                branch_path.clone().into_child(
+                    bip32::ChildNumber::from_normal_idx(child_index)
+                        .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?,
+                )
+            };
+            Ok(Some((synthetic_xpub.fingerprint(), derivation_path)))
+        }
+    }
+}
+
+fn musig2_participant_set_key(
+    type_value: u8,
+    aggregate_pubkey: secp256k1::PublicKey,
+    scope: Option<MuSig2PlaceholderScope>,
+) -> raw::Key {
+    let mut key = aggregate_pubkey.serialize().to_vec();
+    if let Some(MuSig2PlaceholderScope::ScriptSpend(leaf_hash)) = scope {
+        key.extend_from_slice(&leaf_hash.to_byte_array());
+    }
+    raw::Key { type_value, key }
 }
 
 pub fn aggregate_plain_pubkey<I>(
@@ -649,43 +899,6 @@ fn descriptor_body(descriptor: &str) -> Result<&str, LianaPolicyError> {
         }
     } else {
         Ok(descriptor)
-    }
-}
-
-fn split_tr_descriptor(descriptor: &str) -> Result<(&str, Option<&str>), LianaPolicyError> {
-    let inner = descriptor
-        .strip_prefix("tr(")
-        .and_then(|s| s.strip_suffix(')'))
-        .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
-    let mut paren_depth = 0usize;
-    let mut brace_depth = 0usize;
-    let mut split_at = None;
-    for (idx, ch) in inner.char_indices() {
-        match ch {
-            '(' => paren_depth += 1,
-            ')' => paren_depth = paren_depth.saturating_sub(1),
-            '{' => brace_depth += 1,
-            '}' => brace_depth = brace_depth.saturating_sub(1),
-            ',' if paren_depth == 0 && brace_depth == 0 => {
-                split_at = Some(idx);
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(split_at) = split_at {
-        Ok((&inner[..split_at], Some(&inner[split_at + 1..])))
-    } else {
-        Ok((inner, None))
-    }
-}
-
-fn render_tr_descriptor(primary_expr: &str, tap_tree: Option<&str>) -> String {
-    if let Some(tap_tree) = tap_tree {
-        format!("tr({primary_expr},{tap_tree})")
-    } else {
-        format!("tr({primary_expr})")
     }
 }
 
