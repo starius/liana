@@ -97,7 +97,8 @@ If using the compact-filters backend, Liana will connect directly to Bitcoin pee
 / BIP158 filters for transactions matching the wallet descriptor. This backend does not require
 `bitcoind` or Electrum, but it currently has a few first-version limitations:
 
-- rescans replay the compact-filter history instead of starting from an exact timestamp cutoff
+- rescans start from the last stored block before the requested timestamp, so the cutoff remains
+  block-time-based rather than exact-descriptor-import semantics
 - mempool visibility is limited compared to `bitcoind`
 - unconfirmed incoming transactions are only tracked once they have been learned through the
   wallet's own view of the network

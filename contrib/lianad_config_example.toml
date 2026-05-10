@@ -64,8 +64,8 @@ poll_interval_secs = 30
 # `required_peers` defaults to 1 and is clamped by the backend to a
 # reasonable range.
 # `proxy_addr` is optional and can be used with a local Tor daemon.
-# Note that rescans currently replay compact-filter history rather than
-# starting from a precise timestamp cutoff.
+# Note that rescans start from the last stored block before the requested
+# timestamp, so the cutoff remains block-time-based rather than exact.
 # [bip157_config]
 # peers = ["seed.bitcoin.sipa.be:18333", "127.0.0.1:18333"]
 # required_peers = 2
