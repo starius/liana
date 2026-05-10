@@ -99,7 +99,8 @@ class Bitcoind(BitcoinBackend):
         )
 
     def descriptor_with_checksum(self, descriptor):
-        return self.node_rpc.getdescriptorinfo(descriptor)["descriptor"]
+        checksum = self.node_rpc.getdescriptorinfo(descriptor)["checksum"]
+        return f"{descriptor}#{checksum}"
 
     def create_wallet(
         self,
