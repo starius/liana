@@ -192,9 +192,33 @@ This reduces moving parts while the backend semantics are still settling.
 ## Milestone 6: Production Hardening
 
 - persistence tuning
+- persist per-block `filter_hash` and `filter_header` alongside wallet-era canonical headers
 - peer configuration UX
 - tests against signet/regtest if feasible
 - GUI support
+- optional Liana-only peer bootstrap cache, if upstream Kyoto peer persistence is still unavailable
+
+## Suggested Commit Split
+
+The core backend work and any local workaround for peer persistence should not be mixed.
+
+A practical split is:
+
+- core backend commits
+  - shared light-wallet extraction
+  - BIP157 backend integration
+  - GUI/config support
+  - docs and usage notes
+- optional workaround commit
+  - a Liana-only peer bootstrap cache that remembers recently successful peers and feeds them back to Kyoto on startup
+
+The peer bootstrap cache should be kept in its own commit on purpose.
+
+Reason:
+
+- it is a pragmatic local workaround, not a clean upstream solution
+- maintainers may prefer to wait for a Kyoto-side persistence fix instead
+- keeping it isolated makes it trivial to drop with `git rebase --drop` or to carry only in downstream branches
 
 ## Limitations And Known Tradeoffs
 
@@ -211,6 +235,18 @@ Adding BIP157 in the same style will increase technical debt unless a later clea
 The simplest implementation is a forced full scan, not a precise timestamp-targeted backend rescan.
 
 That is acceptable for an MVP, but it should be documented as such.
+
+Follow-up persistence work should improve this by:
+
+- storing wallet-era canonical block headers
+- storing per-block `filter_hash`
+- storing per-block `filter_header`
+
+This allows later work to:
+
+- map wallet birth timestamp to a practical birth height
+- resume the authenticated compact-filter-header chain from local state
+- re-download full compact filters on demand and validate them against stored commitments
 
 ## 3. Mempool And Fee-Inspection Parity May Lag
 
@@ -236,6 +272,19 @@ Any Kyoto integration must be checked carefully for compatibility with the versi
 
 Until the backend works from daemon config alone, GUI support should be considered out of scope.
 
+## 7. Peer Persistence Workaround Should Be Treated As Optional
+
+A Liana-only workaround can improve startup by caching recently successful peers and re-injecting them into Kyoto on the next launch.
+
+This is useful, but it is not equivalent to persisting Kyoto's full peer database:
+
+- no persisted tried/new bucket state
+- no persisted peer-quality history
+- no persisted ban state
+- no persisted gossip address set
+
+So this should be treated as a removable convenience layer, not part of the backend's core correctness story.
+
 ## Non-Goals For The First Pass
 
 - migrating Liana to `bdk_wallet`
@@ -252,5 +301,13 @@ The most straightforward path is:
 - add a new `Bip157` backend variant
 - implement a Kyoto-backed adapter that behaves like Electrum from the poller's perspective
 - accept a few documented MVP limitations, especially around rescan and mempool parity
+
+The first persistence upgrade after MVP should be:
+
+- persist wallet-era canonical block headers
+- persist per-block `filter_hash`
+- persist per-block `filter_header`
+
+while continuing to avoid persisting full compact-filter bodies.
 
 This keeps the change aligned with Liana's current design and minimizes the amount of unrelated architecture work that must happen before a first working backend exists.
