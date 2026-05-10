@@ -92,11 +92,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Build lianad and taproot_signer
+      - name: Build lianad and Taproot helper signers
         run: |
           cd lianad
           cargo build --release
           cd ../tests/tools/taproot_signer
+          cargo build --release
+          cd ../musig2_signer
           cargo build --release
 
       - name: Prepare and run functional tests

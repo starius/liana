@@ -76,18 +76,25 @@ def sign_psbt_taproot(psbt, hds):
     """
     assert isinstance(psbt, PSBT)
 
-    # This file is under tests/test_framework/ and we want tests/tools/taproot_signer/target/release/taproot_signer.
+    return sign_psbt_with_tool("taproot_signer", psbt, hds)
+
+
+def sign_psbt_musig2(psbt, hds):
+    return sign_psbt_with_tool("musig2_signer", psbt, hds)
+
+
+def sign_psbt_with_tool(tool_name, psbt, hds):
     bin_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "tools",
-        "taproot_signer",
+        tool_name,
         "target",
         "release",
-        "taproot_signer",
+        tool_name,
     )
     if not os.path.exists(bin_path):
         raise Exception(
-            "Please compile the Taproot signer under tests/tools using 'cargo bin --release'."
+            f"Please compile the {tool_name} helper under tests/tools using 'cargo build --release'."
         )
 
     psbt_str = psbt.to_base64()

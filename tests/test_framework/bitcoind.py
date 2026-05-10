@@ -93,6 +93,64 @@ class Bitcoind(BitcoinBackend):
         )
         self.node_rpc = BitcoindRpcInterface(bitcoin_dir, "regtest", rpcport)
 
+    def wallet_rpc(self, wallet_name):
+        return BitcoindRpcInterface(
+            self.bitcoin_dir, "regtest", self.rpcport, wallet=wallet_name
+        )
+
+    def descriptor_with_checksum(self, descriptor):
+        return self.node_rpc.getdescriptorinfo(descriptor)["descriptor"]
+
+    def create_wallet(
+        self,
+        wallet_name,
+        disable_private_keys=False,
+        blank=True,
+        descriptors=True,
+    ):
+        self.node_rpc.createwallet(
+            wallet_name, disable_private_keys, blank, "", False, descriptors, True
+        )
+        return self.wallet_rpc(wallet_name)
+
+    def create_descriptor_wallet(
+        self,
+        wallet_name,
+        receive_descriptor,
+        change_descriptor,
+        disable_private_keys=False,
+        next_index=0,
+        range_end=1000,
+    ):
+        wallet = self.create_wallet(
+            wallet_name,
+            disable_private_keys=disable_private_keys,
+            blank=True,
+            descriptors=True,
+        )
+        res = wallet.importdescriptors(
+            [
+                {
+                    "desc": receive_descriptor,
+                    "timestamp": "now",
+                    "active": True,
+                    "internal": False,
+                    "range": [0, range_end],
+                    "next_index": next_index,
+                },
+                {
+                    "desc": change_descriptor,
+                    "timestamp": "now",
+                    "active": True,
+                    "internal": True,
+                    "range": [0, range_end],
+                    "next_index": next_index,
+                },
+            ]
+        )
+        assert all(entry["success"] for entry in res), res
+        return wallet
+
     def start(self):
         TailableProc.start(self)
         self.wait_for_log("Done loading", timeout=TIMEOUT)

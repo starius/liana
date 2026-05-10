@@ -130,6 +130,33 @@ def sign_and_broadcast_psbt(lianad, psbt):
     return txid
 
 
+def update_and_broadcast_spend(lianad, psbt):
+    """Store a PSBT in lianad, finalize it, and broadcast it."""
+    txid = psbt.tx.txid().hex()
+    lianad.rpc.updatespend(psbt.to_base64())
+    lianad.rpc.broadcastspend(txid)
+    return txid
+
+
+def wallet_process_psbt(wallet_rpc, psbt):
+    """Let a bitcoind descriptor wallet add whatever signing data it can."""
+    return PSBT.from_base64(wallet_rpc.walletprocesspsbt(psbt.to_base64())["psbt"])
+
+
+def wallet_create_funded_psbt(wallet_rpc, inputs, outputs, options=None):
+    """Create a PSBT using a descriptor wallet while preserving caller options."""
+    return PSBT.from_base64(
+        wallet_rpc.walletcreatefundedpsbt(inputs, outputs, 0, options or {})["psbt"]
+    )
+
+
+def finalize_and_broadcast_with_bitcoind(bitcoind, psbt):
+    """Finalize a PSBT through bitcoind and broadcast the resulting transaction."""
+    res = bitcoind.node_rpc.finalizepsbt(psbt.to_base64())
+    assert res["complete"], res
+    return bitcoind.node_rpc.sendrawtransaction(res["hex"])
+
+
 class RpcError(ValueError):
     def __init__(self, method: str, params: dict, error: str):
         super(ValueError, self).__init__(

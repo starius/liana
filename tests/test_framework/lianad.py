@@ -26,7 +26,13 @@ from test_framework.serializations import (
 
 class Lianad(TailableProc):
     def __init__(
-        self, datadir, signer, multi_desc, bitcoin_backend, legacy_datadir=False
+        self,
+        datadir,
+        signer,
+        multi_desc,
+        bitcoin_backend,
+        legacy_datadir=False,
+        singlepath_descs=None,
     ):
         TailableProc.__init__(self, datadir, verbose=VERBOSE)
 
@@ -36,7 +42,10 @@ class Lianad(TailableProc):
         self.signer = signer
         self._poll_interval_secs = 1
         self.multi_desc = multi_desc
-        self.receive_desc, self.change_desc = multi_desc.singlepath_descriptors()
+        if hasattr(multi_desc, "singlepath_descriptors"):
+            self.receive_desc, self.change_desc = multi_desc.singlepath_descriptors()
+        else:
+            self.receive_desc, self.change_desc = singlepath_descs or (None, None)
 
         self.conf_file = os.path.join(datadir, "config.toml")
         self.cmd_line = [LIANAD_PATH, "--conf", f"{self.conf_file}"]
@@ -53,7 +62,7 @@ class Lianad(TailableProc):
 
             f.write(f"log_level = '{LOG_LEVEL}'\n")
 
-            f.write(f'main_descriptor = "{multi_desc}"\n')
+            f.write(f'main_descriptor = "{self.multi_desc}"\n')
 
             f.write("[bitcoin_config]\n")
             f.write('network = "regtest"\n')
@@ -73,6 +82,15 @@ class Lianad(TailableProc):
         :returns: PSBT with finalized inputs.
         """
         assert isinstance(psbt, PSBT)
+        if (
+            self.receive_desc is None
+            or self.change_desc is None
+            or not hasattr(self.receive_desc, "derive")
+            or not hasattr(self.change_desc, "derive")
+        ):
+            raise ValueError(
+                "PSBT finalization requires parsed receive/change descriptors."
+            )
 
         # Create a witness for each input of the transaction.
         for i, psbt_in in enumerate(psbt.i):
