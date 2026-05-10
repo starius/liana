@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync,
+    time::Duration,
 };
 
 use bdk_electrum::bdk_chain::{
@@ -46,6 +47,10 @@ const CHAIN_STORE_FILE: &str = "chain.sqlite3";
 const PEER_CACHE_FILE: &str = "peer-cache.json";
 const SNAPSHOT_FILE: &str = "snapshot.json";
 const HEADER_FLUSH_BATCH_SIZE: usize = 512;
+const SYNC_EVENT_TIMEOUT: Duration = Duration::from_secs(35);
+const SYNC_IDLE_RETRY_LIMIT: usize = 4;
+const SYNC_NODE_RESTART_LIMIT: usize = 3;
+const BOOTSTRAP_PEER_RETRY_FANOUT: usize = 4;
 
 #[derive(Debug)]
 pub enum Bip157Error {
@@ -149,6 +154,11 @@ pub struct Bip157 {
     db: sync::Arc<sync::Mutex<dyn DatabaseInterface>>,
     runtime: bip157::tokio::runtime::Runtime,
     chain_store: ChainStore,
+    node_data_dir: PathBuf,
+    bootstrap_peers: Vec<TrustedPeer>,
+    required_peers: u8,
+    whitelist_only: bool,
+    proxy_addr: Option<SocketAddr>,
     peer_cache_path: PathBuf,
     peer_cache_enabled: bool,
     snapshot_path: PathBuf,
@@ -214,47 +224,31 @@ impl Bip157 {
         let tip_time = chain_store.tip_time()?;
 
         let chain_state = chain_state_from(&chain_store, snapshot.as_ref(), synced_tip, network)?;
-        let mut builder = bip157::Builder::new(network)
-            .data_dir(node_data_dir(data_dir))
-            .required_peers(bip157_config.required_peers)
-            // Signet peers can take longer than the upstream default to answer
-            // compact-filter requests during the initial sync.
-            .response_timeout(config::BIP157_RESPONSE_TIMEOUT);
-        if let Some(chain_state) = chain_state {
-            builder = builder.chain_state(chain_state);
-        }
-        if bip157_config.whitelist_only {
-            builder = builder.whitelist_only();
-        }
-        if let Some(proxy_addr) = bip157_config.proxy_addr {
-            builder = builder.socks5_proxy(Socks5Proxy::new(proxy_addr));
-        }
-        if !bootstrap_peers.is_empty() {
-            let peers = bootstrap_peers
+        let node_data_dir = node_data_dir(data_dir);
+        let bootstrap_peers = if !bootstrap_peers.is_empty() {
+            bootstrap_peers
                 .iter()
                 .map(|peer| parse_peer(network, peer))
-                .collect::<Result<Vec<_>, _>>()?;
-            builder = builder.add_peers(peers);
-        }
-
-        let (node, client) = builder.build();
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         let runtime = bip157::tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|e| Bip157Error::Runtime(e.to_string()))?;
-        let Client {
-            requester,
-            info_rx,
-            warn_rx,
-            event_rx,
-        } = client;
         let progress = sync::Arc::new(sync::Mutex::new(None));
-        spawn_log_tasks(&runtime, progress.clone(), info_rx, warn_rx);
-        runtime.spawn(async move {
-            if let Err(e) = node.run().await {
-                log::error!("BIP157 node stopped: {e}");
-            }
-        });
+        let (requester, event_rx) = spawn_node(
+            &runtime,
+            progress.clone(),
+            network,
+            &node_data_dir,
+            chain_state,
+            bip157_config.required_peers,
+            bip157_config.whitelist_only,
+            bip157_config.proxy_addr,
+            &bootstrap_peers,
+        )?;
 
         Ok(Self {
             requester,
@@ -264,6 +258,11 @@ impl Bip157 {
             db,
             runtime,
             chain_store,
+            node_data_dir,
+            bootstrap_peers,
+            required_peers: bip157_config.required_peers,
+            whitelist_only: bip157_config.whitelist_only,
+            proxy_addr: bip157_config.proxy_addr,
             peer_cache_path,
             peer_cache_enabled: !bip157_config.whitelist_only,
             snapshot_path,
@@ -307,7 +306,10 @@ impl Bip157 {
     }
 
     pub fn is_in_wallet_chain(&self, tip: BlockChainTip) -> Option<bool> {
-        self.bdk_wallet.borrow().is_in_chain(tip)
+        self.chain_store
+            .contains_tip(tip)
+            .ok()
+            .or_else(|| self.bdk_wallet.borrow().is_in_chain(tip))
     }
 
     pub fn is_rescanning(&self) -> bool {
@@ -332,6 +334,34 @@ impl Bip157 {
     }
 
     pub fn sync_wallet(
+        &mut self,
+        receive_index: ChildNumber,
+        change_index: ChildNumber,
+    ) -> Result<Option<BlockChainTip>, Bip157Error> {
+        for attempt in 0..=SYNC_NODE_RESTART_LIMIT {
+            match self.sync_wallet_once(receive_index, change_index) {
+                Ok(result) => return Ok(result),
+                Err(error)
+                    if attempt < SYNC_NODE_RESTART_LIMIT && is_restartable_client_error(&error) =>
+                {
+                    log::warn!(
+                        "Restarting the BIP157 node after a transient sync failure ({}/{}): {}",
+                        attempt + 1,
+                        SYNC_NODE_RESTART_LIMIT,
+                        error
+                    );
+                    self.restart_node()?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(Bip157Error::Client(
+            "exhausted all BIP157 node restart attempts".to_owned(),
+        ))
+    }
+
+    fn sync_wallet_once(
         &mut self,
         receive_index: ChildNumber,
         change_index: ChildNumber,
@@ -376,11 +406,42 @@ impl Bip157 {
         let mut pending_headers = Vec::new();
         let mut seen_block_hashes = HashSet::new();
         let mut reorg_common_ancestor: Option<BlockChainTip> = None;
+        let mut idle_retries = 0usize;
         loop {
-            let event = self
-                .runtime
-                .block_on(self.event_rx.recv())
-                .ok_or_else(|| Bip157Error::Client("the BIP157 node is not running".into()))?;
+            let event = {
+                let runtime = &self.runtime;
+                let event_rx = &mut self.event_rx;
+                runtime.block_on(async {
+                    bip157::tokio::time::timeout(SYNC_EVENT_TIMEOUT, event_rx.recv()).await
+                })
+            };
+            let event = match event {
+                Ok(Some(event)) => {
+                    idle_retries = 0;
+                    event
+                }
+                Ok(None) => {
+                    return Err(Bip157Error::Client("the BIP157 node is not running".into()))
+                }
+                Err(_) => {
+                    idle_retries = idle_retries.saturating_add(1);
+                    let added = queue_retryable_peers(&self.requester, &self.bootstrap_peers, 1)?;
+                    log::warn!(
+                        "BIP157 sync stalled for {:?}; re-queued {} configured peer(s) ({}/{})",
+                        SYNC_EVENT_TIMEOUT,
+                        added,
+                        idle_retries,
+                        SYNC_IDLE_RETRY_LIMIT
+                    );
+                    if idle_retries >= SYNC_IDLE_RETRY_LIMIT {
+                        return Err(Bip157Error::Client(format!(
+                            "timed out waiting for BIP157 sync progress after {} retries",
+                            idle_retries
+                        )));
+                    }
+                    continue;
+                }
+            };
             match event {
                 Event::IndexedFilter(filter) => {
                     let matches_wallet = filter.contains_any(bdk_wallet.all_spks());
@@ -482,6 +543,34 @@ impl Bip157 {
                 _ => {}
             }
         }
+    }
+
+    fn restart_node(&mut self) -> Result<(), Bip157Error> {
+        let _ = self.requester.shutdown();
+        clear_pending_events(&mut self.event_rx);
+        *self.progress.lock().unwrap() = None;
+
+        let snapshot = load_snapshot(&self.snapshot_path)?;
+        let chain_state = chain_state_from(
+            &self.chain_store,
+            snapshot.as_ref(),
+            self.synced_tip.get(),
+            self.network,
+        )?;
+        let (requester, event_rx) = spawn_node(
+            &self.runtime,
+            self.progress.clone(),
+            self.network,
+            &self.node_data_dir,
+            chain_state,
+            self.required_peers,
+            self.whitelist_only,
+            self.proxy_addr,
+            &self.bootstrap_peers,
+        )?;
+        self.requester = requester;
+        self.event_rx = event_rx;
+        Ok(())
     }
 
     pub fn wallet_transaction(
@@ -743,6 +832,7 @@ fn default_port(network: bitcoin::Network) -> u16 {
         bitcoin::Network::Testnet4 => 48333,
         bitcoin::Network::Signet => 38333,
         bitcoin::Network::Regtest => 18444,
+        _ => 8333,
     }
 }
 
@@ -949,6 +1039,83 @@ fn persist_filter_hash(
 
 fn clear_pending_events(event_rx: &mut bip157::UnboundedReceiver<Event>) {
     while event_rx.try_recv().is_ok() {}
+}
+
+fn queue_retryable_peers(
+    requester: &Requester,
+    bootstrap_peers: &[TrustedPeer],
+    fanout: usize,
+) -> Result<usize, Bip157Error> {
+    let mut added = 0usize;
+    for _ in 0..fanout {
+        for peer in bootstrap_peers {
+            requester
+                .add_peer(peer.clone())
+                .map_err(|e| Bip157Error::Client(e.to_string()))?;
+            added = added.saturating_add(1);
+        }
+    }
+    Ok(added)
+}
+
+fn spawn_node(
+    runtime: &bip157::tokio::runtime::Runtime,
+    progress: sync::Arc<sync::Mutex<Option<bip157::Progress>>>,
+    network: bitcoin::Network,
+    node_data_dir: &Path,
+    chain_state: Option<ChainState>,
+    required_peers: u8,
+    whitelist_only: bool,
+    proxy_addr: Option<SocketAddr>,
+    bootstrap_peers: &[TrustedPeer],
+) -> Result<(Requester, bip157::UnboundedReceiver<Event>), Bip157Error> {
+    let mut builder = bip157::Builder::new(network)
+        .data_dir(node_data_dir.to_path_buf())
+        .required_peers(required_peers)
+        // Signet peers can take longer than the upstream default to answer
+        // compact-filter requests during the initial sync.
+        .response_timeout(config::BIP157_RESPONSE_TIMEOUT);
+    if let Some(chain_state) = chain_state {
+        builder = builder.chain_state(chain_state);
+    }
+    if whitelist_only {
+        builder = builder.whitelist_only();
+    }
+    if let Some(proxy_addr) = proxy_addr {
+        builder = builder.socks5_proxy(Socks5Proxy::new(proxy_addr));
+    }
+    if !bootstrap_peers.is_empty() {
+        builder = builder.add_peers(bootstrap_peers.to_vec());
+    }
+
+    let (node, client) = builder.build();
+    let Client {
+        requester,
+        info_rx,
+        warn_rx,
+        event_rx,
+    } = client;
+    spawn_log_tasks(runtime, progress, info_rx, warn_rx);
+    runtime.spawn(async move {
+        if let Err(e) = node.run().await {
+            log::error!("BIP157 node stopped: {e}");
+        }
+    });
+    if whitelist_only {
+        queue_retryable_peers(&requester, bootstrap_peers, BOOTSTRAP_PEER_RETRY_FANOUT)?;
+    }
+
+    Ok((requester, event_rx))
+}
+
+fn is_restartable_client_error(error: &Bip157Error) -> bool {
+    match error {
+        Bip157Error::Client(message) => {
+            message.contains("the BIP157 node is not running")
+                || message.contains("receiver of this message was dropped")
+        }
+        _ => false,
+    }
 }
 
 fn fetch_block_error(error: FetchBlockError) -> Bip157Error {

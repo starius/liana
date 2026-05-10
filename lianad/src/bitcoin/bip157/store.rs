@@ -95,6 +95,18 @@ impl ChainStore {
         Ok(Some(block_time))
     }
 
+    pub fn contains_tip(&self, tip: BlockChainTip) -> Result<bool, ChainStoreError> {
+        if tip.height < 0 {
+            return Ok(false);
+        }
+        let height = tip.height as u32;
+
+        Ok(self
+            .header(height)?
+            .map(|indexed_header| indexed_header.header.block_hash() == tip.hash)
+            .unwrap_or(false))
+    }
+
     pub fn ensure_header(&self, indexed_header: IndexedHeader) -> Result<(), ChainStoreError> {
         let conn = self.connection()?;
         conn.execute(
@@ -524,6 +536,55 @@ mod tests {
                 height: 2,
             })
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn checks_if_tip_is_on_the_canonical_chain() {
+        let path = temp_path("chain-store-contains-tip");
+        let store = ChainStore::new(path.clone());
+        let genesis = test_header(bitcoin::BlockHash::all_zeros(), 100, 0);
+        let block1 = test_header(genesis.block_hash(), 200, 1);
+        let block2 = test_header(block1.block_hash(), 300, 2);
+        store
+            .replace_from(
+                0,
+                &[
+                    IndexedHeader {
+                        height: 0,
+                        header: genesis,
+                    },
+                    IndexedHeader {
+                        height: 1,
+                        header: block1,
+                    },
+                    IndexedHeader {
+                        height: 2,
+                        header: block2,
+                    },
+                ],
+            )
+            .expect("store headers");
+
+        assert!(store
+            .contains_tip(BlockChainTip {
+                hash: block1.block_hash(),
+                height: 1,
+            })
+            .expect("tip membership"));
+        assert!(!store
+            .contains_tip(BlockChainTip {
+                hash: block2.block_hash(),
+                height: 1,
+            })
+            .expect("mismatched tip membership"));
+        assert!(!store
+            .contains_tip(BlockChainTip {
+                hash: block2.block_hash(),
+                height: 9,
+            })
+            .expect("missing height membership"));
 
         let _ = fs::remove_file(path);
     }
