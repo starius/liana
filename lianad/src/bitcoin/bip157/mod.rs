@@ -1078,6 +1078,26 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_file_roundtrip() {
+        let path = temp_path("bip157-snapshot");
+        let header = test_header(BlockHash::all_zeros(), 1231006505, 0);
+        let snapshot = StoredSnapshot::from_recent_history(&BTreeMap::from([(0, header)]));
+
+        save_snapshot(&path, &snapshot).expect("save snapshot");
+        let loaded = load_snapshot(&path).expect("load snapshot");
+
+        assert_eq!(
+            loaded.and_then(|snapshot| snapshot.tip().expect("snapshot tip")),
+            Some(BlockChainTip {
+                hash: header.block_hash(),
+                height: 0,
+            })
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn reorg_common_ancestor_comes_from_reorg_boundary() {
         let ancestor_hash = bitcoin::BlockHash::from_byte_array([7; 32]);
         let accepted = vec![IndexedHeader {
@@ -1100,6 +1120,85 @@ mod tests {
                 height: 299,
             })
         );
+    }
+
+    #[test]
+    fn reorg_common_ancestor_returns_genesis_for_height_zero() {
+        let genesis_hash = bitcoin::BlockHash::from_byte_array([9; 32]);
+        let accepted = vec![IndexedHeader {
+            height: 0,
+            header: test_header(bitcoin::BlockHash::all_zeros(), 1_000, 1),
+        }];
+
+        assert_eq!(
+            reorg_common_ancestor_from_update(&accepted, &[], genesis_hash),
+            Some(BlockChainTip {
+                hash: genesis_hash,
+                height: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn chain_state_from_uses_db_tip_checkpoint_when_no_history_exists() {
+        let path = temp_path("bip157-chain-state");
+        let chain_store = ChainStore::new(path.clone());
+        let tip = BlockChainTip {
+            hash: bitcoin::BlockHash::from_byte_array([11; 32]),
+            height: 42,
+        };
+
+        let chain_state = chain_state_from(&chain_store, None, Some(tip), bitcoin::Network::Signet)
+            .expect("chain state");
+
+        match chain_state {
+            Some(ChainState::Checkpoint(checkpoint)) => {
+                assert_eq!(checkpoint.height, 42);
+                assert_eq!(checkpoint.hash, tip.hash);
+            }
+            other => panic!("unexpected chain state: {:?}", other),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn seed_chain_store_from_snapshot_keeps_legacy_tip_segment() {
+        let path = temp_path("bip157-legacy-snapshot-store");
+        let chain_store = ChainStore::new(path.clone());
+        let genesis = test_header(bitcoin::BlockHash::all_zeros(), 100, 0);
+        let block10 = test_header(bitcoin::BlockHash::from_byte_array([1; 32]), 200, 10);
+        let block11 = test_header(block10.block_hash(), 300, 11);
+        let snapshot =
+            StoredSnapshot::from_recent_history(&BTreeMap::from([(10, block10), (11, block11)]));
+        chain_store
+            .ensure_header(IndexedHeader {
+                height: 0,
+                header: genesis,
+            })
+            .expect("store genesis");
+
+        seed_chain_store_from_snapshot(&chain_store, Some(&snapshot)).expect("seed chain store");
+
+        assert_eq!(chain_store.last_height().expect("last height"), Some(11));
+        assert_eq!(
+            chain_store
+                .header(0)
+                .expect("genesis header")
+                .map(|header| header.height),
+            Some(0)
+        );
+        assert_eq!(
+            chain_store
+                .contiguous_headers()
+                .expect("contiguous tip segment")
+                .into_iter()
+                .map(|header| header.height)
+                .collect::<Vec<_>>(),
+            vec![10, 11]
+        );
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1180,6 +1279,57 @@ mod tests {
                 height: 8,
             }),
             None
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_wallet_from_db_falls_back_to_legacy_snapshot_tip() {
+        let path = temp_path("bip157-wallet-snapshot");
+        let chain_store = ChainStore::new(path.clone());
+        let store_headers = stored_chain(5);
+        chain_store
+            .replace_from(0, &store_headers)
+            .expect("store shorter chain");
+
+        let snapshot_headers = stored_chain(11);
+        let snapshot_tip_header = snapshot_headers.last().expect("snapshot tip");
+        let snapshot = StoredSnapshot::from_recent_history(&BTreeMap::from([
+            (10, snapshot_headers[10].header),
+            (11, snapshot_tip_header.header),
+        ]));
+        let tip = BlockChainTip {
+            hash: snapshot_tip_header.header.block_hash(),
+            height: height_i32_from_u32(snapshot_tip_header.height),
+        };
+
+        let database = DummyDatabase::new();
+        {
+            let mut db_conn = database.connection();
+            db_conn.update_tip(&tip);
+        }
+        let db: sync::Arc<sync::Mutex<dyn DatabaseInterface>> =
+            sync::Arc::new(sync::Mutex::new(database));
+        let wallet = load_wallet_from_db(
+            &db,
+            &test_descriptor(),
+            store_headers[0].header.block_hash(),
+            &chain_store,
+            Some(&snapshot),
+            None,
+            None,
+            &HashMap::new(),
+        )
+        .expect("load wallet from db");
+
+        assert_eq!(wallet.is_in_chain(tip), Some(true));
+        assert_eq!(
+            wallet.is_in_chain(BlockChainTip {
+                hash: snapshot_headers[10].header.block_hash(),
+                height: 10,
+            }),
+            Some(true)
         );
 
         let _ = fs::remove_file(path);
