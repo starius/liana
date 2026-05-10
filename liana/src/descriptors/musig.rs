@@ -3,7 +3,6 @@ use std::{convert::TryFrom, fmt, str::FromStr};
 use miniscript::{
     bitcoin::{
         self, bip32,
-        hashes::Hash,
         psbt::{raw, Input as PsbtIn, Output as PsbtOut},
         secp256k1,
         taproot::TapLeafHash,
@@ -364,7 +363,7 @@ impl MuSig2SinglePathDescriptor {
             .placeholders
             .iter()
             .map(|placeholder| {
-                let participant_origins = match placeholder.expr().derivation_mode() {
+                let mut participant_origins = match placeholder.expr().derivation_mode() {
                     MuSig2DerivationMode::DeriveThenAggregate => placeholder
                         .expr()
                         .participants()
@@ -380,6 +379,7 @@ impl MuSig2SinglePathDescriptor {
                         .map(|participant| derive_participant_origin(participant, 0, 0))
                         .collect::<Result<Vec<_>, _>>()?,
                 };
+                participant_origins.sort_by_key(|(participant, _)| *participant);
                 let participant_set_pubkey = match placeholder.expr().derivation_mode() {
                     MuSig2DerivationMode::DeriveThenAggregate => {
                         derive_aggregate_pubkey(placeholder.expr(), 0, child_index)?
@@ -485,16 +485,13 @@ impl MuSig2DerivedDescriptor {
                 .iter()
                 .flat_map(|(participant, _)| participant.serialize())
                 .collect();
-            for scope in &path.scopes {
-                psbt_in.unknown.insert(
-                    musig2_participant_set_key(
-                        PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
-                        path.participant_set_pubkey,
-                        Some(*scope),
-                    ),
-                    participant_bytes.clone(),
-                );
-            }
+            psbt_in.unknown.insert(
+                musig2_participant_set_key(
+                    PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
+                    path.participant_set_pubkey,
+                ),
+                participant_bytes,
+            );
         }
     }
 
@@ -548,16 +545,13 @@ impl MuSig2DerivedDescriptor {
                 .iter()
                 .flat_map(|(participant, _)| participant.serialize())
                 .collect();
-            for scope in &path.scopes {
-                psbt_out.unknown.insert(
-                    musig2_participant_set_key(
-                        PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS,
-                        path.participant_set_pubkey,
-                        Some(*scope),
-                    ),
-                    participant_bytes.clone(),
-                );
-            }
+            psbt_out.unknown.insert(
+                musig2_participant_set_key(
+                    PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS,
+                    path.participant_set_pubkey,
+                ),
+                participant_bytes,
+            );
         }
     }
 }
@@ -696,16 +690,11 @@ fn output_key_origin(
     }
 }
 
-fn musig2_participant_set_key(
-    type_value: u8,
-    aggregate_pubkey: secp256k1::PublicKey,
-    scope: Option<MuSig2PlaceholderScope>,
-) -> raw::Key {
-    let mut key = aggregate_pubkey.serialize().to_vec();
-    if let Some(MuSig2PlaceholderScope::ScriptSpend(leaf_hash)) = scope {
-        key.extend_from_slice(&leaf_hash.to_byte_array());
+fn musig2_participant_set_key(type_value: u8, aggregate_pubkey: secp256k1::PublicKey) -> raw::Key {
+    raw::Key {
+        type_value,
+        key: aggregate_pubkey.serialize().to_vec(),
     }
-    raw::Key { type_value, key }
 }
 
 pub fn aggregate_plain_pubkey<I>(
