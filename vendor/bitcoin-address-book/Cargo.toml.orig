@@ -1,0 +1,26 @@
+[package]
+name = "bitcoin-address-book"
+version = "0.1.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Network address manager for Bitcoin clients."
+repository = "https://github.com/2140-dev/bitcoin-address-book"
+keywords = ["bitcoin", "cryptography", "network", "peer-to-peer"]
+categories = ["cryptography::cryptocurrencies"]
+rust-version = "1.84"
+
+[lib]
+name = "bitcoin_address_book"
+path = "src/lib.rs"
+
+[dependencies]
+# Keep this aligned with Liana's temporary rust-bitcoin 0.32.5 pin until a
+# stable rust-bitcoin release includes the addrv2 service-flags fix from 0.33.
+bitcoin = "=0.32.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"

@@ -91,4 +91,14 @@ tar = { version = "0.4", default-features = false }
 flate2 = { version = "1.0", default-features = false }
 winresource = "0.1.24"
 unicode-segmentation = "1.0"
-bitcoin = "0.32"
+bitcoin = "=0.32.5"
+
+[patch.crates-io]
+# Keep Kyoto local so Liana can:
+# - pin rust-bitcoin to 0.32.5 and avoid the addrv2 service-flags regression introduced in 0.32.9
+# - carry the BIP157 reconnect hardening needed for transient compact-filter failures on a single
+#   configured peer
+# rust-bitcoin 0.33.0-beta already fixes the addrv2 issue, so this exact pin can be revisited
+# once a stable >=0.33 release is available.
+bip157 = { path = "vendor/bip157" }
+bitcoin-address-book = { path = "vendor/bitcoin-address-book" }

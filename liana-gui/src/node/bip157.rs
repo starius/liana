@@ -182,6 +182,7 @@ fn default_port(network: Network) -> u16 {
         Network::Testnet4 => 48333,
         Network::Signet => 38333,
         Network::Regtest => 18444,
+        _ => 8333,
     }
 }
 
