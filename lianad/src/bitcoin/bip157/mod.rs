@@ -3,7 +3,7 @@ mod store;
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt, fs, io,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
@@ -338,7 +338,6 @@ impl Bip157 {
         change_index: ChildNumber,
     ) -> Result<Option<BlockChainTip>, Bip157Error> {
         let previous_snapshot = load_snapshot(&self.snapshot_path)?;
-        let previous_headers = recent_chain_headers(&self.chain_store, previous_snapshot.as_ref())?;
         let mut bdk_wallet = load_wallet_from_db(
             &self.db,
             &self.main_descriptor,
@@ -377,7 +376,7 @@ impl Bip157 {
         let mut matched_blocks = Vec::new();
         let mut pending_headers = Vec::new();
         let mut seen_block_hashes = HashSet::new();
-        let mut reorg_from_height: Option<u32> = None;
+        let mut reorg_common_ancestor: Option<BlockChainTip> = None;
         loop {
             let event = self
                 .runtime
@@ -389,7 +388,7 @@ impl Bip157 {
                     let height = filter.height();
                     let block_hash = filter.block_hash();
                     let filter_contents = filter.into_contents();
-                    persist_filter_commitment(&self.chain_store, height, &filter_contents)?;
+                    persist_filter_hash(&self.chain_store, height, &filter_contents)?;
                     if matches_wallet && seen_block_hashes.insert(block_hash) {
                         let block = self
                             .runtime
@@ -408,15 +407,18 @@ impl Bip157 {
                     accepted,
                     reorganized,
                 }) => {
+                    if let Some(common_ancestor) = reorg_common_ancestor_from_update(
+                        &accepted,
+                        &reorganized,
+                        self.genesis_hash,
+                    ) {
+                        reorg_common_ancestor = Some(match reorg_common_ancestor {
+                            Some(current) if current.height <= common_ancestor.height => current,
+                            _ => common_ancestor,
+                        });
+                    }
                     flush_connected_headers(&self.chain_store, &mut pending_headers)?;
                     apply_reorg_to_store(&self.chain_store, &accepted, &reorganized)?;
-                    if let Some(height) = reorganized.iter().map(|header| header.height).min() {
-                        reorg_from_height = Some(
-                            reorg_from_height
-                                .map(|current| current.min(height))
-                                .unwrap_or(height),
-                        );
-                    }
                 }
                 Event::FiltersSynced(update) => {
                     flush_connected_headers(&self.chain_store, &mut pending_headers)?;
@@ -442,10 +444,24 @@ impl Bip157 {
                         .collect::<Vec<_>>();
 
                     let snapshot = StoredSnapshot::from_recent_history(update.recent_history());
-                    let recent_headers = recent_chain_headers(&self.chain_store, Some(&snapshot))?;
-                    let local_chain = local_chain_from_headers(self.genesis_hash, &recent_headers)?;
+                    let initial_headers =
+                        wallet_local_chain_headers(&self.chain_store, Some(&snapshot), tip, &[])?;
+                    let local_chain =
+                        local_chain_from_headers(self.genesis_hash, &initial_headers)?;
                     bdk_wallet.set_local_chain(local_chain);
                     bdk_wallet.apply_relevant_confirmed_transactions(&confirmed_txs);
+                    let wallet_coins = bdk_wallet
+                        .coins(None, None)
+                        .into_values()
+                        .collect::<Vec<_>>();
+                    let wallet_headers = wallet_local_chain_headers(
+                        &self.chain_store,
+                        Some(&snapshot),
+                        tip,
+                        &wallet_coins,
+                    )?;
+                    let local_chain = local_chain_from_headers(self.genesis_hash, &wallet_headers)?;
+                    bdk_wallet.set_local_chain(local_chain);
 
                     self.pending_txs.borrow_mut().retain(|txid, _| {
                         bdk_wallet
@@ -462,10 +478,7 @@ impl Bip157 {
                     *self.bdk_wallet.borrow_mut() = bdk_wallet;
                     self.persist_peer_cache();
 
-                    let common_ancestor = reorg_from_height.map(|height| {
-                        common_ancestor_from_headers(&previous_headers, height, self.genesis_hash)
-                    });
-                    return Ok(common_ancestor);
+                    return Ok(reorg_common_ancestor);
                 }
                 _ => {}
             }
@@ -686,23 +699,11 @@ fn load_wallet_from_db(
         change_index,
     );
 
-    if chain_store.tip()? == tip {
-        let headers = chain_store.recent_headers(10)?;
+    if let Some(tip) = tip {
+        let headers = wallet_local_chain_headers(chain_store, snapshot, tip, &coins)?;
         if !headers.is_empty() {
             let local_chain = local_chain_from_headers(genesis_hash, &headers)?;
             bdk_wallet.set_local_chain(local_chain);
-        }
-    } else {
-        let snapshot_tip = match snapshot {
-            Some(snapshot) => snapshot.tip()?,
-            None => None,
-        };
-        if snapshot_tip == tip {
-            if let Some(snapshot) = snapshot {
-                let local_chain =
-                    local_chain_from_headers(genesis_hash, &snapshot.indexed_headers()?)?;
-                bdk_wallet.set_local_chain(local_chain);
-            }
         }
     }
 
@@ -824,18 +825,40 @@ fn seed_chain_store_from_snapshot(
     Ok(())
 }
 
-fn recent_chain_headers(
+fn wallet_local_chain_headers(
     chain_store: &ChainStore,
     snapshot: Option<&StoredSnapshot>,
+    tip: BlockChainTip,
+    coins: &[Coin],
 ) -> Result<Vec<IndexedHeader>, Bip157Error> {
-    let headers = chain_store.recent_headers(10)?;
-    if !headers.is_empty() {
-        return Ok(headers);
+    if chain_store.tip()? == Some(tip) {
+        let heights = wallet_relevant_heights(tip, coins);
+        let headers = chain_store.headers_at_heights(&heights)?;
+        if !headers.is_empty() {
+            return Ok(headers);
+        }
     }
-    snapshot
-        .map(StoredSnapshot::indexed_headers)
-        .transpose()
-        .map(|headers| headers.unwrap_or_default())
+    let snapshot_tip = snapshot.map(StoredSnapshot::tip).transpose()?.flatten();
+    if snapshot_tip == Some(tip) {
+        return snapshot
+            .map(StoredSnapshot::indexed_headers)
+            .transpose()
+            .map(|headers| headers.unwrap_or_default());
+    }
+    Ok(Vec::new())
+}
+
+fn wallet_relevant_heights(tip: BlockChainTip, coins: &[Coin]) -> Vec<u32> {
+    let mut heights = BTreeSet::from([0u32, height_u32_from_i32(tip.height)]);
+    for coin in coins {
+        if let Some(block) = coin.block_info {
+            heights.insert(height_u32_from_i32(block.height));
+        }
+        if let Some(block) = coin.spend_block {
+            heights.insert(height_u32_from_i32(block.height));
+        }
+    }
+    heights.into_iter().collect()
 }
 
 fn local_chain_from_headers(
@@ -860,23 +883,25 @@ fn local_chain_from_headers(
     LocalChain::from_tip(checkpoint).map_err(|e| Bip157Error::Snapshot(e.to_string()))
 }
 
-fn common_ancestor_from_headers(
-    headers: &[IndexedHeader],
-    reorg_from_height: u32,
+fn reorg_common_ancestor_from_update(
+    accepted: &[IndexedHeader],
+    reorganized: &[IndexedHeader],
     genesis_hash: BlockHash,
-) -> BlockChainTip {
-    headers
+) -> Option<BlockChainTip> {
+    let boundary = accepted
         .iter()
-        .rev()
-        .find(|header| header.height < reorg_from_height)
-        .map(|header| BlockChainTip {
-            hash: header.header.block_hash(),
-            height: height_i32_from_u32(header.height),
-        })
-        .unwrap_or(BlockChainTip {
+        .chain(reorganized.iter())
+        .min_by_key(|header| header.height)?;
+    if boundary.height == 0 {
+        return Some(BlockChainTip {
             hash: genesis_hash,
             height: 0,
-        })
+        });
+    }
+    Some(BlockChainTip {
+        hash: boundary.header.prev_blockhash,
+        height: height_i32_from_u32(boundary.height - 1),
+    })
 }
 
 fn flush_connected_headers(
@@ -913,21 +938,13 @@ fn apply_reorg_to_store(
     Ok(())
 }
 
-fn persist_filter_commitment(
+fn persist_filter_hash(
     chain_store: &ChainStore,
     height: u32,
     filter_contents: &[u8],
 ) -> Result<(), Bip157Error> {
     let filter_hash = bitcoin::FilterHash::hash(filter_contents);
-    let previous_filter_header = if height <= 1 {
-        bitcoin::FilterHeader::all_zeros()
-    } else if let Some(previous_filter_header) = chain_store.filter_header(height - 1)? {
-        previous_filter_header
-    } else {
-        return Ok(());
-    };
-    let filter_header = filter_hash.filter_header(&previous_filter_header);
-    chain_store.set_filter_commitments(&[(height, filter_hash, filter_header)])?;
+    chain_store.set_filter_hashes(&[(height, filter_hash)])?;
     Ok(())
 }
 
@@ -969,6 +986,67 @@ fn spawn_log_tasks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, path::PathBuf};
+
+    use liana::descriptors;
+    use miniscript::{bitcoin::hashes::Hash, DescriptorPublicKey};
+
+    use crate::{database::DatabaseInterface, testutils::DummyDatabase};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("liana-{name}-{nanos}.sqlite3"))
+    }
+
+    fn test_header(
+        prev_blockhash: bitcoin::BlockHash,
+        time: u32,
+        nonce: u32,
+    ) -> bitcoin::block::Header {
+        bitcoin::block::Header {
+            version: bitcoin::block::Version::from_consensus(1),
+            prev_blockhash,
+            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+            time,
+            bits: bitcoin::CompactTarget::from_consensus(0x1d00ffff),
+            nonce,
+        }
+    }
+
+    fn test_descriptor() -> LianaDescriptor {
+        let owner_key = descriptors::PathInfo::Single(
+            DescriptorPublicKey::from_str(
+                "[aabbccdd]xpub68JJTXc1MWK8KLW4HGLXZBJknja7kDUJuFHnM424LbziEXsfkh1WQCiEjjHw4zLqSUm4rvhgyGkkuRowE9tCJSgt3TQB5J3SKAbZ2SdcKST/<0;1>/*",
+            )
+            .expect("owner key"),
+        );
+        let heir_key = descriptors::PathInfo::Single(
+            DescriptorPublicKey::from_str(
+                "[aabbccdd]xpub68JJTXc1MWK8PEQozKsRatrUHXKFNkD1Cb1BuQU9Xr5moCv87anqGyXLyUd4KpnDyZgo3gz4aN1r3NiaoweFW8UutBsBbgKHzaD5HkTkifK/<0;1>/*",
+            )
+            .expect("heir key"),
+        );
+        let policy = descriptors::LianaPolicy::new_legacy(
+            owner_key,
+            std::collections::BTreeMap::from([(10_000u16, heir_key)]),
+        )
+        .expect("policy");
+        descriptors::LianaDescriptor::new(policy)
+    }
+
+    fn stored_chain(tip_height: u32) -> Vec<IndexedHeader> {
+        let mut headers = Vec::with_capacity(tip_height as usize + 1);
+        let mut prev_hash = bitcoin::BlockHash::all_zeros();
+        for height in 0..=tip_height {
+            let header = test_header(prev_hash, 100 + height, height);
+            prev_hash = header.block_hash();
+            headers.push(IndexedHeader { height, header });
+        }
+        headers
+    }
 
     #[test]
     fn peer_parser_accepts_common_forms() {
@@ -980,14 +1058,7 @@ mod tests {
 
     #[test]
     fn snapshot_tip_roundtrip() {
-        let header = bitcoin::block::Header {
-            version: bitcoin::block::Version::from_consensus(1),
-            prev_blockhash: BlockHash::all_zeros(),
-            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
-            time: 1231006505,
-            bits: bitcoin::CompactTarget::from_consensus(0x1d00ffff),
-            nonce: 0,
-        };
+        let header = test_header(BlockHash::all_zeros(), 1231006505, 0);
         let snapshot = StoredSnapshot::from_recent_history(&BTreeMap::from([(0, header)]));
         let tip = snapshot.tip().expect("tip lookup");
         assert_eq!(
@@ -1005,5 +1076,113 @@ mod tests {
                 .map(|h| h.header.time),
             Some(header.time)
         );
+    }
+
+    #[test]
+    fn reorg_common_ancestor_comes_from_reorg_boundary() {
+        let ancestor_hash = bitcoin::BlockHash::from_byte_array([7; 32]);
+        let accepted = vec![IndexedHeader {
+            height: 300,
+            header: test_header(ancestor_hash, 1_000, 1),
+        }];
+        let reorganized = vec![IndexedHeader {
+            height: 300,
+            header: test_header(ancestor_hash, 1_100, 2),
+        }];
+
+        assert_eq!(
+            reorg_common_ancestor_from_update(
+                &accepted,
+                &reorganized,
+                bitcoin::BlockHash::all_zeros()
+            ),
+            Some(BlockChainTip {
+                hash: ancestor_hash,
+                height: 299,
+            })
+        );
+    }
+
+    #[test]
+    fn load_wallet_from_db_restores_wallet_relevant_heights_from_chain_store() {
+        let path = temp_path("bip157-wallet-chain");
+        let chain_store = ChainStore::new(path.clone());
+        let headers = stored_chain(20);
+        chain_store
+            .replace_from(0, &headers)
+            .expect("store chain headers");
+
+        let tip_header = headers.last().expect("tip header");
+        let tip = BlockChainTip {
+            hash: tip_header.header.block_hash(),
+            height: height_i32_from_u32(tip_header.height),
+        };
+        let confirmed_header = headers.get(3).expect("confirmed header");
+        let spent_header = headers.get(7).expect("spent header");
+
+        let mut database = DummyDatabase::new();
+        database.insert_coins(vec![crate::database::Coin {
+            outpoint: bitcoin::OutPoint {
+                txid: bitcoin::Txid::from_byte_array([2; 32]),
+                vout: 0,
+            },
+            is_immature: false,
+            block_info: Some(crate::database::BlockInfo {
+                height: 3,
+                time: confirmed_header.header.time,
+            }),
+            amount: bitcoin::Amount::from_sat(10_000),
+            derivation_index: 0.into(),
+            is_change: false,
+            spend_txid: Some(bitcoin::Txid::from_byte_array([3; 32])),
+            spend_block: Some(crate::database::BlockInfo {
+                height: 7,
+                time: spent_header.header.time,
+            }),
+            is_from_self: false,
+        }]);
+        {
+            let mut db_conn = database.connection();
+            db_conn.update_tip(&tip);
+        }
+
+        let db: sync::Arc<sync::Mutex<dyn DatabaseInterface>> =
+            sync::Arc::new(sync::Mutex::new(database));
+        let wallet = load_wallet_from_db(
+            &db,
+            &test_descriptor(),
+            headers[0].header.block_hash(),
+            &chain_store,
+            None,
+            None,
+            None,
+            &HashMap::new(),
+        )
+        .expect("load wallet from db");
+
+        assert_eq!(wallet.is_in_chain(tip), Some(true));
+        assert_eq!(
+            wallet.is_in_chain(BlockChainTip {
+                hash: confirmed_header.header.block_hash(),
+                height: 3,
+            }),
+            Some(true)
+        );
+        assert_eq!(
+            wallet.is_in_chain(BlockChainTip {
+                hash: spent_header.header.block_hash(),
+                height: 7,
+            }),
+            Some(true)
+        );
+        assert_eq!(
+            wallet.is_in_chain(BlockChainTip {
+                hash: headers[8].header.block_hash(),
+                height: 8,
+            }),
+            None
+        );
+
+        let _ = fs::remove_file(path);
     }
 }

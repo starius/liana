@@ -14,8 +14,7 @@ CREATE TABLE IF NOT EXISTS chain (
     height INTEGER PRIMARY KEY NOT NULL,
     header BLOB NOT NULL,
     block_time INTEGER NOT NULL,
-    filter_hash BLOB,
-    filter_header BLOB
+    filter_hash BLOB
 );
 CREATE INDEX IF NOT EXISTS chain_block_time ON chain(block_time);";
 
@@ -62,7 +61,8 @@ impl ChainStore {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&self.path)?;
+        let mut conn = Connection::open(&self.path)?;
+        migrate_legacy_schema(&mut conn)?;
         conn.execute_batch(SCHEMA)?;
         Ok(conn)
     }
@@ -109,6 +109,34 @@ impl ChainStore {
         Ok(())
     }
 
+    pub fn header(&self, height: u32) -> Result<Option<IndexedHeader>, ChainStoreError> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare("SELECT header FROM chain WHERE height = ?1")?;
+        let mut rows = stmt.query(params![height])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let header: Vec<u8> = row.get(0)?;
+        Ok(Some(IndexedHeader {
+            height,
+            header: decode_header(&header)?,
+        }))
+    }
+
+    pub fn headers_at_heights(
+        &self,
+        heights: &[u32],
+    ) -> Result<Vec<IndexedHeader>, ChainStoreError> {
+        let mut headers = Vec::with_capacity(heights.len());
+        for height in heights {
+            if let Some(header) = self.header(*height)? {
+                headers.push(header);
+            }
+        }
+        Ok(headers)
+    }
+
+    #[cfg(test)]
     pub fn recent_headers(&self, limit: usize) -> Result<Vec<IndexedHeader>, ChainStoreError> {
         self.tip_segment(Some(limit))
     }
@@ -202,46 +230,35 @@ impl ChainStore {
         Ok(())
     }
 
-    pub fn set_filter_commitments(
+    pub fn set_filter_hashes(
         &self,
-        commitments: &[(u32, bitcoin::FilterHash, bitcoin::FilterHeader)],
+        filter_hashes: &[(u32, bitcoin::FilterHash)],
     ) -> Result<(), ChainStoreError> {
-        if commitments.is_empty() {
+        if filter_hashes.is_empty() {
             return Ok(());
         }
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;
         {
-            let mut update = tx.prepare(
-                "UPDATE chain SET filter_hash = ?1, filter_header = ?2 WHERE height = ?3",
-            )?;
-            for (height, filter_hash, filter_header) in commitments {
-                update.execute(params![
-                    serialize(filter_hash),
-                    serialize(filter_header),
-                    height,
-                ])?;
+            let mut update = tx.prepare("UPDATE chain SET filter_hash = ?1 WHERE height = ?2")?;
+            for (height, filter_hash) in filter_hashes {
+                update.execute(params![serialize(filter_hash), height])?;
             }
         }
         tx.commit()?;
         Ok(())
     }
 
-    pub fn filter_header(
-        &self,
-        height: u32,
-    ) -> Result<Option<bitcoin::FilterHeader>, ChainStoreError> {
+    #[cfg(test)]
+    pub fn filter_hash(&self, height: u32) -> Result<Option<bitcoin::FilterHash>, ChainStoreError> {
         let conn = self.connection()?;
-        let mut stmt = conn.prepare("SELECT filter_header FROM chain WHERE height = ?1")?;
+        let mut stmt = conn.prepare("SELECT filter_hash FROM chain WHERE height = ?1")?;
         let mut rows = stmt.query(params![height])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
         };
-        let filter_header: Option<Vec<u8>> = row.get(0)?;
-        filter_header
-            .as_deref()
-            .map(decode_filter_header)
-            .transpose()
+        let filter_hash: Option<Vec<u8>> = row.get(0)?;
+        filter_hash.as_deref().map(decode_filter_hash).transpose()
     }
 
     pub fn block_before_date(
@@ -274,9 +291,48 @@ fn decode_header(bytes: &[u8]) -> Result<bitcoin::block::Header, ChainStoreError
         .map_err(|e| ChainStoreError::Decode(format!("invalid stored block header: {e}")))
 }
 
-fn decode_filter_header(bytes: &[u8]) -> Result<bitcoin::FilterHeader, ChainStoreError> {
+#[cfg(test)]
+fn decode_filter_hash(bytes: &[u8]) -> Result<bitcoin::FilterHash, ChainStoreError> {
     deserialize(bytes)
-        .map_err(|e| ChainStoreError::Decode(format!("invalid stored filter header: {e}")))
+        .map_err(|e| ChainStoreError::Decode(format!("invalid stored filter hash: {e}")))
+}
+
+fn migrate_legacy_schema(conn: &mut Connection) -> Result<(), ChainStoreError> {
+    let has_filter_header = {
+        let mut stmt = conn.prepare("PRAGMA table_info(chain)")?;
+        let mut rows = stmt.query([])?;
+        let mut has_filter_header = false;
+        while let Some(row) = rows.next()? {
+            let column_name: String = row.get(1)?;
+            if column_name == "filter_header" {
+                has_filter_header = true;
+                break;
+            }
+        }
+        has_filter_header
+    };
+
+    if !has_filter_header {
+        return Ok(());
+    }
+
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "
+        CREATE TABLE chain_new (
+            height INTEGER PRIMARY KEY NOT NULL,
+            header BLOB NOT NULL,
+            block_time INTEGER NOT NULL,
+            filter_hash BLOB
+        );
+        INSERT INTO chain_new (height, header, block_time, filter_hash)
+        SELECT height, header, block_time, filter_hash FROM chain;
+        DROP TABLE chain;
+        ALTER TABLE chain_new RENAME TO chain;
+        ",
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -349,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn stores_filter_commitments() {
+    fn stores_filter_hashes() {
         let path = temp_path("chain-store-commitments");
         let store = ChainStore::new(path.clone());
         let genesis = test_header(bitcoin::BlockHash::all_zeros(), 10, 0);
@@ -364,14 +420,71 @@ mod tests {
             .expect("store header");
 
         let filter_hash = bitcoin::FilterHash::hash(b"filter-0");
-        let filter_header = filter_hash.filter_header(&bitcoin::FilterHeader::all_zeros());
         store
-            .set_filter_commitments(&[(0, filter_hash, filter_header)])
-            .expect("store commitments");
+            .set_filter_hashes(&[(0, filter_hash)])
+            .expect("store filter hash");
 
         assert_eq!(
-            store.filter_header(0).expect("filter header"),
-            Some(filter_header)
+            store.filter_hash(0).expect("filter hash"),
+            Some(filter_hash)
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn migrates_legacy_filter_header_store() {
+        let path = temp_path("chain-store-legacy");
+        {
+            let conn = Connection::open(&path).expect("open legacy store");
+            conn.execute_batch(
+                "
+                CREATE TABLE chain (
+                    height INTEGER PRIMARY KEY NOT NULL,
+                    header BLOB NOT NULL,
+                    block_time INTEGER NOT NULL,
+                    filter_hash BLOB,
+                    filter_header BLOB
+                );
+                ",
+            )
+            .expect("create legacy schema");
+
+            let genesis = test_header(bitcoin::BlockHash::all_zeros(), 10, 0);
+            let filter_hash = bitcoin::FilterHash::hash(b"filter-0");
+            let filter_header = filter_hash.filter_header(&bitcoin::FilterHeader::all_zeros());
+            conn.execute(
+                "INSERT INTO chain (height, header, block_time, filter_hash, filter_header)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    0u32,
+                    serialize(&genesis),
+                    genesis.time,
+                    serialize(&filter_hash),
+                    serialize(&filter_header),
+                ],
+            )
+            .expect("insert legacy row");
+        }
+
+        let store = ChainStore::new(path.clone());
+        assert_eq!(
+            store.filter_hash(0).expect("filter hash after migration"),
+            Some(bitcoin::FilterHash::hash(b"filter-0"))
+        );
+
+        let conn = Connection::open(&path).expect("reopen migrated store");
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(chain)")
+            .expect("prepare table info");
+        let mut rows = stmt.query([]).expect("query table info");
+        let mut columns = Vec::new();
+        while let Some(row) = rows.next().expect("next column") {
+            columns.push(row.get::<_, String>(1).expect("column name"));
+        }
+        assert_eq!(
+            columns,
+            vec!["height", "header", "block_time", "filter_hash"]
         );
 
         let _ = fs::remove_file(path);
