@@ -8,7 +8,7 @@ use std::{
 
 use bip157::{Builder, Client, Socks5Proxy, TrustedPeer};
 use liana::miniscript::bitcoin::Network;
-use lianad::config::Bip157Config;
+use lianad::config::{Bip157Config, BIP157_RESPONSE_TIMEOUT};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ConfigField {
@@ -22,6 +22,7 @@ pub const PEERS_NOTES: &str =
 pub const REQUIRED_PEERS_NOTES: &str = "Maintain between 1 and 15 peer connections.";
 pub const PROXY_ADDR_NOTES: &str = "Optional Socks5 proxy, for example 127.0.0.1:9050.";
 pub const WHITELIST_ONLY_LABEL: &str = "Only connect to the configured peers";
+const PING_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl fmt::Display for ConfigField {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -99,7 +100,8 @@ pub fn ping(network: Network, config: &Bip157Config) -> Result<(), String> {
     let result = (|| {
         let mut builder = Builder::new(network)
             .data_dir(&data_dir)
-            .required_peers(config.required_peers);
+            .required_peers(config.required_peers)
+            .response_timeout(BIP157_RESPONSE_TIMEOUT);
         if config.whitelist_only {
             builder = builder.whitelist_only();
         }
@@ -129,11 +131,11 @@ pub fn ping(network: Network, config: &Bip157Config) -> Result<(), String> {
         let shutdown = requester.clone();
         let handle = runtime.spawn(async move { node.run().await });
         let result = runtime.block_on(async {
-            bip157::tokio::time::timeout(Duration::from_secs(15), requester.chain_tip()).await
+            bip157::tokio::time::timeout(BIP157_RESPONSE_TIMEOUT, requester.chain_tip()).await
         });
         let _ = shutdown.shutdown();
         let _ = runtime
-            .block_on(async { bip157::tokio::time::timeout(Duration::from_secs(2), handle).await });
+            .block_on(async { bip157::tokio::time::timeout(PING_SHUTDOWN_TIMEOUT, handle).await });
 
         match result {
             Ok(Ok(_)) => Ok(()),
@@ -180,5 +182,26 @@ fn default_port(network: Network) -> u16 {
         Network::Testnet4 => 48333,
         Network::Signet => 38333,
         Network::Regtest => 18444,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_peers_accepts_commas_and_lines() {
+        assert_eq!(
+            parse_peers("127.0.0.1:38333,\nseed.signet.example"),
+            vec!["127.0.0.1:38333", "seed.signet.example"]
+        );
+    }
+
+    #[test]
+    fn whitelist_mode_requires_enough_configured_peers() {
+        assert_eq!(
+            config_from_values("127.0.0.1:38333", "2", true, "").unwrap_err(),
+            "Whitelist-only mode needs at least as many configured peers as required peers"
+        );
     }
 }

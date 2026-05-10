@@ -9,7 +9,6 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync,
-    time::Duration,
 };
 
 use bdk_electrum::bdk_chain::{
@@ -220,7 +219,7 @@ impl Bip157 {
             .required_peers(bip157_config.required_peers)
             // Signet peers can take longer than the upstream default to answer
             // compact-filter requests during the initial sync.
-            .response_timeout(Duration::from_secs(30));
+            .response_timeout(config::BIP157_RESPONSE_TIMEOUT);
         if let Some(chain_state) = chain_state {
             builder = builder.chain_state(chain_state);
         }

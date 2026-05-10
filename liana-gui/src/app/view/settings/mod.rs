@@ -383,7 +383,7 @@ pub fn remote_backend_section<'a>(
             .push(content)
             .push(link(
                 help::CHANGE_BACKEND_OR_NODE_URL,
-                "I want to connect to my own node",
+                "I want to connect to a local Bitcoin backend",
             )),
     )
 }

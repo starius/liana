@@ -145,6 +145,8 @@ fn default_bip157_required_peers() -> u8 {
     1
 }
 
+pub const BIP157_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Everything we need to know for talking to a BIP157 backend serenely.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Bip157Config {
