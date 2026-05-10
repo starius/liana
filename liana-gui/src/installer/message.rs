@@ -26,7 +26,7 @@ use crate::{
     hw::HardwareWalletMessage,
     installer::{
         decrypt::Decrypt,
-        descriptor::{PathKind, PrimarySpendKind},
+        descriptor::{PathKind, PrimarySpendKind, TaprootSpendKind},
     },
     node::{
         bitcoind::{Bitcoind, ConfigField, RpcAuthType},
@@ -194,6 +194,7 @@ pub enum DefinePath {
     Key(usize, DefineKey),
     ThresholdEdited(usize),
     SequenceEdited(u16),
+    SelectTaprootSpendKind(TaprootSpendKind),
     EditSequence,
     EditThreshold,
 }

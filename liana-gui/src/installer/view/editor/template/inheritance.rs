@@ -12,7 +12,7 @@ use liana_ui::{
 
 use crate::installer::{
     context,
-    descriptor::{Path, PathSequence},
+    descriptor::{Path, PathSequence, TaprootSpendKind},
     message::{self, Message},
     view::{
         editor::{define_descriptor_advanced_settings, defined_key, path, undefined_key},
@@ -69,6 +69,8 @@ pub fn inheritance_template<'a>(
     use_taproot: bool,
     primary_spend: crate::installer::descriptor::PrimarySpendKind,
     allow_musig: bool,
+    primary_taproot_spend_kind: Option<TaprootSpendKind>,
+    recovery_taproot_spend_kind: Option<TaprootSpendKind>,
     primary_path: &'a Path,
     recovery_path: &'a Path,
     valid: bool,
@@ -107,6 +109,7 @@ pub fn inheritance_template<'a>(
                     None,
                     PathSequence::Primary,
                     primary_path.warning,
+                    primary_taproot_spend_kind,
                     1,
                     vec![if let Some(key) = primary_key {
                         defined_key(
@@ -134,6 +137,7 @@ pub fn inheritance_template<'a>(
                     None,
                     recovery_path.sequence,
                     recovery_path.warning,
+                    recovery_taproot_spend_kind,
                     1,
                     vec![if let Some(Some(key)) = recovery_path.keys.first() {
                         defined_key(

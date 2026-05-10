@@ -12,7 +12,7 @@ use liana_ui::{
 
 use crate::installer::{
     context,
-    descriptor::{Path, PathKind, PathSequence},
+    descriptor::{Path, PathKind, PathSequence, TaprootSpendKind},
     message::{self, Message},
     view::{
         editor::{
@@ -79,6 +79,8 @@ pub fn multisig_security_template<'a>(
     use_taproot: bool,
     primary_spend: crate::installer::descriptor::PrimarySpendKind,
     allow_musig: bool,
+    primary_taproot_spend_kind: Option<TaprootSpendKind>,
+    recovery_taproot_spend_kind: Option<TaprootSpendKind>,
     primary_path: &'a Path,
     recovery_path: &'a Path,
     valid: bool,
@@ -112,6 +114,7 @@ pub fn multisig_security_template<'a>(
                     None,
                     PathSequence::Primary,
                     primary_path.warning,
+                    primary_taproot_spend_kind,
                     primary_path.keys.len(),
                     primary_path
                         .keys
@@ -160,6 +163,7 @@ pub fn multisig_security_template<'a>(
                     None,
                     recovery_path.sequence,
                     recovery_path.warning,
+                    recovery_taproot_spend_kind,
                     recovery_path.threshold,
                     recovery_path
                         .keys

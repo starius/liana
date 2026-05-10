@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use iced::{Subscription, Task};
 use liana::miniscript::bitcoin::bip32::ChildNumber;
 use liana::{
-    descriptors::{LianaDescriptor, LianaPolicy, MuSig2KeyExpr, PathInfo, PrimaryPathInfo},
+    descriptors::{
+        LianaDescriptor, LianaPolicy, MuSig2KeyExpr, PathInfo, PrimaryPathInfo, RecoveryPathInfo,
+    },
     miniscript::{
         bitcoin::{bip32::Fingerprint, Network},
         descriptor::DescriptorPublicKey,
@@ -26,7 +28,9 @@ use crate::{
     hw::HardwareWallets,
     installer::{
         context::DescriptorTemplate,
-        descriptor::{Key, Path, PathKind, PathSequence, PathWarning, PrimarySpendKind},
+        descriptor::{
+            Key, Path, PathKind, PathSequence, PathWarning, PrimarySpendKind, TaprootSpendKind,
+        },
         message::{self, Message},
         step::{Context, Step},
         view,
@@ -124,24 +128,49 @@ impl DefineDescriptor {
                         .iter()
                         .any(|k| !k.as_ref().is_some_and(|k| k.source.is_compatible_taproot())))
         }) && self.paths.len() >= 2
-            && (!self.primary_spend_is_musig() || self.primary_path_supports_musig())
+            && self
+                .paths
+                .iter()
+                .enumerate()
+                .all(|(index, _)| !self.path_uses_musig(index) || self.path_supports_musig(index))
     }
 
     fn check_setup(&mut self) {
-        if !self.primary_path_supports_musig() {
+        if !self.any_path_supports_musig() {
             self.primary_spend = PrimarySpendKind::ScriptPath;
+        }
+        for index in 0..self.paths.len() {
+            if !self.use_taproot
+                || self.primary_spend.musig_mode().is_none()
+                || !self.path_supports_musig(index)
+            {
+                self.paths[index].taproot_spend_kind = TaprootSpendKind::ScriptPath;
+            }
         }
         self.check_for_warning();
     }
 
-    fn primary_spend_is_musig(&self) -> bool {
-        self.primary_spend.musig_mode().is_some()
+    fn path_uses_musig(&self, index: usize) -> bool {
+        self.paths
+            .get(index)
+            .is_some_and(|path| path.taproot_spend_kind == TaprootSpendKind::MuSig2)
     }
 
-    fn primary_path_supports_musig(&self) -> bool {
+    fn path_supports_musig(&self, index: usize) -> bool {
         self.paths
-            .first()
+            .get(index)
             .is_some_and(|path| path.keys.len() >= 2 && path.threshold == path.keys.len())
+    }
+
+    fn any_path_supports_musig(&self) -> bool {
+        (0..self.paths.len()).any(|index| self.path_supports_musig(index))
+    }
+
+    fn show_path_spend_kind(&self, index: usize) -> Option<TaprootSpendKind> {
+        (self.use_taproot
+            && self.primary_spend.musig_mode().is_some()
+            && self.path_supports_musig(index))
+        .then_some(self.paths[index].taproot_spend_kind)
     }
 
     fn load_template(&mut self, template: DescriptorTemplate) {
@@ -357,6 +386,12 @@ impl Step for DefineDescriptor {
             }
             Message::DefineDescriptor(message::DefineDescriptor::Path(i, msg)) => {
                 match msg {
+                    message::DefinePath::SelectTaprootSpendKind(spend_kind) => {
+                        if let Some(path) = self.paths.get_mut(i) {
+                            path.taproot_spend_kind = spend_kind;
+                        }
+                        self.check_setup();
+                    }
                     message::DefinePath::SequenceEdited(seq) => {
                         self.modal = None;
                         if let Some(Path {
@@ -495,6 +530,7 @@ impl Step for DefineDescriptor {
         ctx.keys = HashMap::new();
         let mut hw_is_used = false;
         let mut spending_keys: Vec<DescriptorPublicKey> = Vec::new();
+        let mut primary_plain_xpubs: Vec<DescriptorPublicKey> = Vec::new();
         let mut key_derivation_index = HashMap::<Fingerprint, usize>::new();
         for spending_key in self.paths[0].keys.iter().clone() {
             let fingerprint = spending_key
@@ -519,6 +555,7 @@ impl Step for DefineDescriptor {
                         hw_is_used = true;
                     }
                 }
+                primary_plain_xpubs.push(DescriptorPublicKey::XPub(xpub.clone()));
                 let derivation_index = key_derivation_index.get(&fingerprint).unwrap_or(&0);
                 spending_keys.push(DescriptorPublicKey::MultiXPub(new_multixkey_from_xpub(
                     xpub.clone(),
@@ -528,10 +565,33 @@ impl Step for DefineDescriptor {
             }
         }
 
-        let mut recovery_paths = BTreeMap::new();
+        let build_musig_expr = |participants: Vec<DescriptorPublicKey>,
+                                mode: liana::descriptors::MuSig2DerivationMode,
+                                derivation_index: usize| {
+            let aggregate_suffix = if matches!(
+                mode,
+                liana::descriptors::MuSig2DerivationMode::AggregateThenDeriveBip328
+            ) {
+                format!("/<{};{}>/*", 2 * derivation_index, 2 * derivation_index + 1)
+            } else {
+                String::new()
+            };
+            MuSig2KeyExpr::from_str(&format!(
+                "musig({}){aggregate_suffix}",
+                participants
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))
+            .map_err(|e| e.to_string())
+        };
 
-        for path in &self.paths[1..] {
+        let mut recovery_paths = BTreeMap::<u16, RecoveryPathInfo>::new();
+
+        for (path_index, path) in self.paths[1..].iter().enumerate() {
             let mut recovery_keys: Vec<DescriptorPublicKey> = Vec::new();
+            let mut recovery_plain_xpubs: Vec<DescriptorPublicKey> = Vec::new();
             for recovery_key in path.keys.iter().clone() {
                 let fingerprint = recovery_key
                     .as_ref()
@@ -556,6 +616,7 @@ impl Step for DefineDescriptor {
                         }
                     }
 
+                    recovery_plain_xpubs.push(DescriptorPublicKey::XPub(xpub.clone()));
                     let derivation_index = key_derivation_index.get(&fingerprint).unwrap_or(&0);
                     recovery_keys.push(DescriptorPublicKey::MultiXPub(new_multixkey_from_xpub(
                         xpub.clone(),
@@ -571,7 +632,36 @@ impl Step for DefineDescriptor {
                 PathInfo::Multi(path.threshold, recovery_keys)
             };
 
-            recovery_paths.insert(path.sequence.as_u16(), recovery_keys);
+            let recovery_path =
+                if self.use_taproot && path.taproot_spend_kind == TaprootSpendKind::MuSig2 {
+                    let Some(mode) = self.primary_spend.musig_mode() else {
+                        self.error = Some("MuSig2 mode must be selected first".to_string());
+                        return false;
+                    };
+                    let participants = if matches!(
+                        mode,
+                        liana::descriptors::MuSig2DerivationMode::DeriveThenAggregate
+                    ) {
+                        match &recovery_keys {
+                            PathInfo::Single(key) => vec![key.clone()],
+                            PathInfo::Multi(_, keys) => keys.clone(),
+                        }
+                    } else {
+                        recovery_plain_xpubs
+                    };
+                    let expr = match build_musig_expr(participants, mode, path_index + 1) {
+                        Ok(expr) => expr,
+                        Err(e) => {
+                            self.error = Some(e);
+                            return false;
+                        }
+                    };
+                    RecoveryPathInfo::MuSig2(expr)
+                } else {
+                    RecoveryPathInfo::Script(recovery_keys)
+                };
+
+            recovery_paths.insert(path.sequence.as_u16(), recovery_path);
         }
 
         if spending_keys.is_empty() {
@@ -579,63 +669,23 @@ impl Step for DefineDescriptor {
         }
 
         let primary_path = if self.use_taproot {
-            if let Some(mode) = self.primary_spend.musig_mode() {
-                let participants = self.paths[0]
-                    .keys
-                    .iter()
-                    .map(|spending_key| {
-                        let fingerprint = spending_key
-                            .as_ref()
-                            .expect("Must be present at this step")
-                            .fingerprint;
-                        let key = self
-                            .keys
-                            .get(&fingerprint)
-                            .expect("Must be present at this step");
-                        match (&key.key, mode) {
-                            (
-                                DescriptorPublicKey::XPub(xpub),
-                                liana::descriptors::MuSig2DerivationMode::DeriveThenAggregate,
-                            ) => Ok(DescriptorPublicKey::MultiXPub(new_multixkey_from_xpub(
-                                xpub.clone(),
-                                0,
-                            ))),
-                            (
-                                DescriptorPublicKey::XPub(xpub),
-                                liana::descriptors::MuSig2DerivationMode::AggregateThenDeriveBip328,
-                            ) => Ok(DescriptorPublicKey::XPub(xpub.clone())),
-                            _ => {
-                                Err("MuSig2 primary keys must be extended public keys".to_string())
-                            }
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>();
-                let participants = match participants {
-                    Ok(participants) => participants,
-                    Err(e) => {
-                        self.error = Some(e);
-                        return false;
-                    }
+            if self.paths[0].taproot_spend_kind == TaprootSpendKind::MuSig2 {
+                let Some(mode) = self.primary_spend.musig_mode() else {
+                    self.error = Some("MuSig2 mode must be selected first".to_string());
+                    return false;
                 };
-                let aggregate_suffix = if matches!(
+                let participants = if matches!(
                     mode,
-                    liana::descriptors::MuSig2DerivationMode::AggregateThenDeriveBip328
+                    liana::descriptors::MuSig2DerivationMode::DeriveThenAggregate
                 ) {
-                    "/<0;1>/*"
+                    spending_keys.clone()
                 } else {
-                    ""
+                    primary_plain_xpubs
                 };
-                let expr = match MuSig2KeyExpr::from_str(&format!(
-                    "musig({}){aggregate_suffix}",
-                    participants
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                )) {
+                let expr = match build_musig_expr(participants, mode, 0) {
                     Ok(expr) => expr,
                     Err(e) => {
-                        self.error = Some(e.to_string());
+                        self.error = Some(e);
                         return false;
                     }
                 };
@@ -660,9 +710,17 @@ impl Step for DefineDescriptor {
         };
 
         let policy = match if self.use_taproot {
-            LianaPolicy::new_with_primary_info(primary_path, recovery_paths)
+            LianaPolicy::new_with_all_path_info(primary_path, recovery_paths)
         } else {
-            LianaPolicy::new_legacy_with_primary_info(primary_path, recovery_paths)
+            LianaPolicy::new_legacy_with_primary_info(
+                primary_path,
+                recovery_paths
+                    .into_iter()
+                    .filter_map(|(timelock, path)| {
+                        path.into_script_path().map(|path| (timelock, path))
+                    })
+                    .collect(),
+            )
         } {
             Ok(policy) => policy,
             Err(e) => {
@@ -682,13 +740,21 @@ impl Step for DefineDescriptor {
         progress: (usize, usize),
         _email: Option<&'a str>,
     ) -> Element<'a, Message> {
+        let custom_recovery_taproot_spend_kinds = self.paths[1..]
+            .iter()
+            .filter(|p| p.kind() == PathKind::Recovery)
+            .enumerate()
+            .map(|(index, _)| self.show_path_spend_kind(index + 1))
+            .collect::<Vec<_>>();
         let content = match self.descriptor_template {
             DescriptorTemplate::SimpleInheritance => {
                 view::editor::template::inheritance::inheritance_template(
                     progress,
                     self.use_taproot,
                     self.primary_spend,
-                    self.primary_path_supports_musig(),
+                    self.any_path_supports_musig(),
+                    self.show_path_spend_kind(0),
+                    self.show_path_spend_kind(1),
                     &self.paths[0],
                     &self.paths[1],
                     self.valid(),
@@ -699,7 +765,9 @@ impl Step for DefineDescriptor {
                     progress,
                     self.use_taproot,
                     self.primary_spend,
-                    self.primary_path_supports_musig(),
+                    self.any_path_supports_musig(),
+                    self.show_path_spend_kind(0),
+                    self.show_path_spend_kind(1),
                     &self.paths[0],
                     &self.paths[1],
                     self.valid(),
@@ -709,7 +777,14 @@ impl Step for DefineDescriptor {
                 progress,
                 self.use_taproot,
                 self.primary_spend,
-                self.primary_path_supports_musig(),
+                self.any_path_supports_musig(),
+                self.show_path_spend_kind(0),
+                custom_recovery_taproot_spend_kinds,
+                self.paths[1..]
+                    .iter()
+                    .enumerate()
+                    .find(|(_, p)| p.kind() == PathKind::SafetyNet)
+                    .and_then(|(index, _)| self.show_path_spend_kind(index + 1)),
                 &self.paths[0],
                 &mut self.paths[1..]
                     .iter()
@@ -873,7 +948,7 @@ mod tests {
     use crate::installer::step::descriptor::editor::key::{SelectKeySource, SelectedKey};
     use crate::{
         dir::LianaDirectory,
-        installer::descriptor::{KeySource, PrimarySpendKind},
+        installer::descriptor::{KeySource, PrimarySpendKind, TaprootSpendKind},
     };
 
     pub struct Sandbox<S: Step> {
@@ -1173,6 +1248,12 @@ mod tests {
                 PrimarySpendKind::MuSig2DeriveThenAggregate,
             ))
             .await;
+        sandbox
+            .update(Message::DefineDescriptor(message::DefineDescriptor::Path(
+                0,
+                message::DefinePath::SelectTaprootSpendKind(TaprootSpendKind::MuSig2),
+            )))
+            .await;
 
         sandbox.check(|step| {
             assert!(step.apply(&mut ctx));
@@ -1241,6 +1322,12 @@ mod tests {
             .update(Message::SelectPrimarySpendKind(
                 PrimarySpendKind::MuSig2AggregateThenDeriveBip328,
             ))
+            .await;
+        sandbox
+            .update(Message::DefineDescriptor(message::DefineDescriptor::Path(
+                0,
+                message::DefinePath::SelectTaprootSpendKind(TaprootSpendKind::MuSig2),
+            )))
             .await;
 
         sandbox.check(|step| {
@@ -1314,6 +1401,12 @@ mod tests {
         sandbox
             .update(Message::DefineDescriptor(message::DefineDescriptor::Path(
                 0,
+                message::DefinePath::SelectTaprootSpendKind(TaprootSpendKind::MuSig2),
+            )))
+            .await;
+        sandbox
+            .update(Message::DefineDescriptor(message::DefineDescriptor::Path(
+                0,
                 message::DefinePath::ThresholdEdited(1),
             )))
             .await;
@@ -1329,6 +1422,83 @@ mod tests {
                 .primary_path()
                 .musig()
                 .is_none());
+        });
+    }
+
+    #[tokio::test]
+    async fn test_define_descriptor_builds_musig_recovery_path() {
+        let mut ctx = Context::new(
+            Network::Signet,
+            LianaDirectory::new(PathBuf::from_str("/").unwrap()),
+            crate::installer::context::RemoteBackend::None,
+        );
+        let sandbox: Sandbox<DefineDescriptor> = Sandbox::new(DefineDescriptor::new(
+            Network::Signet,
+            Arc::new(Mutex::new(Signer::generate(Network::Signet).unwrap())),
+        ));
+        sandbox.load(&ctx).await;
+
+        sandbox.update(Message::CreateTaprootDescriptor(true)).await;
+        sandbox
+            .update(Message::DefineDescriptor(message::DefineDescriptor::Path(
+                1,
+                message::DefinePath::AddKey,
+            )))
+            .await;
+        insert_key(
+            &sandbox,
+            (0, 0),
+            manual_key(
+                "primary",
+                "[9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK",
+            ),
+        )
+        .await;
+        insert_key(
+            &sandbox,
+            (1, 0),
+            manual_key(
+                "recovery_a",
+                "[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM",
+            ),
+        )
+        .await;
+        insert_key(
+            &sandbox,
+            (1, 1),
+            manual_key(
+                "recovery_b",
+                "[1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs",
+            ),
+        )
+        .await;
+        sandbox
+            .update(Message::SelectPrimarySpendKind(
+                PrimarySpendKind::MuSig2AggregateThenDeriveBip328,
+            ))
+            .await;
+        sandbox
+            .update(Message::DefineDescriptor(message::DefineDescriptor::Path(
+                1,
+                message::DefinePath::SelectTaprootSpendKind(TaprootSpendKind::MuSig2),
+            )))
+            .await;
+
+        sandbox.check(|step| {
+            assert!(step.apply(&mut ctx));
+            let policy = ctx.descriptor.as_ref().unwrap().policy();
+            let recovery_expr = policy
+                .recovery_paths()
+                .values()
+                .next()
+                .and_then(|path| path.musig())
+                .expect("recovery path is musig");
+            assert_eq!(
+                recovery_expr.derivation_mode(),
+                MuSig2DerivationMode::AggregateThenDeriveBip328
+            );
+            assert!(recovery_expr.to_string().ends_with("/<2;3>/*"));
+            assert!(policy.primary_path().musig().is_none());
         });
     }
 }

@@ -119,6 +119,7 @@ pub struct Path {
     pub keys: Vec<Option<Key>>,
     pub threshold: usize,
     pub sequence: PathSequence,
+    pub taproot_spend_kind: TaprootSpendKind,
     pub warning: Option<PathWarning>,
 }
 
@@ -133,6 +134,7 @@ impl Path {
             keys: vec![None],
             threshold: 1,
             sequence,
+            taproot_spend_kind: TaprootSpendKind::ScriptPath,
             warning: None,
         }
     }
@@ -172,6 +174,21 @@ impl Path {
 
     pub fn valid(&self) -> bool {
         !self.keys.is_empty() && !self.keys.iter().any(|k| k.is_none()) && self.warning.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaprootSpendKind {
+    ScriptPath,
+    MuSig2,
+}
+
+impl std::fmt::Display for TaprootSpendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ScriptPath => write!(f, "Script path"),
+            Self::MuSig2 => write!(f, "MuSig2"),
+        }
     }
 }
 

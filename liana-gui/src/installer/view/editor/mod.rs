@@ -20,7 +20,7 @@ use liana_ui::{
 };
 
 use crate::installer::{
-    descriptor::{PathKind, PathSequence, PathWarning, PrimarySpendKind},
+    descriptor::{PathKind, PathSequence, PathWarning, PrimarySpendKind, TaprootSpendKind},
     message::{self, Message},
     view::defined_sequence,
 };
@@ -39,6 +39,8 @@ const PRIMARY_SPEND_KINDS: [PrimarySpendKind; 3] = [
     PrimarySpendKind::MuSig2DeriveThenAggregate,
     PrimarySpendKind::MuSig2AggregateThenDeriveBip328,
 ];
+const TAPROOT_SPEND_KINDS: [TaprootSpendKind; 2] =
+    [TaprootSpendKind::ScriptPath, TaprootSpendKind::MuSig2];
 
 impl std::fmt::Display for DescriptorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -88,7 +90,7 @@ pub fn define_descriptor_advanced_settings<'a>(
                         Some(
                             Column::new()
                                 .spacing(10)
-                                .push(text("Primary spend").bold())
+                                .push(text("MuSig2 mode").bold())
                                 .push(container(
                                     pick_list::pick_list(
                                         primary_spend_options,
@@ -113,14 +115,14 @@ pub fn define_descriptor_advanced_settings<'a>(
                         .push_maybe(if allow_musig {
                             Some(
                                 p1_regular(
-                                    "MuSig2 uses every primary key and the selected mode applies to the whole musig() expression.",
+                                    "The selected MuSig2 mode applies wallet-wide. Eligible Taproot paths can then opt into MuSig2 individually.",
                                 )
                                 .style(theme::text::secondary),
                             )
                         } else {
                             Some(
                                 p1_regular(
-                                    "MuSig2 becomes available once the primary Taproot path has at least two keys and the threshold matches the number of primary keys.",
+                                    "MuSig2 becomes available once at least one Taproot path has two or more keys and its threshold matches the number of keys in that path.",
                                 )
                                 .style(theme::text::secondary),
                             )
@@ -138,6 +140,7 @@ pub fn path(
     title: Option<String>,
     sequence: PathSequence,
     warning: Option<PathWarning>,
+    taproot_spend_kind: Option<TaprootSpendKind>,
     threshold: usize,
     keys: Vec<Element<message::DefinePath>>,
     fixed: bool,
@@ -148,6 +151,21 @@ pub fn path(
             .spacing(10)
             .push_maybe(title.map(|t| Row::new().push(Space::with_width(10)).push(p1_bold(t))))
             .push(defined_sequence(sequence, warning))
+            .push_maybe(taproot_spend_kind.map(|kind| {
+                Row::new()
+                    .padding(5)
+                    .spacing(10)
+                    .align_y(Alignment::Center)
+                    .push(text("Spend type").style(theme::text::secondary))
+                    .push(
+                        pick_list::pick_list(
+                            TAPROOT_SPEND_KINDS,
+                            Some(kind),
+                            message::DefinePath::SelectTaprootSpendKind,
+                        )
+                        .padding(10),
+                    )
+            }))
             .push(
                 Column::new()
                     .spacing(5)

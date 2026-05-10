@@ -15,7 +15,7 @@ use liana_ui::{
 };
 
 use crate::installer::{
-    descriptor::Path,
+    descriptor::{Path, TaprootSpendKind},
     message::{self, Message},
     view::{
         editor::{define_descriptor_advanced_settings, defined_key, path, undefined_key},
@@ -58,6 +58,9 @@ pub fn custom_template<'a>(
     use_taproot: bool,
     primary_spend: crate::installer::descriptor::PrimarySpendKind,
     allow_musig: bool,
+    primary_taproot_spend_kind: Option<TaprootSpendKind>,
+    recovery_taproot_spend_kinds: Vec<Option<TaprootSpendKind>>,
+    safety_net_taproot_spend_kind: Option<TaprootSpendKind>,
     primary_path: &'a Path,
     recovery_paths: &mut dyn Iterator<Item = (usize, &'a Path)>,
     safety_net_path: Option<(usize, &'a Path)>,
@@ -94,6 +97,7 @@ pub fn custom_template<'a>(
                     Some("Primary spending option:".to_string()),
                     primary_path.sequence,
                     primary_path.warning,
+                    primary_taproot_spend_kind,
                     primary_path.threshold,
                     primary_path
                         .keys
@@ -136,6 +140,7 @@ pub fn custom_template<'a>(
                             Some(format!("Recovery option #{}:", i + 1)),
                             p.sequence,
                             p.warning,
+                            recovery_taproot_spend_kinds.get(i).copied().flatten(),
                             p.threshold,
                             p.keys
                                 .iter()
@@ -209,6 +214,7 @@ pub fn custom_template<'a>(
                     Some("Safety Net:".to_string()),
                     sn_path.sequence,
                     sn_path.warning,
+                    safety_net_taproot_spend_kind,
                     sn_path.threshold,
                     sn_path
                         .keys
