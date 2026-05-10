@@ -246,6 +246,12 @@ fn merge_psbt_input_signing_data(
     if db_psbtin.tap_key_sig.is_none() {
         db_psbtin.tap_key_sig = psbtin.tap_key_sig;
     }
+    if db_psbtin.final_script_sig.is_none() {
+        db_psbtin.final_script_sig = psbtin.final_script_sig.clone();
+    }
+    if db_psbtin.final_script_witness.is_none() {
+        db_psbtin.final_script_witness = psbtin.final_script_witness.clone();
+    }
 }
 
 impl DaemonControl {
@@ -854,6 +860,19 @@ impl DaemonControl {
                     }
                 }
             }
+
+            // Imported PSBTs from external initiators may omit descriptor-derived taproot
+            // metadata that our finalizer expects. Reconstruct it from our own descriptor view
+            // before storing the PSBT.
+            for (index, txin) in tx.input.iter().enumerate() {
+                let Some(coin) = coins.get(&txin.previous_output) else {
+                    continue;
+                };
+                let Some(psbtin) = psbt.inputs.get_mut(index) else {
+                    continue;
+                };
+                self.derived_desc(coin).update_psbt_in(psbtin);
+            }
         }
 
         // Finally, insert (or update) the PSBT in database.
@@ -923,14 +942,19 @@ impl DaemonControl {
         let mut spend_psbt = db_conn
             .spend_tx(txid)
             .ok_or(CommandError::UnknownSpend(*txid))?;
-        spend_psbt.finalize_mut(&self.secp).map_err(|e| {
-            CommandError::SpendFinalization(
-                e.into_iter()
-                    .next()
-                    .map(|e| e.to_string())
-                    .unwrap_or_default(),
-            )
-        })?;
+        let already_finalized = spend_psbt.inputs.iter().all(|psbtin| {
+            psbtin.final_script_sig.is_some() || psbtin.final_script_witness.is_some()
+        });
+        if !already_finalized {
+            spend_psbt.finalize_mut(&self.secp).map_err(|e| {
+                CommandError::SpendFinalization(
+                    e.into_iter()
+                        .next()
+                        .map(|e| e.to_string())
+                        .unwrap_or_default(),
+                )
+            })?;
+        }
 
         // Then, broadcast it (or try to, we never know if we are not going to hit an
         // error at broadcast time).
