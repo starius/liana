@@ -4,6 +4,7 @@ use miniscript::{
         bip32::{self, DerivationPath, Fingerprint},
         constants::WITNESS_SCALE_FACTOR,
         hashes::Hash,
+        key::TapTweak,
         psbt::{Input as PsbtIn, Output as PsbtOut, Psbt},
         secp256k1,
         taproot::TapLeafHash,
@@ -91,6 +92,158 @@ fn key_is_for_path(
     false
 }
 
+#[derive(Clone)]
+struct Musig2MatchingSet {
+    participant_set_pubkey: secp256k1::PublicKey,
+    spend_pubkey: secp256k1::PublicKey,
+    leaf_hash: Option<TapLeafHash>,
+}
+
+fn musig2_synthetic_fingerprint(aggregate_pubkey: secp256k1::PublicKey) -> Fingerprint {
+    bip328_synthetic_xpub(aggregate_pubkey, bitcoin::Network::Bitcoin).fingerprint()
+}
+
+fn derive_bip328_internal_pubkey(
+    aggregate_pubkey: secp256k1::PublicKey,
+    derivation_path: &bip32::DerivationPath,
+) -> Option<secp256k1::PublicKey> {
+    let secp = secp256k1::Secp256k1::verification_only();
+    let mut synthetic_xpub = bip328_synthetic_xpub(aggregate_pubkey, bitcoin::Network::Bitcoin);
+    for child in derivation_path {
+        let (tweak, chain_code) = synthetic_xpub.ckd_pub_tweak(*child).ok()?;
+        let tweak_scalar: secp256k1::Scalar = tweak.clone().into();
+        let public_key = synthetic_xpub
+            .public_key
+            .add_exp_tweak(&secp, &tweak_scalar)
+            .ok()?;
+        synthetic_xpub = bip32::Xpub {
+            network: synthetic_xpub.network,
+            depth: synthetic_xpub.depth + 1,
+            parent_fingerprint: synthetic_xpub.fingerprint(),
+            child_number: *child,
+            chain_code,
+            public_key,
+        };
+    }
+    Some(synthetic_xpub.public_key)
+}
+
+fn reconstruct_musig2_matching_set(
+    psbt_in: &PsbtIn,
+    participant_set_pubkey: secp256k1::PublicKey,
+    participant_pubkeys: &[secp256k1::PublicKey],
+    leaf_hash: Option<TapLeafHash>,
+) -> Option<Musig2MatchingSet> {
+    let secp = secp256k1::Secp256k1::verification_only();
+    let mut participant_pubkeys = participant_pubkeys.to_vec();
+    participant_pubkeys.sort();
+    let expected_aggregate = aggregate_plain_pubkey(participant_pubkeys).ok()?;
+    if expected_aggregate != participant_set_pubkey {
+        return None;
+    }
+
+    let synthetic_fingerprint = musig2_synthetic_fingerprint(participant_set_pubkey);
+    let maybe_bip328_derivation =
+        match leaf_hash {
+            None => psbt_in
+                .tap_internal_key
+                .and_then(|tap_internal_key| psbt_in.tap_key_origins.get(&tap_internal_key))
+                .and_then(|(_, (fg, derivation_path))| {
+                    (*fg == synthetic_fingerprint).then(|| derivation_path.clone())
+                }),
+            Some(leaf_hash) => psbt_in.tap_key_origins.iter().find_map(
+                |(_, (leaf_hashes, (fg, derivation_path)))| {
+                    (*fg == synthetic_fingerprint && leaf_hashes.contains(&leaf_hash))
+                        .then(|| derivation_path.clone())
+                },
+            ),
+        };
+
+    let internal_pubkey = maybe_bip328_derivation
+        .as_ref()
+        .and_then(|derivation_path| {
+            derive_bip328_internal_pubkey(participant_set_pubkey, derivation_path)
+        })
+        .unwrap_or(participant_set_pubkey);
+
+    let spend_pubkey = if let Some(leaf_hash) = leaf_hash {
+        let (leaf_hashes, _) = psbt_in
+            .tap_key_origins
+            .get(&internal_pubkey.x_only_public_key().0)?;
+        if !leaf_hashes.contains(&leaf_hash) {
+            return None;
+        }
+        internal_pubkey
+    } else {
+        let tap_internal_key = psbt_in.tap_internal_key?;
+        if internal_pubkey.x_only_public_key().0 != tap_internal_key {
+            return None;
+        }
+        let (output_key, parity) = tap_internal_key.tap_tweak(&secp, psbt_in.tap_merkle_root);
+        secp256k1::XOnlyPublicKey::from(output_key).public_key(parity)
+    };
+
+    Some(Musig2MatchingSet {
+        participant_set_pubkey,
+        spend_pubkey,
+        leaf_hash,
+    })
+}
+
+fn musig2_matching_sets_for_participant_set(
+    psbt_in: &PsbtIn,
+    participant_set_pubkey: secp256k1::PublicKey,
+    participant_pubkeys: &[secp256k1::PublicKey],
+    legacy_script_leaf_hash: Option<TapLeafHash>,
+    keyspend: bool,
+) -> Vec<Musig2MatchingSet> {
+    if keyspend {
+        return reconstruct_musig2_matching_set(
+            psbt_in,
+            participant_set_pubkey,
+            participant_pubkeys,
+            None,
+        )
+        .into_iter()
+        .collect();
+    }
+
+    let mut leaf_hashes = BTreeSet::new();
+    if let Some(leaf_hash) = legacy_script_leaf_hash {
+        leaf_hashes.insert(leaf_hash);
+    }
+
+    if let Some((existing_leaf_hashes, _)) = psbt_in
+        .tap_key_origins
+        .get(&participant_set_pubkey.x_only_public_key().0)
+    {
+        leaf_hashes.extend(existing_leaf_hashes.iter().copied());
+    }
+
+    let synthetic_fingerprint = musig2_synthetic_fingerprint(participant_set_pubkey);
+    leaf_hashes.extend(
+        psbt_in
+            .tap_key_origins
+            .iter()
+            .filter(|(_, (candidate_leaf_hashes, (fg, _)))| {
+                !candidate_leaf_hashes.is_empty() && *fg == synthetic_fingerprint
+            })
+            .flat_map(|(_, (candidate_leaf_hashes, _))| candidate_leaf_hashes.iter().copied()),
+    );
+
+    leaf_hashes
+        .into_iter()
+        .filter_map(|leaf_hash| {
+            reconstruct_musig2_matching_set(
+                psbt_in,
+                participant_set_pubkey,
+                participant_pubkeys,
+                Some(leaf_hash),
+            )
+        })
+        .collect()
+}
+
 fn musig2_spend_info(
     psbt_in: &PsbtIn,
     threshold: usize,
@@ -106,55 +259,60 @@ fn musig2_spend_info(
                 || key_is_for_path(path_origins, fg, der_path)
         };
 
-    #[derive(Clone)]
-    struct MatchingSet {
-        aggregate_pubkey: secp256k1::PublicKey,
-        leaf_hash: Option<TapLeafHash>,
-    }
-
     let matching_sets = psbt_in
         .unknown
         .iter()
-        .filter_map(|(key, value)| {
+        .flat_map(|(key, value)| {
             if key.type_value != 0x1a
                 || !matches!(key.key.len(), 33 | 65)
                 || (keyspend && key.key.len() != 33)
-                || (!keyspend && key.key.len() != 65)
                 || value.is_empty()
                 || value.len() % 33 != 0
             {
-                return None;
+                return Vec::new();
             }
 
-            let aggregate_pubkey = secp256k1::PublicKey::from_slice(&key.key[..33]).ok()?;
+            let participant_set_pubkey = match secp256k1::PublicKey::from_slice(&key.key[..33]).ok()
+            {
+                Some(pubkey) => pubkey,
+                None => return Vec::new(),
+            };
             let leaf_hash = (key.key.len() == 65)
                 .then(|| TapLeafHash::from_slice(&key.key[33..]).ok())
                 .flatten();
-            let participant_pubkeys = value
+            let participant_pubkeys = match value
                 .chunks_exact(33)
                 .map(secp256k1::PublicKey::from_slice)
                 .collect::<Result<Vec<_>, _>>()
-                .ok()?;
+                .ok()
+            {
+                Some(pubkeys) => pubkeys,
+                None => return Vec::new(),
+            };
 
-            participant_pubkeys
-                .iter()
-                .all(|participant_pubkey| {
-                    psbt_in
-                        .tap_key_origins
-                        .get(&participant_pubkey.x_only_public_key().0)
-                        .map(|(_, (fg, der_path))| participant_is_for_path(fg, der_path))
-                        .unwrap_or(false)
-                })
-                .then_some(MatchingSet {
-                    aggregate_pubkey,
-                    leaf_hash,
-                })
+            if !participant_pubkeys.iter().all(|participant_pubkey| {
+                psbt_in
+                    .tap_key_origins
+                    .get(&participant_pubkey.x_only_public_key().0)
+                    .map(|(_, (fg, der_path))| participant_is_for_path(fg, der_path))
+                    .unwrap_or(false)
+            }) {
+                return Vec::new();
+            }
+
+            musig2_matching_sets_for_participant_set(
+                psbt_in,
+                participant_set_pubkey,
+                &participant_pubkeys,
+                leaf_hash,
+                keyspend,
+            )
         })
         .collect::<Vec<_>>();
 
     matching_sets
         .into_iter()
-        .map(|matching_set| {
+        .map(|matching_set: Musig2MatchingSet| {
             let mut signed_pubkeys = HashMap::new();
             for key in psbt_in.unknown.keys() {
                 if key.type_value != 0x1c || !matches!(key.key.len(), 66 | 98) {
@@ -171,11 +329,12 @@ fn musig2_spend_info(
                 else {
                     continue;
                 };
-                let Ok(partial_sig_aggregate) = secp256k1::PublicKey::from_slice(&key.key[33..66])
+                let Ok(partial_sig_pubkey) = secp256k1::PublicKey::from_slice(&key.key[33..66])
                 else {
                     continue;
                 };
-                if partial_sig_aggregate != matching_set.aggregate_pubkey
+                if (partial_sig_pubkey != matching_set.participant_set_pubkey
+                    && partial_sig_pubkey != matching_set.spend_pubkey)
                     || (!keyspend
                         && TapLeafHash::from_slice(&key.key[66..]).ok() != matching_set.leaf_hash)
                 {
@@ -199,9 +358,12 @@ fn musig2_spend_info(
                 }
             } else if let Some(leaf_hash) = matching_set.leaf_hash {
                 if psbt_in.tap_script_sigs.contains_key(&(
-                    matching_set.aggregate_pubkey.x_only_public_key().0,
+                    matching_set.participant_set_pubkey.x_only_public_key().0,
                     leaf_hash,
-                )) {
+                )) || psbt_in
+                    .tap_script_sigs
+                    .contains_key(&(matching_set.spend_pubkey.x_only_public_key().0, leaf_hash))
+                {
                     sigs_count = threshold;
                 }
             }
@@ -2920,19 +3082,11 @@ mod tests {
             .and_then(|path| path.musig())
             .unwrap();
         let aggregate_pubkey = derive_aggregate_pubkey(expr, 0, 7).unwrap();
-        let leaf_hash = *psbt_in
-            .tap_key_origins
-            .get(&aggregate_pubkey.x_only_public_key().0)
-            .and_then(|(leaf_hashes, _)| leaf_hashes.first())
-            .unwrap();
-        let expected_participants = expected_musig_participants(expr, 7);
+        let mut expected_participants = expected_musig_participants(expr, 7);
+        expected_participants.sort();
         let raw_key = raw::Key {
             type_value: 0x1a,
-            key: [
-                aggregate_pubkey.serialize().as_slice(),
-                leaf_hash.as_byte_array(),
-            ]
-            .concat(),
+            key: aggregate_pubkey.serialize().to_vec(),
         };
         let expected_value: Vec<u8> = expected_participants
             .iter()
@@ -2973,11 +3127,7 @@ mod tests {
             .unwrap();
         let raw_key = raw::Key {
             type_value: 0x08,
-            key: [
-                aggregate_pubkey.serialize().as_slice(),
-                leaf_hash.as_byte_array(),
-            ]
-            .concat(),
+            key: aggregate_pubkey.serialize().to_vec(),
         };
         let expected_value: Vec<u8> = participant_pubkeys
             .iter()
@@ -3022,12 +3172,23 @@ mod tests {
             .find(|key| key.type_value == 0x1a)
             .cloned()
             .unwrap();
-        let aggregate_pubkey = secp256k1::PublicKey::from_slice(&participant_set_key.key).unwrap();
+        let aggregate_pubkey =
+            secp256k1::PublicKey::from_slice(&participant_set_key.key[..33]).unwrap();
         let participants = psbt.inputs[0].unknown[&participant_set_key]
             .chunks_exact(33)
             .map(secp256k1::PublicKey::from_slice)
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
+        let matching_set = musig2_matching_sets_for_participant_set(
+            &psbt.inputs[0],
+            aggregate_pubkey,
+            &participants,
+            None,
+            true,
+        )
+        .into_iter()
+        .next()
+        .unwrap();
 
         let first_fg = *psbt.inputs[0]
             .tap_key_origins
@@ -3039,7 +3200,7 @@ mod tests {
                 type_value: 0x1c,
                 key: [
                     participants[0].serialize().as_slice(),
-                    aggregate_pubkey.serialize().as_slice(),
+                    matching_set.spend_pubkey.serialize().as_slice(),
                 ]
                 .concat(),
             },
@@ -3093,17 +3254,27 @@ mod tests {
         let participant_set_key = psbt.inputs[0]
             .unknown
             .keys()
-            .find(|key| key.type_value == 0x1a && key.key.len() == 65)
+            .find(|key| key.type_value == 0x1a)
             .cloned()
             .unwrap();
         let aggregate_pubkey =
             secp256k1::PublicKey::from_slice(&participant_set_key.key[..33]).unwrap();
-        let leaf_hash = TapLeafHash::from_slice(&participant_set_key.key[33..]).unwrap();
         let participants = psbt.inputs[0].unknown[&participant_set_key]
             .chunks_exact(33)
             .map(secp256k1::PublicKey::from_slice)
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
+        let matching_set = musig2_matching_sets_for_participant_set(
+            &psbt.inputs[0],
+            aggregate_pubkey,
+            &participants,
+            None,
+            false,
+        )
+        .into_iter()
+        .next()
+        .unwrap();
+        let leaf_hash = matching_set.leaf_hash.unwrap();
 
         let first_fg = *psbt.inputs[0]
             .tap_key_origins
@@ -3115,7 +3286,7 @@ mod tests {
                 type_value: 0x1c,
                 key: [
                     participants[0].serialize().as_slice(),
-                    aggregate_pubkey.serialize().as_slice(),
+                    matching_set.spend_pubkey.serialize().as_slice(),
                     leaf_hash.as_byte_array(),
                 ]
                 .concat(),
@@ -3134,7 +3305,7 @@ mod tests {
             .unknown
             .retain(|key, _| key.type_value != 0x1c);
         psbt.inputs[0].tap_script_sigs.insert(
-            (aggregate_pubkey.x_only_public_key().0, leaf_hash),
+            (matching_set.spend_pubkey.x_only_public_key().0, leaf_hash),
             dummy_sig,
         );
 
