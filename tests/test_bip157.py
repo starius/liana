@@ -1,9 +1,11 @@
 import pytest
 
 from fixtures import *
+from test_framework.serializations import PSBT
 from test_framework.utils import (
     BITCOIN_BACKEND_TYPE,
     BitcoinBackendType,
+    sign_and_broadcast_psbt,
     wait_for,
 )
 
@@ -99,3 +101,24 @@ def test_bip157_restarts_after_receiving_funds(lianad, bitcoind):
     assert reloaded_coin["outpoint"] == coin["outpoint"]
     assert reloaded_coin["block_height"] == coin["block_height"]
     assert reloaded_coin["amount"] == coin["amount"]
+
+
+def test_bip157_spend_round_trip(lianad, bitcoind):
+    wait_for_wallet_tip(lianad, bitcoind)
+
+    _, coin = receive_coin(lianad, bitcoind)
+    destinations = {bitcoind.rpc.getnewaddress(): coin["amount"] - 11 - 31 - 300}
+    res = lianad.rpc.createspend(destinations, [coin["outpoint"]], 1)
+    spend_txid = sign_and_broadcast_psbt(lianad, PSBT.from_base64(res["psbt"]))
+
+    wait_for(lambda: get_coin(lianad, coin["outpoint"])["spend_info"] is not None)
+    spending_coin = get_coin(lianad, coin["outpoint"])
+    assert spending_coin["spend_info"]["txid"] == spend_txid
+    assert spending_coin["spend_info"]["height"] is None
+
+    bitcoind.generate_block(1, wait_for_mempool=spend_txid)
+    wait_for(
+        lambda: get_coin(lianad, coin["outpoint"])["spend_info"]["height"]
+        == bitcoind.rpc.getblockcount()
+    )
+    wait_for_wallet_tip(lianad, bitcoind)
