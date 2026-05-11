@@ -307,7 +307,8 @@ impl HotSigner {
                     if keypair.x_only_public_key().0 != *int_key {
                         return Err(SignerError::InsanePsbt);
                     }
-                    let keypair = keypair.tap_tweak(secp, psbt_in.tap_merkle_root).to_inner();
+                    let keypair =
+                        secp256k1::Keypair::from(keypair.tap_tweak(secp, psbt_in.tap_merkle_root));
                     let sighash = sighash_cache
                         .taproot_key_spend_signature_hash(input_index, &prevouts, sighash_type)
                         .map_err(|_| SignerError::InsanePsbt)?;
