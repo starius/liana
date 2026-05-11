@@ -207,20 +207,21 @@ impl Bip157 {
                 }
             }
         }
+        let synced_tip = {
+            let mut db_conn = db.connection();
+            db_conn.chain_tip()
+        };
         let bdk_wallet = load_wallet_from_db(
             &db,
             main_descriptor,
             genesis_hash,
             &chain_store,
             snapshot.as_ref(),
+            synced_tip,
             None,
             None,
             &HashMap::new(),
         )?;
-        let synced_tip = {
-            let mut db_conn = db.connection();
-            db_conn.chain_tip()
-        };
         let tip_time = chain_store.tip_time()?;
 
         let chain_state = chain_state_from(&chain_store, snapshot.as_ref(), synced_tip, network)?;
@@ -367,17 +368,28 @@ impl Bip157 {
         change_index: ChildNumber,
     ) -> Result<Option<BlockChainTip>, Bip157Error> {
         let previous_snapshot = load_snapshot(&self.snapshot_path)?;
+        let db_tip = {
+            let mut db_conn = self.db.connection();
+            db_conn.chain_tip()
+        };
         let mut bdk_wallet = load_wallet_from_db(
             &self.db,
             &self.main_descriptor,
             self.genesis_hash,
             &self.chain_store,
             previous_snapshot.as_ref(),
+            self.synced_tip.get(),
             Some(receive_index),
             Some(change_index),
             &self.pending_txs.borrow(),
         )?;
         bdk_wallet.reveal_spks(receive_index, change_index);
+        let needs_wallet_replay = matches!(
+            (db_tip, self.synced_tip.get()),
+            (Some(db_tip), Some(synced_tip))
+                if db_tip.height < synced_tip.height
+                    || (db_tip.height == synced_tip.height && db_tip.hash != synced_tip.hash)
+        );
 
         if self.full_scan.get() {
             clear_pending_events(&mut self.event_rx);
@@ -396,14 +408,26 @@ impl Bip157 {
                 .map_err(|e| Bip157Error::Client(e.to_string()))?,
         ) == self.synced_tip.get()
         {
-            *self.bdk_wallet.borrow_mut() = bdk_wallet;
-            self.tip_time.set(self.chain_store.tip_time()?);
-            self.persist_peer_cache();
-            return Ok(None);
+            if needs_wallet_replay {
+                clear_pending_events(&mut self.event_rx);
+                let replay_from_height = db_tip
+                    .map(|tip| height_u32_from_i32(tip.height))
+                    .unwrap_or(0);
+                self.requester
+                    .rescan_from(replay_from_height)
+                    .map_err(|e| Bip157Error::Client(e.to_string()))?;
+                *self.progress.lock().unwrap() = None;
+            } else {
+                *self.bdk_wallet.borrow_mut() = bdk_wallet;
+                self.tip_time.set(self.chain_store.tip_time()?);
+                self.persist_peer_cache();
+                return Ok(None);
+            }
         }
 
         let mut matched_blocks = Vec::new();
         let mut pending_headers = Vec::new();
+        let mut pending_filter_hashes = BTreeMap::new();
         let mut seen_block_hashes = HashSet::new();
         let mut reorg_common_ancestor: Option<BlockChainTip> = None;
         let mut idle_retries = 0usize;
@@ -448,7 +472,8 @@ impl Bip157 {
                     let height = filter.height();
                     let block_hash = filter.block_hash();
                     let filter_contents = filter.into_contents();
-                    persist_filter_hash(&self.chain_store, height, &filter_contents)?;
+                    pending_filter_hashes
+                        .insert(height, bitcoin::FilterHash::hash(&filter_contents));
                     if matches_wallet && seen_block_hashes.insert(block_hash) {
                         let block = self
                             .runtime
@@ -482,6 +507,7 @@ impl Bip157 {
                 }
                 Event::FiltersSynced(update) => {
                     flush_connected_headers(&self.chain_store, &mut pending_headers)?;
+                    flush_filter_hashes(&self.chain_store, &mut pending_filter_hashes)?;
                     let tip = BlockChainTip {
                         hash: update.tip().hash,
                         height: height_i32_from_u32(update.tip().height),
@@ -742,6 +768,7 @@ fn load_wallet_from_db(
     genesis_hash: BlockHash,
     chain_store: &ChainStore,
     snapshot: Option<&StoredSnapshot>,
+    preferred_tip: Option<BlockChainTip>,
     receive_index: Option<ChildNumber>,
     change_index: Option<ChildNumber>,
     pending_txs: &HashMap<bitcoin::Txid, (bitcoin::Transaction, u64)>,
@@ -787,8 +814,16 @@ fn load_wallet_from_db(
         change_index,
     );
 
-    if let Some(tip) = tip {
-        let headers = wallet_local_chain_headers(chain_store, snapshot, tip, &coins)?;
+    let local_chain_tip = preferred_tip
+        .filter(|preferred_tip| {
+            chain_store.contains_tip(*preferred_tip).unwrap_or(false)
+                && tip
+                    .map(|db_tip| preferred_tip.height >= db_tip.height)
+                    .unwrap_or(true)
+        })
+        .or(tip);
+    if let Some(local_chain_tip) = local_chain_tip {
+        let headers = wallet_local_chain_headers(chain_store, snapshot, local_chain_tip, &coins)?;
         if !headers.is_empty() {
             let local_chain = local_chain_from_headers(genesis_hash, &headers)?;
             bdk_wallet.set_local_chain(local_chain);
@@ -1027,13 +1062,19 @@ fn apply_reorg_to_store(
     Ok(())
 }
 
-fn persist_filter_hash(
+fn flush_filter_hashes(
     chain_store: &ChainStore,
-    height: u32,
-    filter_contents: &[u8],
+    pending_filter_hashes: &mut BTreeMap<u32, bitcoin::FilterHash>,
 ) -> Result<(), Bip157Error> {
-    let filter_hash = bitcoin::FilterHash::hash(filter_contents);
-    chain_store.set_filter_hashes(&[(height, filter_hash)])?;
+    if pending_filter_hashes.is_empty() {
+        return Ok(());
+    }
+    let filter_hashes = pending_filter_hashes
+        .iter()
+        .map(|(height, filter_hash)| (*height, *filter_hash))
+        .collect::<Vec<_>>();
+    chain_store.set_filter_hashes(&filter_hashes)?;
+    pending_filter_hashes.clear();
     Ok(())
 }
 
@@ -1421,6 +1462,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &HashMap::new(),
         )
         .expect("load wallet from db");
@@ -1486,6 +1528,7 @@ mod tests {
             Some(&snapshot),
             None,
             None,
+            None,
             &HashMap::new(),
         )
         .expect("load wallet from db");
@@ -1498,6 +1541,52 @@ mod tests {
             }),
             Some(true)
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_wallet_from_db_prefers_synced_tip_over_rolled_back_db_tip() {
+        let path = temp_path("bip157-wallet-preferred-tip");
+        let chain_store = ChainStore::new(path.clone());
+        let headers = stored_chain(20);
+        chain_store
+            .replace_from(0, &headers)
+            .expect("store chain headers");
+
+        let db_tip_header = headers.get(10).expect("db tip header");
+        let db_tip = BlockChainTip {
+            hash: db_tip_header.header.block_hash(),
+            height: height_i32_from_u32(db_tip_header.height),
+        };
+        let preferred_tip_header = headers.last().expect("preferred tip header");
+        let preferred_tip = BlockChainTip {
+            hash: preferred_tip_header.header.block_hash(),
+            height: height_i32_from_u32(preferred_tip_header.height),
+        };
+
+        let database = DummyDatabase::new();
+        {
+            let mut db_conn = database.connection();
+            db_conn.update_tip(&db_tip);
+        }
+        let db: sync::Arc<sync::Mutex<dyn DatabaseInterface>> =
+            sync::Arc::new(sync::Mutex::new(database));
+        let wallet = load_wallet_from_db(
+            &db,
+            &test_descriptor(),
+            headers[0].header.block_hash(),
+            &chain_store,
+            None,
+            Some(preferred_tip),
+            None,
+            None,
+            &HashMap::new(),
+        )
+        .expect("load wallet from db");
+
+        assert_eq!(wallet.is_in_chain(preferred_tip), Some(true));
+        assert_eq!(wallet.is_in_chain(db_tip), None);
 
         let _ = fs::remove_file(path);
     }
