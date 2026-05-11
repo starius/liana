@@ -3,6 +3,8 @@ import math
 from fixtures import *
 from test_framework.serializations import PSBT, uint256_from_str
 from test_framework.utils import (
+    BITCOIN_BACKEND_TYPE,
+    BitcoinBackendType,
     sign_and_broadcast_psbt,
     wait_for,
     COIN,
@@ -76,6 +78,12 @@ def test_spend_change(lianad, bitcoind):
 
 def test_coin_marked_spent(lianad, bitcoind):
     """Test a spent coin is marked as such under various conditions."""
+    if BITCOIN_BACKEND_TYPE is BitcoinBackendType.Bip157:
+        pytest.skip(
+            "BIP157 does not provide mempool, so this unconfirmed external-"
+            "deposit spend-tracking case is backend-specific."
+        )
+
     DUST = 500
     # Receive a coin in a single transaction
     addr = lianad.rpc.getnewaddress()["address"]
@@ -314,6 +322,12 @@ def test_send_to_self(lianad, bitcoind):
 
 def test_coin_selection(lianad, bitcoind):
     """We can create a spend using coin selection."""
+    if BITCOIN_BACKEND_TYPE is BitcoinBackendType.Bip157:
+        pytest.skip(
+            "BIP157 does not provide mempool, so this unconfirmed external-"
+            "deposit coin-selection case is backend-specific."
+        )
+
     # Send to an (external) address.
     dest_addr_1 = bitcoind.rpc.getnewaddress()
     # Coin selection is not possible if we have no coins.
@@ -547,6 +561,11 @@ def test_sweep(lianad, bitcoind):
     Test we can leverage the change_address parameter to partially or completely sweep
     the wallet's coins.
     """
+    if BITCOIN_BACKEND_TYPE is BitcoinBackendType.Bip157:
+        pytest.skip(
+            "BIP157 does not provide mempool, so this unconfirmed external-"
+            "deposit sweep case is backend-specific."
+        )
 
     # Get a bunch of coins. Don't even confirm them.
     destinations = {

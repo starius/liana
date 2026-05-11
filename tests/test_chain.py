@@ -1,7 +1,8 @@
 import copy
-
 from fixtures import *
 from test_framework.utils import (
+    BITCOIN_BACKEND_TYPE,
+    BitcoinBackendType,
     wait_for,
     wait_for_while_condition_holds,
     get_txid,
@@ -21,37 +22,57 @@ def get_coin(lianad, outpoint_or_txid):
     )
 
 
+def has_coin(lianad, outpoint_or_txid):
+    return any(
+        outpoint_or_txid in coin["outpoint"] for coin in lianad.rpc.listcoins()["coins"]
+    )
+
+
+def using_bip157_backend():
+    return BITCOIN_BACKEND_TYPE is BitcoinBackendType.Bip157
+
+
+def invalidate_remine_reorg(lianad, bitcoind, height):
+    if using_bip157_backend():
+        # Kyoto keeps equal-work alternatives as competing forks until one branch
+        # gains more work, so build a branch that wins by one block.
+        shift = bitcoind.rpc.getblockcount() + 1 - height
+        bitcoind.simple_reorg(height, shift=shift)
+    else:
+        bitcoind.invalidate_remine(height)
+    return bitcoind.rpc.getblockcount()
+
+
+def wait_for_reorg_logs(lianad):
+    regexs = ["Tip was rolled back."]
+    if not using_bip157_backend():
+        regexs.insert(0, "Block chain reorganization detected.")
+    lianad.wait_for_logs(regexs)
+
+
 def test_reorg_detection(lianad, bitcoind):
     """Test we detect block chain reorganization under various conditions."""
     initial_height = bitcoind.rpc.getblockcount()
     wait_for(lambda: lianad.rpc.getinfo()["block_height"] == initial_height)
 
     # Re-mine the last block. We should detect it as a reorg.
-    bitcoind.invalidate_remine(initial_height)
-    lianad.wait_for_logs(
-        ["Block chain reorganization detected.", "Tip was rolled back."]
-    )
-    wait_for(lambda: lianad.rpc.getinfo()["block_height"] == initial_height)
+    current_height = invalidate_remine_reorg(lianad, bitcoind, initial_height)
+    wait_for_reorg_logs(lianad)
+    wait_for(lambda: lianad.rpc.getinfo()["block_height"] == current_height)
 
     # Same if we re-mine the next-to-last block.
-    bitcoind.invalidate_remine(initial_height - 1)
-    lianad.wait_for_logs(
-        ["Block chain reorganization detected.", "Tip was rolled back."]
-    )
-    wait_for(lambda: lianad.rpc.getinfo()["block_height"] == initial_height)
+    current_height = invalidate_remine_reorg(lianad, bitcoind, initial_height - 1)
+    wait_for_reorg_logs(lianad)
+    wait_for(lambda: lianad.rpc.getinfo()["block_height"] == current_height)
 
     # Same if we re-mine a deep block.
-    bitcoind.invalidate_remine(initial_height - 50)
-    lianad.wait_for_logs(
-        ["Block chain reorganization detected.", "Tip was rolled back."]
-    )
-    wait_for(lambda: lianad.rpc.getinfo()["block_height"] == initial_height)
+    current_height = invalidate_remine_reorg(lianad, bitcoind, initial_height - 50)
+    wait_for_reorg_logs(lianad)
+    wait_for(lambda: lianad.rpc.getinfo()["block_height"] == current_height)
 
     # Same if the new chain is longer.
     bitcoind.simple_reorg(initial_height - 10, shift=20)
-    lianad.wait_for_logs(
-        ["Block chain reorganization detected.", "Tip was rolled back."]
-    )
+    wait_for_reorg_logs(lianad)
     wait_for(lambda: lianad.rpc.getinfo()["block_height"] == initial_height + 10)
 
 
@@ -82,19 +103,28 @@ def test_reorg_exclusion(lianad, bitcoind):
     # A confirmed and spent coin
     addr = lianad.rpc.getnewaddress()["address"]
     txid_c = bitcoind.rpc.sendtoaddress(addr, 3)
-    wait_for(lambda: len(lianad.rpc.listcoins()["coins"]) == 3)
+    if using_bip157_backend():
+        # BIP157 does not provide mempool for third-party deposits, so mine the
+        # receive before creating the spend that this test later reorgs out.
+        bitcoind.generate_block(1, wait_for_mempool=txid_c)
+    wait_for(lambda: has_coin(lianad, txid_c))
     # Now refresh this coin while it is unconfirmed.
     res = lianad.rpc.createspend({}, [get_coin(lianad, txid_c)["outpoint"]], 1)
     c_spend_psbt = PSBT.from_base64(res["psbt"])
     txid_d = sign_and_broadcast_psbt(lianad, c_spend_psbt)
-    wait_for(lambda: len(lianad.rpc.listcoins()["coins"]) == 4)
+    wait_for(lambda: has_coin(lianad, txid_d))
     coin_c = get_coin(lianad, txid_c)
     coin_d = get_coin(lianad, txid_d)
     assert coin_c["is_from_self"] is False
-    assert coin_c["block_height"] is None
-    # Even though coin_d is from a self-send, coin_c is still unconfirmed
-    # and is not from self. Therefore, coin_d is not from self either.
-    assert coin_d["is_from_self"] is False
+    if using_bip157_backend():
+        assert coin_c["block_height"] is not None
+        assert coin_d["block_height"] is None
+        assert coin_d["is_from_self"] is True
+    else:
+        assert coin_c["block_height"] is None
+        # Even though coin_d is from a self-send, coin_c is still unconfirmed
+        # and is not from self. Therefore, coin_d is not from self either.
+        assert coin_d["is_from_self"] is False
 
     bitcoind.generate_block(1)
     # Wait for confirmation to be detected.
@@ -113,14 +143,25 @@ def test_reorg_exclusion(lianad, bitcoind):
     # Reorg the chain down to the initial height, excluding all transactions.
     current_height = bitcoind.rpc.getblockcount()
     bitcoind.simple_reorg(initial_height, shift=-1)
-    wait_for(lambda: lianad.rpc.getinfo()["block_height"] == current_height + 1)
+    if using_bip157_backend():
+        wait_for_reorg_logs(lianad)
+        wait_for(lambda: lianad.rpc.getinfo()["block_height"] >= current_height)
+    else:
+        wait_for(lambda: lianad.rpc.getinfo()["block_height"] == current_height + 1)
 
     # During a reorg, bitcoind doesn't update the mempool for blocks too deep (>10 confs).
     # The deposit transactions were dropped. And we discard the unconfirmed coins whose deposit
     # tx isn't part of our mempool anymore: the coins must have been marked as unconfirmed and
     # subsequently discarded.
-    wait_for(lambda: len(bitcoind.rpc.getrawmempool()) == 0)
-    wait_for(lambda: len(lianad.rpc.listcoins()["coins"]) == 0)
+    if using_bip157_backend():
+        wait_for(
+            lambda: all(
+                coin["block_height"] is None for coin in lianad.rpc.listcoins()["coins"]
+            )
+        )
+    else:
+        wait_for(lambda: len(bitcoind.rpc.getrawmempool()) == 0)
+        wait_for(lambda: len(lianad.rpc.listcoins()["coins"]) == 0)
 
     # And if we now confirm everything, they'll be marked as such. The one that was 'spending'
     # will now be spent (its spending transaction will be confirmed) and the one that was spent
@@ -175,7 +216,8 @@ def test_reorg_status_recovery(lianad, bitcoind):
     list_coins = lambda: lianad.rpc.listcoins()["coins"]
 
     # Generate blocks in order to test locktime set correctly.
-    bitcoind.generate_block(200)
+    if not using_bip157_backend():
+        bitcoind.generate_block(200)
     # Create two confirmed coins. Note how we take the initial_height after having
     # mined them, as we'll reorg back to this height and due to anti fee-sniping
     # these deposit transactions might not be valid anymore!
@@ -218,11 +260,20 @@ def test_reorg_status_recovery(lianad, bitcoind):
     new_coin_b = get_coin(lianad, coin_b["outpoint"])
 
     if locktime == initial_height:
-        # Cannot be mined until next block (initial_height + 1).
-        coin_b["spend_info"] = None
-        # coin_c no longer exists.
-        with pytest.raises(StopIteration):
-            get_coin(lianad, coin_c["outpoint"])
+        if using_bip157_backend():
+            # Compact filters keep the locally broadcast spend pending, so the
+            # spent coin remains confirmed while the self-change stays
+            # unconfirmed until another block can include the spend.
+            coin_b["spend_info"]["height"] = None
+            new_coin_c = get_coin(lianad, coin_c["outpoint"])
+            assert new_coin_c["block_height"] is None
+            assert new_coin_c["is_from_self"] is True
+        else:
+            # Cannot be mined until next block (initial_height + 1).
+            coin_b["spend_info"] = None
+            # coin_c no longer exists.
+            with pytest.raises(StopIteration):
+                get_coin(lianad, coin_c["outpoint"])
     else:
         # Otherwise, the tx will be mined at the height the reorg happened.
         coin_b["spend_info"]["height"] = initial_height
@@ -233,6 +284,12 @@ def test_reorg_status_recovery(lianad, bitcoind):
 
 def test_rescan_edge_cases(lianad, bitcoind):
     """Test some specific cases that could arise when rescanning the chain."""
+    if using_bip157_backend():
+        pytest.skip(
+            "BIP157 covers reorg/restart recovery in tests/test_bip157.py; "
+            "this importdescriptors-style rescan race remains backend-specific."
+        )
+
     initial_tip = bitcoind.rpc.getblockheader(bitcoind.rpc.getbestblockhash())
 
     # Some helpers
@@ -325,6 +382,12 @@ def test_rescan_edge_cases(lianad, bitcoind):
 
 def test_deposit_replacement(lianad, bitcoind):
     """Test we discard an unconfirmed deposit that was replaced."""
+    if using_bip157_backend():
+        pytest.skip(
+            "BIP157 does not provide mempool, so this unconfirmed external-"
+            "deposit RBF case is backend-specific."
+        )
+
     # Get some more coins.
     bitcoind.generate_block(1)
 
@@ -413,6 +476,12 @@ def test_rescan_and_recovery(lianad, bitcoind):
 )
 def test_conflicting_unconfirmed_spend_txs(lianad, bitcoind):
     """Test we'll update the spending txid of a coin if a conflicting spend enters our mempool."""
+    if using_bip157_backend():
+        pytest.skip(
+            "BIP157 does not provide mempool, so this unconfirmed external-"
+            "deposit conflict case is backend-specific."
+        )
+
     # Get an (unconfirmed, on purpose) coin to be spent by 2 different txs.
     addr = lianad.rpc.getnewaddress()["address"]
     txid = bitcoind.rpc.sendtoaddress(addr, 0.01)

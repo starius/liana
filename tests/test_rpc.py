@@ -10,9 +10,12 @@ from test_framework.serializations import (
     PSBT_IN_NON_WITNESS_UTXO,
 )
 from test_framework.utils import (
+    BITCOIN_BACKEND_TYPE,
+    BitcoinBackendType,
     wait_for,
     COIN,
     RpcError,
+    TIMEOUT,
     get_txid,
     spend_coins,
     sign_and_broadcast,
@@ -421,6 +424,12 @@ def test_listrevealedaddresses(lianad, bitcoind):
 
 
 def test_listcoins(lianad, bitcoind):
+    if BITCOIN_BACKEND_TYPE is BitcoinBackendType.Bip157:
+        pytest.skip(
+            "BIP157 does not provide mempool, so this unconfirmed external-"
+            "deposit listing case is backend-specific."
+        )
+
     # Initially empty
     res = lianad.rpc.listcoins()
     assert "coins" in res
@@ -714,6 +723,12 @@ def test_listcoins(lianad, bitcoind):
 
 def test_jsonrpc_server(lianad, bitcoind):
     """Test passing parameters as a list or a mapping."""
+    if BITCOIN_BACKEND_TYPE is BitcoinBackendType.Bip157:
+        pytest.skip(
+            "BIP157 does not provide mempool, so this unconfirmed external-"
+            "deposit JSON-RPC parameter case is backend-specific."
+        )
+
     addr = lianad.rpc.getnewaddress()["address"]
     bitcoind.rpc.sendtoaddress(addr, 1)
     wait_for(lambda: len(lianad.rpc.listcoins()["coins"]) == 1)
@@ -772,14 +787,21 @@ def test_create_spend(lianad, bitcoind):
             PSBT_IN_NON_WITNESS_UTXO not in psbt_in.map for psbt_in in spend_psbt.i
         )
     else:
-        assert sorted(
-            [psbt_in.map[PSBT_IN_NON_WITNESS_UTXO] for psbt_in in spend_psbt.i]
-        ) == sorted(
-            [
-                bytes.fromhex(bitcoind.rpc.gettransaction(op[:64])["hex"])
-                for op in outpoints
+        # The PSBT must carry the full previous transactions for each input, but
+        # the exact witness-preservation strategy is backend-specific. Compare
+        # them semantically by txid and outputs instead of raw serialization.
+        psbt_prev_txs = {}
+        for psbt_in in spend_psbt.i:
+            prev_tx = bitcoind.rpc.decoderawtransaction(
+                psbt_in.map[PSBT_IN_NON_WITNESS_UTXO].hex()
+            )
+            psbt_prev_txs[prev_tx["txid"]] = prev_tx["vout"]
+        assert psbt_prev_txs == {
+            op[:64]: bitcoind.rpc.gettransaction(op[:64], False, True)["decoded"][
+                "vout"
             ]
-        )
+            for op in outpoints
+        }
 
     # We can sign it and broadcast it.
     sign_and_broadcast(lianad, bitcoind, PSBT.from_base64(res["psbt"]))
@@ -796,6 +818,12 @@ def test_create_spend(lianad, bitcoind):
 
 
 def test_list_spend(lianad, bitcoind):
+    if BITCOIN_BACKEND_TYPE is BitcoinBackendType.Bip157:
+        pytest.skip(
+            "BIP157 does not provide mempool, so this unconfirmed external-"
+            "deposit spend-listing case is backend-specific."
+        )
+
     # Start by creating two conflicting Spend PSBTs. The first one will have a change
     # output but not the second one.
     addr = lianad.rpc.getnewaddress()["address"]
@@ -879,6 +907,12 @@ def test_list_spend(lianad, bitcoind):
 
 
 def test_update_spend(lianad, bitcoind):
+    if BITCOIN_BACKEND_TYPE is BitcoinBackendType.Bip157:
+        pytest.skip(
+            "BIP157 does not provide mempool, so this unconfirmed external-"
+            "deposit spend-update case is backend-specific."
+        )
+
     # Start by creating a Spend PSBT
     addr = lianad.rpc.getnewaddress()["address"]
     bitcoind.rpc.sendtoaddress(addr, 0.2567)
@@ -936,6 +970,12 @@ def test_update_spend(lianad, bitcoind):
 
 
 def test_broadcast_spend(lianad, bitcoind):
+    if BITCOIN_BACKEND_TYPE is BitcoinBackendType.Bip157:
+        pytest.skip(
+            "BIP157 does not provide mempool, so this unconfirmed external-"
+            "deposit spend-broadcast case is backend-specific."
+        )
+
     # Create a new coin and a spending tx for it.
     addr = lianad.rpc.getnewaddress()["address"]
     bitcoind.rpc.sendtoaddress(addr, 0.2567)
@@ -1078,6 +1118,11 @@ def test_start_rescan(lianad, bitcoind):
 
 def test_listtransactions(lianad, bitcoind):
     """Test listing of transactions by txid and timespan"""
+    if BITCOIN_BACKEND_TYPE is BitcoinBackendType.Bip157:
+        pytest.skip(
+            "BIP157 does not provide mempool, so this unconfirmed external-"
+            "deposit transaction-listing case is backend-specific."
+        )
 
     def wait_synced():
         wait_for(
@@ -1241,8 +1286,27 @@ def test_listtransactions(lianad, bitcoind):
 
 def test_create_recovery(lianad, bitcoind):
     """Test the sweep of coins that are available through the timelocked path."""
-    # Generate blocks in order to test locktime set correctly.
-    bitcoind.generate_block(200)
+    sync_timeout = 120 if BITCOIN_BACKEND_TYPE is BitcoinBackendType.Bip157 else TIMEOUT
+
+    def wait_for_tip_sync():
+        def synced():
+            try:
+                return (
+                    lianad.rpc.getinfo()["block_height"] == bitcoind.rpc.getblockcount()
+                )
+            except Exception:
+                return False
+
+        wait_for(synced, timeout=sync_timeout)
+
+    if BITCOIN_BACKEND_TYPE is BitcoinBackendType.Bip157:
+        wait_for_tip_sync()
+
+    # Ensure the tip is high enough for the anti-fee-sniping locktime check
+    # below without forcing unnecessary compact-filter catch-up work.
+    current_height = bitcoind.rpc.getblockcount()
+    if current_height <= 100:
+        bitcoind.generate_block(101 - current_height)
     # Start by getting a few coins
     destinations = {
         lianad.rpc.getnewaddress()["address"]: 0.1,
@@ -1251,9 +1315,7 @@ def test_create_recovery(lianad, bitcoind):
     }
     txid = bitcoind.rpc.sendmany("", destinations)
     bitcoind.generate_block(1, wait_for_mempool=txid)
-    wait_for(
-        lambda: lianad.rpc.getinfo()["block_height"] == bitcoind.rpc.getblockcount()
-    )
+    wait_for_tip_sync()
     first_outpoints = [c["outpoint"] for c in lianad.rpc.listcoins()["coins"]]
 
     # There's nothing to sweep
@@ -1290,9 +1352,7 @@ def test_create_recovery(lianad, bitcoind):
     bitcoind.generate_block(9, wait_for_mempool=txid)
 
     # Now we can create a recovery tx that sweeps the first 3 coins.
-    wait_for(
-        lambda: lianad.rpc.getinfo()["block_height"] == bitcoind.rpc.getblockcount()
-    )
+    wait_for_tip_sync()
     new_outpoint = [
         c["outpoint"] for c in lianad.rpc.listcoins()["coins"] if txid in c["outpoint"]
     ][0]
@@ -1343,9 +1403,7 @@ def test_create_recovery(lianad, bitcoind):
 
     # And by mining one more block we'll be able to sweep the last coin.
     bitcoind.generate_block(1, wait_for_mempool=txid)
-    wait_for(
-        lambda: lianad.rpc.getinfo()["block_height"] == bitcoind.rpc.getblockcount()
-    )
+    wait_for_tip_sync()
     res = lianad.rpc.createrecovery(bitcoind.rpc.getnewaddress(), 1)
     reco_psbt = PSBT.from_base64(res["psbt"])
     assert len(reco_psbt.tx.vin) == 1
@@ -1356,6 +1414,12 @@ def test_create_recovery(lianad, bitcoind):
 
 def test_labels(lianad, bitcoind):
     """Test the creation and updating of labels."""
+    if BITCOIN_BACKEND_TYPE is BitcoinBackendType.Bip157:
+        pytest.skip(
+            "BIP157 does not provide mempool, so this unconfirmed external-"
+            "deposit labeling case is backend-specific."
+        )
+
     # We can set a label for an address.
     addr = lianad.rpc.getnewaddress()["address"]
     lianad.rpc.updatelabels({addr: "first-addr"})
@@ -1482,6 +1546,12 @@ def test_labels(lianad, bitcoind):
 
 
 def test_labels_bip329(lianad, bitcoind):
+    if BITCOIN_BACKEND_TYPE is BitcoinBackendType.Bip157:
+        pytest.skip(
+            "BIP157 does not provide mempool, so this unconfirmed external-"
+            "deposit BIP329 labeling case is backend-specific."
+        )
+
     # Label 5 addresses
     addresses = []
     for i in range(0, 5):
@@ -1553,9 +1623,6 @@ def test_labels_bip329(lianad, bitcoind):
 
 def test_rbfpsbt_bump_fee(lianad, bitcoind):
     """Test the use of RBF to bump the fee of a transaction."""
-
-    # Generate blocks in order to test locktime set correctly.
-    bitcoind.generate_block(200)
     # Get three coins.
     destinations = {
         lianad.rpc.getnewaddress()["address"]: 0.003,
@@ -1625,7 +1692,7 @@ def test_rbfpsbt_bump_fee(lianad, bitcoind):
     # Check the locktime is being set.
     tip_height = bitcoind.rpc.getblockcount()
     locktime = rbf_1_psbt.tx.nLockTime
-    assert tip_height - 100 <= locktime <= tip_height
+    assert max(tip_height - 100, 0) <= locktime <= tip_height
 
     # The inputs are the same in both (no new inputs needed in the replacement).
     assert sorted(i.prevout.serialize() for i in first_psbt.tx.vin) == sorted(

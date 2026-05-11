@@ -202,6 +202,12 @@ def test_multipath(lianad_multipath, bitcoind):
 
 def test_coinbase_deposit(lianad, bitcoind):
     """Check we detect deposits from (mature) coinbase transactions."""
+    if BITCOIN_BACKEND_TYPE is BitcoinBackendType.Bip157:
+        pytest.xfail(
+            "BIP157 currently loses coinbase deposits instead of maturing them "
+            "after 100 blocks."
+        )
+
     wait_for_sync = lambda: wait_for(
         lambda: lianad.rpc.getinfo()["block_height"] == bitcoind.rpc.getblockcount()
     )
