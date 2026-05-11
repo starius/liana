@@ -52,6 +52,23 @@ From the root of the repository:
 pytest tests/
 ```
 
+The backend used by the blackbox fixtures can be selected with
+`BITCOIN_BACKEND_TYPE`.
+The current values are:
+
+- `bitcoind`
+- `electrs`
+- `bip157`
+
+For the compact-filters coverage specifically:
+
+```
+BITCOIND_PATH=/path/to/bitcoind BITCOIN_BACKEND_TYPE=bip157 pytest tests/test_bip157.py
+```
+
+The regtest harness will configure `bitcoind` with `blockfilterindex=1` and
+`peerblockfilters=1` automatically for this mode.
+
 For running the tests under Taproot a `bitcoind` version 26.0 or superior must be used. It can be
 pointed to using the `BITCOIND_PATH` variable. For now, one must also compile the `taproot_signer`
 Rust program:
