@@ -72,6 +72,25 @@ drawback: you have to wait for Bitcoin Core to download and validate the histori
 fear not! This is just a one time cost. Also, the full node is pruned so it will not use more than
 20GB of disk space.
 
+#### Taproot and MuSig2 policies
+
+When creating a Taproot wallet in the installer, each Taproot path can either remain a regular
+script path or use MuSig2.
+
+There are two supported MuSig2 derivation modes:
+- Derive then aggregate
+- Aggregate then derive (BIP 328)
+
+The selected MuSig2 mode applies wallet-wide. Once chosen, any eligible Taproot path can opt into
+MuSig2 individually. A path is eligible when it is an `N-of-N` path with at least two keys.
+
+In the GUI:
+- Choose `Taproot` as the descriptor type
+- Choose the wallet-wide `MuSig2 mode`
+- For each eligible immediate or recovery path, choose `MuSig2` as the Taproot spend kind
+
+If a path does not meet the eligibility rules it remains a regular Taproot script path.
+
 #### Using the daemon
 
 Liana can be run as a headless server using the `lianad` program.
