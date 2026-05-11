@@ -137,7 +137,16 @@ class Bitcoind(BitcoinBackend):
             self.generate_block(numblocks)
 
     def wait_for_blockfilter_index(self):
-        wait_for(lambda: self.node_rpc.getindexinfo()["blockfilterindex"]["synced"])
+        def blockfilter_synced():
+            indexes = self.node_rpc.getindexinfo()
+            blockfilter = indexes.get("blockfilterindex")
+            if blockfilter is None:
+                # Newer Bitcoin Core versions expose the basic filter index
+                # under its human-readable name instead.
+                blockfilter = indexes.get("basic block filter index")
+            return blockfilter is not None and blockfilter["synced"]
+
+        wait_for(blockfilter_synced)
 
     def generate_blocks_censor(self, n, txids):
         """Generate {n} blocks ignoring {txids}"""

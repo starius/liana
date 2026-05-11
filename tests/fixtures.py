@@ -2,6 +2,7 @@ from bip32 import BIP32
 from bip32.utils import _pubkey_to_fingerprint
 from bip380.descriptors import Descriptor
 from concurrent import futures
+from test_framework.bip157 import Bip157
 from test_framework.bitcoind import Bitcoind
 from test_framework.electrs import Electrs
 from test_framework.lianad import Lianad
@@ -137,6 +138,11 @@ def bitcoin_backend(directory, bitcoind):
         electrs.startup()
         yield electrs
         electrs.cleanup()
+    elif BITCOIN_BACKEND_TYPE is BitcoinBackendType.Bip157:
+        bip157 = Bip157(bitcoind)
+        bip157.startup()
+        yield bip157
+        bip157.cleanup()
     else:
         raise NotImplementedError
 

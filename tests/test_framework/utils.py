@@ -27,6 +27,7 @@ LIANAD_PATH = os.getenv("LIANAD_PATH", DEFAULT_MS_PATH)
 class BitcoinBackendType(str, enum.Enum):
     Bitcoind = "bitcoind"
     Electrs = "electrs"
+    Bip157 = "bip157"
 
 
 DEFAULT_BITCOIN_BACKEND_TYPE = "bitcoind"
