@@ -55,6 +55,25 @@ def restart_and_wait_for_sync(lianad, bitcoind, timeout=60):
     wait_for_wallet_tip(lianad, bitcoind, timeout=timeout)
 
 
+def mine_wallet_coin_deeply(lianad, bitcoind, extra_blocks=12):
+    txid, coin = receive_coin(lianad, bitcoind)
+    bitcoind.generate_block(extra_blocks)
+    wait_for_wallet_tip(lianad, bitcoind)
+    return txid, coin
+
+
+def tight_reorg(bitcoind, height, shift):
+    current_height = bitcoind.rpc.getblockcount()
+    final_height = max(current_height + 1, height + shift)
+
+    bitcoind.rpc.invalidateblock(bitcoind.rpc.getblockhash(height))
+    mempool = bitcoind.rpc.getrawmempool()
+    bitcoind.generate_empty_blocks(shift)
+    bitcoind.generate_block(1 + final_height - (height + shift), mempool)
+
+    return final_height
+
+
 def test_bip157_syncs_to_tip(lianad, bitcoind):
     wait_for_wallet_tip(lianad, bitcoind)
 
@@ -122,3 +141,47 @@ def test_bip157_spend_round_trip(lianad, bitcoind):
         == bitcoind.rpc.getblockcount()
     )
     wait_for_wallet_tip(lianad, bitcoind)
+
+
+def test_bip157_recovers_from_deep_reorg(lianad, bitcoind):
+    wait_for_wallet_tip(lianad, bitcoind)
+
+    txid, coin = mine_wallet_coin_deeply(lianad, bitcoind)
+    bitcoind.simple_reorg(coin["block_height"], shift=16)
+
+    wait_for_wallet_tip(lianad, bitcoind, timeout=120)
+
+    reorged_coin = get_coin(lianad, txid)
+    assert reorged_coin["outpoint"] == coin["outpoint"]
+
+    _, follow_up_coin = receive_coin(lianad, bitcoind, amount_btc=2)
+    assert follow_up_coin["block_height"] == bitcoind.rpc.getblockcount()
+
+
+def test_bip157_restarts_after_deep_reorg(lianad, bitcoind):
+    wait_for_wallet_tip(lianad, bitcoind)
+
+    txid, coin = mine_wallet_coin_deeply(lianad, bitcoind)
+    bitcoind.simple_reorg(coin["block_height"], shift=16)
+    wait_for_wallet_tip(lianad, bitcoind, timeout=120)
+
+    restart_and_wait_for_sync(lianad, bitcoind, timeout=120)
+
+    reloaded_coin = get_coin(lianad, txid)
+    assert reloaded_coin["outpoint"] == coin["outpoint"]
+
+    _, follow_up_coin = receive_coin(lianad, bitcoind, amount_btc=2)
+    assert follow_up_coin["block_height"] == bitcoind.rpc.getblockcount()
+
+
+def test_bip157_recovers_from_tight_deep_reorg(lianad, bitcoind):
+    wait_for_wallet_tip(lianad, bitcoind)
+
+    txid, coin = mine_wallet_coin_deeply(lianad, bitcoind)
+    new_height = tight_reorg(bitcoind, coin["block_height"], shift=16)
+
+    wait_for(lambda: lianad.rpc.getinfo()["block_height"] == new_height, timeout=120)
+    wait_for(lambda: lianad.rpc.getinfo()["sync"] == 1.0, timeout=120)
+
+    reorged_coin = get_coin(lianad, txid)
+    assert reorged_coin["outpoint"] == coin["outpoint"]
