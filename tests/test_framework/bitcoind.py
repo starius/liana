@@ -71,6 +71,8 @@ class Bitcoind(BitcoinBackend):
             "bind": f"127.0.0.1:{self.p2pport}",
             "rpcport": rpcport,
             "fallbackfee": Decimal(1000) / COIN,
+            "blockfilterindex": 1,
+            "peerblockfilters": 1,
             "rpcthreads": 32,
             # bitcoind uses mocktime in some tests, which can lead to peers (e.g. electrs)
             # being disconnected. To prevent this, we set `peertimeout` greater than
@@ -133,6 +135,9 @@ class Bitcoind(BitcoinBackend):
         numblocks = amount_btc // 25 + 1
         while self.rpc.getbalance() < amount_btc:
             self.generate_block(numblocks)
+
+    def wait_for_blockfilter_index(self):
+        wait_for(lambda: self.node_rpc.getindexinfo()["blockfilterindex"]["synced"])
 
     def generate_blocks_censor(self, n, txids):
         """Generate {n} blocks ignoring {txids}"""
