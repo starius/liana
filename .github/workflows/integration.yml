@@ -30,6 +30,8 @@ jobs:
             BITCOIN_BACKEND_TYPE: 'electrs'
           - USE_TAPROOT: 1
             BITCOIN_BACKEND_TYPE: 'electrs'
+          - USE_TAPROOT: 0
+            BITCOIN_BACKEND_TYPE: 'bip157'
 
     env:
       EXECUTOR_WORKERS: 3
@@ -58,7 +60,7 @@ jobs:
           pip install --break-system-packages -r tests/requirements.txt
 
       - name: Add local bin to PATH
-        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
