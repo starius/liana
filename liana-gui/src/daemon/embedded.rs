@@ -40,6 +40,16 @@ impl EmbeddedDaemon {
             None => Err(DaemonError::DaemonStopped),
         }
     }
+
+    async fn stop_handle(handle: DaemonHandle) -> Result<(), DaemonError> {
+        tokio::task::spawn_blocking(move || {
+            handle
+                .stop()
+                .map_err(|e| DaemonError::Unexpected(e.to_string()))
+        })
+        .await
+        .map_err(|e| DaemonError::Unexpected(format!("Stopping embedded daemon task: {e}")))?
+    }
 }
 
 impl<T> From<std::sync::PoisonError<T>> for DaemonError {
@@ -74,25 +84,31 @@ impl Daemon for EmbeddedDaemon {
         _datadir: &LianaDirectory,
         _network: Network,
     ) -> Result<(), DaemonError> {
-        let mut handle = self.handle.lock().await;
-        if let Some(h) = handle.as_ref() {
-            if h.is_alive() {
-                return Ok(());
+        let handle_to_stop = {
+            let mut handle = self.handle.lock().await;
+            if let Some(h) = handle.as_ref() {
+                if h.is_alive() {
+                    return Ok(());
+                }
             }
-        }
-        // if the daemon poller is not alive, we try to terminate it to fetch the error.
-        if let Some(h) = handle.take() {
-            h.stop()
-                .map_err(|e| DaemonError::Unexpected(e.to_string()))?;
+            // If the daemon poller is not alive, we try to terminate it to fetch the error.
+            handle.take()
+        };
+
+        if let Some(h) = handle_to_stop {
+            Self::stop_handle(h).await?;
         }
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), DaemonError> {
-        let mut handle = self.handle.lock().await;
-        if let Some(h) = handle.take() {
-            h.stop()
-                .map_err(|e| DaemonError::Unexpected(e.to_string()))?;
+        let handle_to_stop = {
+            let mut handle = self.handle.lock().await;
+            handle.take()
+        };
+
+        if let Some(h) = handle_to_stop {
+            Self::stop_handle(h).await?;
         }
         Ok(())
     }
