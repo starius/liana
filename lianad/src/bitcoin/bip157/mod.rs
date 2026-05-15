@@ -53,6 +53,7 @@ const SYNC_IDLE_RETRY_LIMIT: usize = 4;
 const SYNC_NODE_RESTART_LIMIT: usize = 3;
 const BOOTSTRAP_PEER_RETRY_FANOUT: usize = 4;
 const SYNC_STEP_BUDGET: Duration = Duration::from_secs(1);
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub enum Bip157Error {
@@ -156,7 +157,7 @@ pub struct Bip157 {
     bdk_wallet: RefCell<BdkWallet>,
     main_descriptor: LianaDescriptor,
     db: sync::Arc<sync::Mutex<dyn DatabaseInterface>>,
-    runtime: bip157::tokio::runtime::Runtime,
+    runtime: Option<bip157::tokio::runtime::Runtime>,
     shared_storage: sync::Arc<SharedStorage>,
     node_data_dir: PathBuf,
     bootstrap_peers: Vec<TrustedPeer>,
@@ -245,13 +246,15 @@ impl Bip157 {
             for cached_peer in peer_cache::load(&shared_storage.peer_cache_path)
                 .map_err(|e| Bip157Error::Io(e.to_string()))?
             {
-                if !bootstrap_peers.contains(&cached_peer.address)
-                    && !cached_bootstrap_peers
+                if !cached_peer_supports_compact_filters(&cached_peer)
+                    || bootstrap_peers.contains(&cached_peer.address)
+                    || cached_bootstrap_peers
                         .iter()
                         .any(|peer: &peer_cache::CachedPeer| peer.address == cached_peer.address)
                 {
-                    cached_bootstrap_peers.push(cached_peer);
+                    continue;
                 }
+                cached_bootstrap_peers.push(cached_peer);
             }
         }
         let db_tip = {
@@ -325,7 +328,7 @@ impl Bip157 {
             bdk_wallet: RefCell::new(bdk_wallet),
             main_descriptor: main_descriptor.clone(),
             db,
-            runtime,
+            runtime: Some(runtime),
             shared_storage,
             node_data_dir,
             bootstrap_peers,
@@ -595,7 +598,7 @@ impl Bip157 {
                 self.scan_request_inflight.set(true);
             }
         } else if Some(
-            self.runtime
+            self.runtime()
                 .block_on(self.requester.chain_tip())
                 .map(|checkpoint| BlockChainTip {
                     hash: checkpoint.hash,
@@ -625,7 +628,7 @@ impl Bip157 {
                 }
             }
             let event = {
-                let runtime = &self.runtime;
+                let runtime = self.runtime().handle().clone();
                 let event_rx = &mut self.event_rx;
                 let wait_for = stop_after
                     .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
@@ -656,18 +659,35 @@ impl Bip157 {
                         return Ok(None);
                     }
                     idle_retries = idle_retries.saturating_add(1);
-                    let added = queue_retryable_peers(&self.requester, &self.bootstrap_peers, 1)?;
-                    log::warn!(
-                        "BIP157 sync stalled for {:?}; re-queued {} configured peer(s) ({}/{})",
-                        SYNC_EVENT_TIMEOUT,
-                        added,
-                        idle_retries,
-                        SYNC_IDLE_RETRY_LIMIT
-                    );
+                    let requeued = if self.whitelist_only {
+                        let added =
+                            queue_retryable_peers(&self.requester, &self.bootstrap_peers, 1)?;
+                        log::warn!(
+                            "BIP157 sync stalled for {:?}; re-queued {} configured peer(s) ({}/{})",
+                            SYNC_EVENT_TIMEOUT,
+                            added,
+                            idle_retries,
+                            SYNC_IDLE_RETRY_LIMIT
+                        );
+                        true
+                    } else {
+                        log::warn!(
+                            "BIP157 sync stalled for {:?}; waiting for peer discovery to recover ({}/{})",
+                            SYNC_EVENT_TIMEOUT,
+                            idle_retries,
+                            SYNC_IDLE_RETRY_LIMIT
+                        );
+                        false
+                    };
                     if idle_retries >= SYNC_IDLE_RETRY_LIMIT {
                         return Err(Bip157Error::Client(format!(
-                            "timed out waiting for BIP157 sync progress after {} retries",
-                            idle_retries
+                            "timed out waiting for BIP157 sync progress after {} retries{}",
+                            idle_retries,
+                            if requeued {
+                                " while retrying configured peers"
+                            } else {
+                                " while relying on peer discovery"
+                            }
                         )));
                     }
                     continue;
@@ -696,7 +716,7 @@ impl Bip157 {
                     if matches_wallet && self.sync_seen_block_hashes.borrow_mut().insert(block_hash)
                     {
                         let block = self
-                            .runtime
+                            .runtime()
                             .block_on(self.requester.get_block(block_hash))
                             .map_err(fetch_block_error)?;
                         self.sync_matched_blocks.borrow_mut().push(block);
@@ -850,7 +870,7 @@ impl Bip157 {
             self.network,
         )?;
         let (requester, event_rx) = spawn_node(
-            &self.runtime,
+            self.runtime(),
             self.progress.clone(),
             self.network,
             &self.node_data_dir,
@@ -874,7 +894,7 @@ impl Bip157 {
 
     pub fn broadcast_tx(&self, tx: &bitcoin::Transaction) -> Result<(), Bip157Error> {
         let _ = self
-            .runtime
+            .runtime()
             .block_on(self.requester.submit_package(tx.clone()))
             .map_err(|e| Bip157Error::Client(e.to_string()))?;
 
@@ -1039,17 +1059,23 @@ impl Bip157 {
     }
 
     fn connected_peer_count(&self) -> Result<usize, Bip157Error> {
-        self.runtime
+        self.runtime()
             .block_on(self.requester.peer_info())
             .map(|peers| peers.len())
             .map_err(|e| Bip157Error::Client(e.to_string()))
+    }
+
+    fn runtime(&self) -> &bip157::tokio::runtime::Runtime {
+        self.runtime
+            .as_ref()
+            .expect("BIP157 runtime is only taken during drop")
     }
 
     fn persist_peer_cache(&self) {
         if !self.peer_cache_enabled {
             return;
         }
-        let peer_info = match self.runtime.block_on(self.requester.peer_info()) {
+        let peer_info = match self.runtime().block_on(self.requester.peer_info()) {
             Ok(peer_info) => peer_info,
             Err(error) => {
                 log::debug!("Failed to query BIP157 peers for cache persistence: {error}");
@@ -1101,6 +1127,9 @@ fn format_bip157_sync_status(
 impl Drop for Bip157 {
     fn drop(&mut self) {
         self.shutdown();
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+        }
     }
 }
 
@@ -1209,6 +1238,12 @@ fn parse_cached_peer(
     let mut trusted_peer = parse_peer(network, &peer.address)?;
     trusted_peer.set_services(bitcoin::p2p::ServiceFlags::from(peer.known_services));
     Ok(trusted_peer)
+}
+
+fn cached_peer_supports_compact_filters(peer: &peer_cache::CachedPeer) -> bool {
+    let services = bitcoin::p2p::ServiceFlags::from(peer.known_services);
+    services.has(bitcoin::p2p::ServiceFlags::COMPACT_FILTERS)
+        && services.has(bitcoin::p2p::ServiceFlags::NETWORK)
 }
 
 fn default_port(network: bitcoin::Network) -> u16 {
@@ -1797,6 +1832,23 @@ mod tests {
             shared_first.snapshot_path,
             PathBuf::from("/tmp/liana/bitcoin/bip157/snapshot.json")
         );
+    }
+
+    #[test]
+    fn cached_peer_must_advertise_compact_filters_and_network() {
+        let usable = peer_cache::CachedPeer {
+            address: "1.1.1.1".to_owned(),
+            known_services: (bitcoin::p2p::ServiceFlags::COMPACT_FILTERS
+                | bitcoin::p2p::ServiceFlags::NETWORK)
+                .to_u64(),
+        };
+        let legacy = peer_cache::CachedPeer {
+            address: "2.2.2.2".to_owned(),
+            known_services: bitcoin::p2p::ServiceFlags::NONE.to_u64(),
+        };
+
+        assert!(cached_peer_supports_compact_filters(&usable));
+        assert!(!cached_peer_supports_compact_filters(&legacy));
     }
 
     #[test]
