@@ -398,6 +398,21 @@ pub fn sync_poll_interval() -> time::Duration {
     time::Duration::from_secs(0)
 }
 
+pub fn sync_step(
+    bit: &mut sync::Arc<sync::Mutex<dyn BitcoinInterface>>,
+    db: &sync::Arc<sync::Mutex<dyn DatabaseInterface>>,
+) {
+    let mut db_conn = db.connection();
+    let (receive_index, change_index) = (db_conn.receive_index(), db_conn.change_index());
+    if let Err(e) = bit.sync_step(receive_index, change_index) {
+        if bit.is_shutting_down() {
+            log::info!("Bitcoin backend is shutting down. Stopping incremental sync.");
+            return;
+        }
+        log::error!("Error driving incremental wallet sync: '{}'.", e);
+    }
+}
+
 /// Update our state from the Bitcoin backend.
 pub fn poll(
     bit: &mut sync::Arc<sync::Mutex<dyn BitcoinInterface>>,

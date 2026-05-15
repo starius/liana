@@ -79,6 +79,16 @@ pub trait BitcoinInterface: Send {
         change_index: ChildNumber,
     ) -> Result<Option<BlockChainTip>, String>;
 
+    /// Drive any in-progress synchronization work without requiring the backend to finish a full
+    /// sync pass before returning.
+    fn sync_step(
+        &mut self,
+        _receive_index: ChildNumber,
+        _change_index: ChildNumber,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Get coins received since the specified tip.
     fn received_coins(
         &self,
@@ -616,6 +626,14 @@ impl BitcoinInterface for bip157::Bip157 {
         bip157::Bip157::sync_wallet(self, receive_index, change_index).map_err(|e| e.to_string())
     }
 
+    fn sync_step(
+        &mut self,
+        receive_index: ChildNumber,
+        change_index: ChildNumber,
+    ) -> Result<(), String> {
+        bip157::Bip157::sync_step(self, receive_index, change_index).map_err(|e| e.to_string())
+    }
+
     fn received_coins(
         &self,
         tip: &BlockChainTip,
@@ -821,6 +839,14 @@ impl BitcoinInterface for sync::Arc<sync::Mutex<dyn BitcoinInterface + 'static>>
         self.lock()
             .unwrap()
             .sync_wallet(receive_index, change_index)
+    }
+
+    fn sync_step(
+        &mut self,
+        receive_index: ChildNumber,
+        change_index: ChildNumber,
+    ) -> Result<(), String> {
+        self.lock().unwrap().sync_step(receive_index, change_index)
     }
 
     fn received_coins(

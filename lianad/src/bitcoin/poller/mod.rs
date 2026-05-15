@@ -68,10 +68,12 @@ impl Poller {
             // How long to wait before the next poll.
             let time_before_poll = if let Some(last_poll) = last_poll {
                 let time_since_poll = time::Instant::now().duration_since(last_poll);
-                // Until we are synced we poll less often to avoid harassing bitcoind and impeding
-                // the sync. As a function since it's mocked for the tests.
+                // Until we are synced we usually poll less often to avoid harassing the backend.
+                // Backends that need incremental sync draining should still be revisited quickly.
                 let poll_interval = if synced {
                     poll_interval
+                } else if self.bit.poll_while_syncing() {
+                    time::Duration::from_secs(1)
                 } else {
                     looper::sync_poll_interval()
                 };
@@ -137,7 +139,10 @@ impl Poller {
                     progress.headers
                 );
                 synced = progress.is_complete();
-                if !synced && !self.bit.poll_while_syncing() {
+                if !synced {
+                    if self.bit.poll_while_syncing() {
+                        looper::sync_step(&mut self.bit, &self.db);
+                    }
                     continue;
                 }
             }

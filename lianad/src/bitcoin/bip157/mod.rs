@@ -20,7 +20,8 @@ use bdk_electrum::bdk_chain::{
 use bip157::{
     chain::{BlockHeaderChanges, ChainState, IndexedHeader},
     error::FetchBlockError,
-    Client, Event, HeaderCheckpoint, IndexedFilterCommitment, Requester, Socks5Proxy, TrustedPeer,
+    Client, Event, HeaderCheckpoint, IndexedBlock, IndexedFilterCommitment, Requester, Socks5Proxy,
+    TrustedPeer,
 };
 use liana::descriptors::LianaDescriptor;
 use miniscript::bitcoin::{
@@ -51,6 +52,7 @@ const SYNC_EVENT_TIMEOUT: Duration = Duration::from_secs(35);
 const SYNC_IDLE_RETRY_LIMIT: usize = 4;
 const SYNC_NODE_RESTART_LIMIT: usize = 3;
 const BOOTSTRAP_PEER_RETRY_FANOUT: usize = 4;
+const SYNC_STEP_BUDGET: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub enum Bip157Error {
@@ -170,7 +172,12 @@ pub struct Bip157 {
     pending_txs: RefCell<HashMap<bitcoin::Txid, (bitcoin::Transaction, u64)>>,
     full_scan: Cell<bool>,
     rescan_from_height: Cell<Option<u32>>,
+    scan_request_inflight: Cell<bool>,
     assumed_checked_to: Cell<Option<u32>>,
+    sync_matched_blocks: RefCell<Vec<IndexedBlock>>,
+    sync_seen_block_hashes: RefCell<HashSet<BlockHash>>,
+    sync_pending_checked_heights: RefCell<BTreeSet<u32>>,
+    sync_reorg_common_ancestor: Cell<Option<BlockChainTip>>,
     shutdown_requested: Cell<bool>,
     progress: sync::Arc<sync::Mutex<Option<bip157::Progress>>>,
     genesis_hash: BlockHash,
@@ -216,10 +223,16 @@ impl Bip157 {
                 }
             }
         }
-        let synced_tip = {
+        let db_tip = {
             let mut db_conn = db.connection();
             db_conn.chain_tip()
         };
+        let snapshot_tip = snapshot
+            .as_ref()
+            .map(StoredSnapshot::tip)
+            .transpose()?
+            .flatten();
+        let synced_tip = db_tip.filter(|tip| snapshot_tip == Some(*tip));
         let bdk_wallet = load_wallet_from_db(
             &db,
             main_descriptor,
@@ -291,7 +304,12 @@ impl Bip157 {
             pending_txs: RefCell::new(HashMap::new()),
             full_scan: Cell::new(full_scan),
             rescan_from_height: Cell::new(None),
+            scan_request_inflight: Cell::new(false),
             assumed_checked_to: Cell::new(assumed_checked_to),
+            sync_matched_blocks: RefCell::new(Vec::new()),
+            sync_seen_block_hashes: RefCell::new(HashSet::new()),
+            sync_pending_checked_heights: RefCell::new(BTreeSet::new()),
+            sync_reorg_common_ancestor: Cell::new(None),
             shutdown_requested: Cell::new(false),
             progress,
             genesis_hash,
@@ -344,6 +362,7 @@ impl Bip157 {
     pub fn trigger_rescan_from(&mut self, height: u32) {
         self.full_scan.set(true);
         self.rescan_from_height.set(Some(height));
+        self.scan_request_inflight.set(false);
     }
 
     pub fn should_poll_while_syncing(&self) -> bool {
@@ -359,6 +378,70 @@ impl Bip157 {
         self.shutdown_requested.get()
     }
 
+    fn reset_transient_sync_state(&self) {
+        self.sync_matched_blocks.borrow_mut().clear();
+        self.sync_seen_block_hashes.borrow_mut().clear();
+        self.sync_pending_checked_heights.borrow_mut().clear();
+        self.sync_reorg_common_ancestor.set(None);
+    }
+
+    fn maybe_advance_assumed_filter_height(
+        &self,
+        wallet_timestamp: u32,
+        header_height: u32,
+        header_time: u32,
+        pending_headers: &mut Vec<IndexedHeader>,
+    ) -> Result<(), Bip157Error> {
+        if self.full_scan.get() {
+            return Ok(());
+        }
+
+        let desired_height = if header_time < wallet_timestamp {
+            if !pending_headers.is_empty() {
+                return Ok(());
+            }
+            Some(header_height)
+        } else {
+            flush_connected_headers(&self.chain_store, pending_headers)?;
+            self.chain_store
+                .block_before_date(wallet_timestamp)?
+                .map(|tip| height_u32_from_i32(tip.height))
+        };
+
+        let Some(desired_height) = desired_height else {
+            return Ok(());
+        };
+
+        if self
+            .assumed_checked_to
+            .get()
+            .map(|current| desired_height <= current)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        self.requester
+            .assume_filters_checked_to(desired_height)
+            .map_err(|e| Bip157Error::Client(e.to_string()))?;
+        self.assumed_checked_to.set(Some(desired_height));
+        self.chain_store
+            .mark_filters_checked_through(desired_height)?;
+
+        Ok(())
+    }
+
+    fn flush_sync_progress(
+        &self,
+        pending_headers: &mut Vec<IndexedHeader>,
+        pending_filter_hashes: &mut BTreeMap<u32, bitcoin::FilterHash>,
+    ) -> Result<(), Bip157Error> {
+        flush_connected_headers(&self.chain_store, pending_headers)?;
+        flush_filter_hashes(&self.chain_store, pending_filter_hashes)?;
+        self.tip_time.set(self.chain_store.tip_time()?);
+        Ok(())
+    }
+
     pub fn block_before_date(&self, timestamp: u32) -> Option<BlockChainTip> {
         self.chain_store
             .block_before_date(timestamp)
@@ -372,11 +455,33 @@ impl Bip157 {
         receive_index: ChildNumber,
         change_index: ChildNumber,
     ) -> Result<Option<BlockChainTip>, Bip157Error> {
+        self.drive_sync(receive_index, change_index, None)
+    }
+
+    pub fn sync_step(
+        &mut self,
+        receive_index: ChildNumber,
+        change_index: ChildNumber,
+    ) -> Result<(), Bip157Error> {
+        let _ = self.drive_sync(
+            receive_index,
+            change_index,
+            Some(std::time::Instant::now() + SYNC_STEP_BUDGET),
+        )?;
+        Ok(())
+    }
+
+    fn drive_sync(
+        &mut self,
+        receive_index: ChildNumber,
+        change_index: ChildNumber,
+        stop_after: Option<std::time::Instant>,
+    ) -> Result<Option<BlockChainTip>, Bip157Error> {
         if self.shutdown_requested.get() {
             return Err(Bip157Error::Shutdown);
         }
         for attempt in 0..=SYNC_NODE_RESTART_LIMIT {
-            match self.sync_wallet_once(receive_index, change_index) {
+            match self.sync_wallet_once(receive_index, change_index, stop_after) {
                 Ok(result) => return Ok(result),
                 Err(error)
                     if attempt < SYNC_NODE_RESTART_LIMIT && is_restartable_client_error(&error) =>
@@ -402,6 +507,7 @@ impl Bip157 {
         &mut self,
         receive_index: ChildNumber,
         change_index: ChildNumber,
+        stop_after: Option<std::time::Instant>,
     ) -> Result<Option<BlockChainTip>, Bip157Error> {
         if self.shutdown_requested.get() {
             return Err(Bip157Error::Shutdown);
@@ -433,13 +539,26 @@ impl Bip157 {
             && self.assumed_checked_to.get().is_none())
         .then_some(wallet_timestamp);
 
+        if needs_wallet_replay && !self.full_scan.get() {
+            let replay_from_height = db_tip
+                .map(|tip| height_u32_from_i32(tip.height))
+                .unwrap_or(0);
+            self.full_scan.set(true);
+            self.rescan_from_height.set(Some(replay_from_height));
+            self.scan_request_inflight.set(false);
+        }
+
         if self.full_scan.get() {
-            clear_pending_events(&mut self.event_rx);
-            let rescan_from_height = self.rescan_from_height.take().unwrap_or(0);
-            self.requester
-                .rescan_from(rescan_from_height)
-                .map_err(|e| Bip157Error::Client(e.to_string()))?;
-            *self.progress.lock().unwrap() = None;
+            if !self.scan_request_inflight.get() {
+                self.reset_transient_sync_state();
+                clear_pending_events(&mut self.event_rx);
+                let rescan_from_height = self.rescan_from_height.get().unwrap_or(0);
+                self.requester
+                    .rescan_from(rescan_from_height)
+                    .map_err(|e| Bip157Error::Client(e.to_string()))?;
+                *self.progress.lock().unwrap() = None;
+                self.scan_request_inflight.set(true);
+            }
         } else if Some(
             self.runtime
                 .block_on(self.requester.chain_tip())
@@ -450,39 +569,35 @@ impl Bip157 {
                 .map_err(|e| Bip157Error::Client(e.to_string()))?,
         ) == self.synced_tip.get()
         {
-            if needs_wallet_replay {
-                clear_pending_events(&mut self.event_rx);
-                let replay_from_height = db_tip
-                    .map(|tip| height_u32_from_i32(tip.height))
-                    .unwrap_or(0);
-                self.requester
-                    .rescan_from(replay_from_height)
-                    .map_err(|e| Bip157Error::Client(e.to_string()))?;
-                *self.progress.lock().unwrap() = None;
-            } else {
-                *self.bdk_wallet.borrow_mut() = bdk_wallet;
-                self.tip_time.set(self.chain_store.tip_time()?);
-                self.persist_peer_cache();
-                return Ok(None);
-            }
+            *self.bdk_wallet.borrow_mut() = bdk_wallet;
+            self.tip_time.set(self.chain_store.tip_time()?);
+            self.persist_peer_cache();
+            return Ok(None);
         }
 
-        let mut matched_blocks = Vec::new();
         let mut pending_headers = Vec::new();
         let mut pending_filter_hashes = BTreeMap::new();
-        let mut pending_checked_heights = BTreeSet::new();
-        let mut seen_block_hashes = HashSet::new();
-        let mut reorg_common_ancestor: Option<BlockChainTip> = None;
         let mut idle_retries = 0usize;
+        let mut processed_events = 0usize;
         loop {
             if self.shutdown_requested.get() {
                 return Err(Bip157Error::Shutdown);
             }
+            if let Some(stop_after) = stop_after {
+                if std::time::Instant::now() >= stop_after {
+                    self.flush_sync_progress(&mut pending_headers, &mut pending_filter_hashes)?;
+                    return Ok(None);
+                }
+            }
             let event = {
                 let runtime = &self.runtime;
                 let event_rx = &mut self.event_rx;
+                let wait_for = stop_after
+                    .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap_or(SYNC_EVENT_TIMEOUT)
+                    .min(SYNC_EVENT_TIMEOUT);
                 runtime.block_on(async {
-                    bip157::tokio::time::timeout(SYNC_EVENT_TIMEOUT, event_rx.recv()).await
+                    bip157::tokio::time::timeout(wait_for, event_rx.recv()).await
                 })
             };
             let event = match event {
@@ -500,6 +615,10 @@ impl Bip157 {
                 Err(_) => {
                     if self.shutdown_requested.get() {
                         return Err(Bip157Error::Shutdown);
+                    }
+                    if stop_after.is_some() {
+                        self.flush_sync_progress(&mut pending_headers, &mut pending_filter_hashes)?;
+                        return Ok(None);
                     }
                     idle_retries = idle_retries.saturating_add(1);
                     let added = queue_retryable_peers(&self.requester, &self.bootstrap_peers, 1)?;
@@ -536,16 +655,16 @@ impl Bip157 {
                     let matches_wallet = filter.contains_any(bdk_wallet.all_spks());
                     let height = filter.height();
                     let block_hash = filter.block_hash();
-                    pending_checked_heights.insert(height);
-                    if pending_checked_heights.len() >= HEADER_FLUSH_BATCH_SIZE {
-                        flush_checked_heights(&self.chain_store, &mut pending_checked_heights)?;
-                    }
-                    if matches_wallet && seen_block_hashes.insert(block_hash) {
+                    self.sync_pending_checked_heights
+                        .borrow_mut()
+                        .insert(height);
+                    if matches_wallet && self.sync_seen_block_hashes.borrow_mut().insert(block_hash)
+                    {
                         let block = self
                             .runtime
                             .block_on(self.requester.get_block(block_hash))
                             .map_err(fetch_block_error)?;
-                        matched_blocks.push(block);
+                        self.sync_matched_blocks.borrow_mut().push(block);
                     }
                 }
                 Event::ChainUpdate(BlockHeaderChanges::Connected(header)) => {
@@ -555,32 +674,13 @@ impl Bip157 {
                     if pending_headers.len() >= HEADER_FLUSH_BATCH_SIZE {
                         flush_connected_headers(&self.chain_store, &mut pending_headers)?;
                     }
-                    if self
-                        .assumed_checked_to
-                        .get()
-                        .map(|height| header_height <= height)
-                        .unwrap_or(false)
-                    {
-                        pending_checked_heights.insert(header_height);
-                    }
                     if let Some(timestamp) = automatic_assume_timestamp {
-                        if self.assumed_checked_to.get().is_none() && header_time >= timestamp {
-                            flush_connected_headers(&self.chain_store, &mut pending_headers)?;
-                            let assumed_height = self
-                                .chain_store
-                                .block_before_date(timestamp)?
-                                .map(|tip| height_u32_from_i32(tip.height))
-                                .unwrap_or(0);
-                            self.requester
-                                .assume_filters_checked_to(assumed_height)
-                                .map_err(|e| Bip157Error::Client(e.to_string()))?;
-                            self.assumed_checked_to.set(Some(assumed_height));
-                            self.chain_store
-                                .mark_filters_checked_through(assumed_height)?;
-                        }
-                    }
-                    if pending_checked_heights.len() >= HEADER_FLUSH_BATCH_SIZE {
-                        flush_checked_heights(&self.chain_store, &mut pending_checked_heights)?;
+                        self.maybe_advance_assumed_filter_height(
+                            timestamp,
+                            header_height,
+                            header_time,
+                            &mut pending_headers,
+                        )?;
                     }
                 }
                 Event::ChainUpdate(BlockHeaderChanges::Reorganized {
@@ -592,14 +692,16 @@ impl Bip157 {
                         &reorganized,
                         self.genesis_hash,
                     ) {
-                        reorg_common_ancestor = Some(match reorg_common_ancestor {
-                            Some(current) if current.height <= common_ancestor.height => current,
-                            _ => common_ancestor,
-                        });
+                        self.sync_reorg_common_ancestor.set(Some(
+                            match self.sync_reorg_common_ancestor.get() {
+                                Some(current) if current.height <= common_ancestor.height => {
+                                    current
+                                }
+                                _ => common_ancestor,
+                            },
+                        ));
                     }
-                    flush_connected_headers(&self.chain_store, &mut pending_headers)?;
-                    flush_filter_hashes(&self.chain_store, &mut pending_filter_hashes)?;
-                    flush_checked_heights(&self.chain_store, &mut pending_checked_heights)?;
+                    self.flush_sync_progress(&mut pending_headers, &mut pending_filter_hashes)?;
                     apply_reorg_to_store(&self.chain_store, &accepted, &reorganized)?;
                     if let Some(assumed_height) = self.assumed_checked_to.get() {
                         self.chain_store
@@ -607,14 +709,23 @@ impl Bip157 {
                     }
                 }
                 Event::FiltersSynced(update) => {
-                    flush_connected_headers(&self.chain_store, &mut pending_headers)?;
-                    flush_filter_hashes(&self.chain_store, &mut pending_filter_hashes)?;
-                    flush_checked_heights(&self.chain_store, &mut pending_checked_heights)?;
+                    self.flush_sync_progress(&mut pending_headers, &mut pending_filter_hashes)?;
+                    let checked_heights = self
+                        .sync_pending_checked_heights
+                        .borrow()
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>();
+                    if !checked_heights.is_empty() {
+                        self.chain_store.set_filter_checked(&checked_heights)?;
+                    }
                     let tip = BlockChainTip {
                         hash: update.tip().hash,
                         height: height_i32_from_u32(update.tip().height),
                     };
                     let tip_block = block_id_from_tip(tip);
+                    let matched_blocks =
+                        std::mem::take(&mut *self.sync_matched_blocks.borrow_mut());
                     let confirmed_txs = matched_blocks
                         .into_iter()
                         .flat_map(|indexed_block| {
@@ -662,13 +773,26 @@ impl Bip157 {
                     self.tip_time.set(self.chain_store.tip_time()?);
                     self.synced_tip.set(Some(tip));
                     self.full_scan.set(false);
+                    self.rescan_from_height.set(None);
+                    self.scan_request_inflight.set(false);
                     *self.progress.lock().unwrap() = None;
                     *self.bdk_wallet.borrow_mut() = bdk_wallet;
+                    self.sync_seen_block_hashes.borrow_mut().clear();
+                    self.sync_pending_checked_heights.borrow_mut().clear();
                     self.persist_peer_cache();
 
-                    return Ok(reorg_common_ancestor);
+                    return Ok(self.sync_reorg_common_ancestor.replace(None));
                 }
                 _ => {}
+            }
+            processed_events = processed_events.saturating_add(1);
+            if let Some(stop_after) = stop_after {
+                if processed_events >= HEADER_FLUSH_BATCH_SIZE / 2
+                    || std::time::Instant::now() >= stop_after
+                {
+                    self.flush_sync_progress(&mut pending_headers, &mut pending_filter_hashes)?;
+                    return Ok(None);
+                }
             }
         }
     }
@@ -680,6 +804,8 @@ impl Bip157 {
         let _ = self.requester.shutdown();
         clear_pending_events(&mut self.event_rx);
         *self.progress.lock().unwrap() = None;
+        self.scan_request_inflight.set(false);
+        self.reset_transient_sync_state();
 
         let snapshot = load_snapshot(&self.snapshot_path)?;
         let chain_state = chain_state_from(
@@ -1209,19 +1335,6 @@ fn flush_filter_hashes(
         .collect::<Vec<_>>();
     chain_store.set_filter_hashes(&filter_hashes)?;
     pending_filter_hashes.clear();
-    Ok(())
-}
-
-fn flush_checked_heights(
-    chain_store: &ChainStore,
-    pending_checked_heights: &mut BTreeSet<u32>,
-) -> Result<(), Bip157Error> {
-    if pending_checked_heights.is_empty() {
-        return Ok(());
-    }
-    let heights = pending_checked_heights.iter().copied().collect::<Vec<_>>();
-    chain_store.set_filter_checked(&heights)?;
-    pending_checked_heights.clear();
     Ok(())
 }
 
