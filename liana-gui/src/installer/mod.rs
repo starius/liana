@@ -519,16 +519,20 @@ impl Installer<'_, Message> for LianaInstaller {
     }
 }
 
-pub fn daemon_check(cfg: lianad::config::Config) -> Result<(), Error> {
-    // Start Daemon to check correctness of installation
-    match lianad::DaemonHandle::start_default(cfg, false) {
-        Ok(daemon) => daemon
-            .stop()
-            .map_err(|e| Error::Unexpected(format!("Failed to stop Liana daemon: {e}"))),
-        Err(e) => Err(Error::Unexpected(format!(
-            "Failed to start Liana daemon: {e}"
-        ))),
-    }
+pub async fn daemon_check(cfg: lianad::config::Config) -> Result<(), Error> {
+    tokio::task::spawn_blocking(move || {
+        // Start Daemon to check correctness of installation.
+        match lianad::DaemonHandle::start_default(cfg, false) {
+            Ok(daemon) => daemon
+                .stop()
+                .map_err(|e| Error::Unexpected(format!("Failed to stop Liana daemon: {e}"))),
+            Err(e) => Err(Error::Unexpected(format!(
+                "Failed to start Liana daemon: {e}"
+            ))),
+        }
+    })
+    .await
+    .map_err(|e| Error::Unexpected(format!("Daemon check task failed: {e}")))?
 }
 
 async fn with_wallet_id<F>(wallet_id: WalletId, res: F) -> (WalletId, Result<WalletSettings, Error>)
@@ -579,7 +583,7 @@ pub async fn install_local_wallet(
 
     let cfg: lianad::config::Config = extract_daemon_config(&ctx, &wallet_settings)?;
 
-    daemon_check(cfg.clone())?;
+    daemon_check(cfg.clone()).await?;
 
     info!("daemon checked");
 
