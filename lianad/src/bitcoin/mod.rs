@@ -53,6 +53,12 @@ pub trait BitcoinInterface: Send {
     /// backend is completely synced to the best known tip.
     fn sync_progress(&self) -> SyncProgress;
 
+    /// Whether the poller should call into this backend even while the backend still reports
+    /// synchronization in progress.
+    fn poll_while_syncing(&self) -> bool {
+        false
+    }
+
     /// Get the best block info.
     fn chain_tip(&self) -> BlockChainTip;
 
@@ -135,6 +141,14 @@ pub trait BitcoinInterface: Send {
     ///
     /// Returns `None` if the transaction is not in the mempool.
     fn mempool_entry(&self, txid: &bitcoin::Txid) -> Option<MempoolEntry>;
+
+    /// Ask the backend to stop any long-running work in preparation for shutdown.
+    fn shutdown(&mut self) {}
+
+    /// Whether the backend is currently shutting down.
+    fn is_shutting_down(&self) -> bool {
+        false
+    }
 }
 
 impl BitcoinInterface for d::BitcoinD {
@@ -736,6 +750,10 @@ impl BitcoinInterface for bip157::Bip157 {
         bip157::Bip157::sync_progress(self)
     }
 
+    fn poll_while_syncing(&self) -> bool {
+        bip157::Bip157::should_poll_while_syncing(self)
+    }
+
     fn start_rescan(
         &mut self,
         _desc: &descriptors::LianaDescriptor,
@@ -759,6 +777,14 @@ impl BitcoinInterface for bip157::Bip157 {
     fn tip_time(&self) -> Option<u32> {
         bip157::Bip157::tip_time(self)
     }
+
+    fn shutdown(&mut self) {
+        bip157::Bip157::shutdown(self)
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        bip157::Bip157::is_shutting_down(self)
+    }
 }
 
 // FIXME: do we need to repeat the entire trait implementation? Isn't there a nicer way?
@@ -773,6 +799,10 @@ impl BitcoinInterface for sync::Arc<sync::Mutex<dyn BitcoinInterface + 'static>>
 
     fn sync_progress(&self) -> SyncProgress {
         self.lock().unwrap().sync_progress()
+    }
+
+    fn poll_while_syncing(&self) -> bool {
+        self.lock().unwrap().poll_while_syncing()
     }
 
     fn chain_tip(&self) -> BlockChainTip {
@@ -863,6 +893,14 @@ impl BitcoinInterface for sync::Arc<sync::Mutex<dyn BitcoinInterface + 'static>>
 
     fn mempool_entry(&self, txid: &bitcoin::Txid) -> Option<MempoolEntry> {
         self.lock().unwrap().mempool_entry(txid)
+    }
+
+    fn shutdown(&mut self) {
+        self.lock().unwrap().shutdown()
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.lock().unwrap().is_shutting_down()
     }
 }
 

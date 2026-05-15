@@ -207,6 +207,20 @@ impl Requester {
             .map_err(|_| ClientError::SendError)
     }
 
+    /// Treat filters at or below the specified height as already checked.
+    ///
+    /// This is useful when the caller knows older filters cannot contain relevant scripts and
+    /// wants the node to skip downloading them during the next filter phase.
+    ///
+    /// # Errors
+    ///
+    /// If the node has stopped running.
+    pub fn assume_filters_checked_to(&self, height: u32) -> Result<(), ClientError> {
+        self.ntx
+            .send(ClientMessage::AssumeFiltersCheckedTo(height))
+            .map_err(|_| ClientError::SendError)
+    }
+
     /// Add another known peer to connect to.
     ///
     /// # Errors

@@ -93,10 +93,45 @@ pub enum BlockHeaderChanges {
 pub enum ChainState {
     /// A summary of the chain state. The vector of headers should ideally be contiguous.
     Snapshot(Vec<IndexedHeader>),
+    /// A richer summary of the chain state, including compact-filter commitments and whether the
+    /// corresponding filters were already checked.
+    SnapshotWithFilters(Vec<IndexedFilterState>),
     /// A single checkpoint to start the sync _strictly after_.
     ///
     /// Note that no reorganizations can be reported.
     Checkpoint(HeaderCheckpoint),
+}
+
+/// A validated compact-filter commitment associated with a block height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexedFilterCommitment {
+    /// The block height in the canonical chain.
+    pub height: u32,
+    /// The compact-filter hash committed by the filter-header chain.
+    pub filter_hash: FilterHash,
+}
+
+impl IndexedFilterCommitment {
+    pub(crate) fn new(height: u32, filter_hash: FilterHash) -> Self {
+        Self {
+            height,
+            filter_hash,
+        }
+    }
+}
+
+/// A previously persisted block state, including its optional compact-filter commitment and
+/// whether the corresponding filter was already checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexedFilterState {
+    /// The block height in the canonical chain.
+    pub height: u32,
+    /// The block header at this height.
+    pub header: Header,
+    /// The validated compact-filter hash for this block, if any.
+    pub filter_hash: Option<FilterHash>,
+    /// Whether the full filter was already checked or intentionally assumed checked.
+    pub filter_checked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -181,10 +216,10 @@ impl FilterHeaderAgreements {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CFHeaderChanges {
     AddedToQueue,
-    Extended,
+    Extended(Vec<IndexedFilterCommitment>),
     // Unfortunately, auditing each peer by reconstruction the filter would be costly in network
     // and compute. Instead it is easier to disconnect from all peers and try again.
     Conflict,

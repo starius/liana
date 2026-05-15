@@ -20,7 +20,7 @@ use bdk_electrum::bdk_chain::{
 use bip157::{
     chain::{BlockHeaderChanges, ChainState, IndexedHeader},
     error::FetchBlockError,
-    Client, Event, HeaderCheckpoint, Requester, Socks5Proxy, TrustedPeer,
+    Client, Event, HeaderCheckpoint, IndexedFilterCommitment, Requester, Socks5Proxy, TrustedPeer,
 };
 use liana::descriptors::LianaDescriptor;
 use miniscript::bitcoin::{
@@ -60,6 +60,7 @@ pub enum Bip157Error {
     InvalidPeer(String),
     Io(String),
     Runtime(String),
+    Shutdown,
     Snapshot(String),
 }
 
@@ -72,6 +73,7 @@ impl fmt::Display for Bip157Error {
             Self::InvalidPeer(e) => write!(f, "Invalid BIP157 peer configuration: {e}"),
             Self::Io(e) => write!(f, "BIP157 I/O error: {e}"),
             Self::Runtime(e) => write!(f, "BIP157 runtime error: {e}"),
+            Self::Shutdown => write!(f, "BIP157 shutdown requested"),
             Self::Snapshot(e) => write!(f, "BIP157 snapshot error: {e}"),
         }
     }
@@ -168,6 +170,8 @@ pub struct Bip157 {
     pending_txs: RefCell<HashMap<bitcoin::Txid, (bitcoin::Transaction, u64)>>,
     full_scan: Cell<bool>,
     rescan_from_height: Cell<Option<u32>>,
+    assumed_checked_to: Cell<Option<u32>>,
+    shutdown_requested: Cell<bool>,
     progress: sync::Arc<sync::Mutex<Option<bip157::Progress>>>,
     genesis_hash: BlockHash,
     network: bitcoin::Network,
@@ -197,13 +201,18 @@ impl Bip157 {
         let snapshot_path = snapshot_path(data_dir);
         let snapshot = load_snapshot(&snapshot_path)?;
         seed_chain_store_from_snapshot(&chain_store, snapshot.as_ref())?;
-        let mut bootstrap_peers = bip157_config.peers.clone();
+        let bootstrap_peers = bip157_config.peers.clone();
+        let mut cached_bootstrap_peers = Vec::new();
         if !bip157_config.whitelist_only {
             for cached_peer in
                 peer_cache::load(&peer_cache_path).map_err(|e| Bip157Error::Io(e.to_string()))?
             {
-                if !bootstrap_peers.contains(&cached_peer) {
-                    bootstrap_peers.push(cached_peer);
+                if !bootstrap_peers.contains(&cached_peer.address)
+                    && !cached_bootstrap_peers
+                        .iter()
+                        .any(|peer: &peer_cache::CachedPeer| peer.address == cached_peer.address)
+                {
+                    cached_bootstrap_peers.push(cached_peer);
                 }
             }
         }
@@ -223,10 +232,16 @@ impl Bip157 {
             &HashMap::new(),
         )?;
         let tip_time = chain_store.tip_time()?;
+        let assumed_checked_to = chain_store
+            .contiguous_filter_states()?
+            .into_iter()
+            .filter(|state| state.filter_checked)
+            .map(|state| state.height)
+            .max();
 
         let chain_state = chain_state_from(&chain_store, snapshot.as_ref(), synced_tip, network)?;
         let node_data_dir = node_data_dir(data_dir);
-        let bootstrap_peers = if !bootstrap_peers.is_empty() {
+        let mut bootstrap_peers = if !bootstrap_peers.is_empty() {
             bootstrap_peers
                 .iter()
                 .map(|peer| parse_peer(network, peer))
@@ -234,6 +249,9 @@ impl Bip157 {
         } else {
             Vec::new()
         };
+        for cached_peer in cached_bootstrap_peers {
+            bootstrap_peers.push(parse_cached_peer(network, &cached_peer)?);
+        }
         let runtime = bip157::tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -273,6 +291,8 @@ impl Bip157 {
             pending_txs: RefCell::new(HashMap::new()),
             full_scan: Cell::new(full_scan),
             rescan_from_height: Cell::new(None),
+            assumed_checked_to: Cell::new(assumed_checked_to),
+            shutdown_requested: Cell::new(false),
             progress,
             genesis_hash,
             network,
@@ -326,6 +346,19 @@ impl Bip157 {
         self.rescan_from_height.set(Some(height));
     }
 
+    pub fn should_poll_while_syncing(&self) -> bool {
+        true
+    }
+
+    pub fn shutdown(&mut self) {
+        self.shutdown_requested.set(true);
+        let _ = self.requester.shutdown();
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown_requested.get()
+    }
+
     pub fn block_before_date(&self, timestamp: u32) -> Option<BlockChainTip> {
         self.chain_store
             .block_before_date(timestamp)
@@ -339,6 +372,9 @@ impl Bip157 {
         receive_index: ChildNumber,
         change_index: ChildNumber,
     ) -> Result<Option<BlockChainTip>, Bip157Error> {
+        if self.shutdown_requested.get() {
+            return Err(Bip157Error::Shutdown);
+        }
         for attempt in 0..=SYNC_NODE_RESTART_LIMIT {
             match self.sync_wallet_once(receive_index, change_index) {
                 Ok(result) => return Ok(result),
@@ -367,10 +403,13 @@ impl Bip157 {
         receive_index: ChildNumber,
         change_index: ChildNumber,
     ) -> Result<Option<BlockChainTip>, Bip157Error> {
+        if self.shutdown_requested.get() {
+            return Err(Bip157Error::Shutdown);
+        }
         let previous_snapshot = load_snapshot(&self.snapshot_path)?;
-        let db_tip = {
+        let (db_tip, wallet_timestamp) = {
             let mut db_conn = self.db.connection();
-            db_conn.chain_tip()
+            (db_conn.chain_tip(), db_conn.timestamp())
         };
         let mut bdk_wallet = load_wallet_from_db(
             &self.db,
@@ -390,6 +429,9 @@ impl Bip157 {
                 if db_tip.height < synced_tip.height
                     || (db_tip.height == synced_tip.height && db_tip.hash != synced_tip.hash)
         );
+        let automatic_assume_timestamp = (!self.full_scan.get()
+            && self.assumed_checked_to.get().is_none())
+        .then_some(wallet_timestamp);
 
         if self.full_scan.get() {
             clear_pending_events(&mut self.event_rx);
@@ -428,10 +470,14 @@ impl Bip157 {
         let mut matched_blocks = Vec::new();
         let mut pending_headers = Vec::new();
         let mut pending_filter_hashes = BTreeMap::new();
+        let mut pending_checked_heights = BTreeSet::new();
         let mut seen_block_hashes = HashSet::new();
         let mut reorg_common_ancestor: Option<BlockChainTip> = None;
         let mut idle_retries = 0usize;
         loop {
+            if self.shutdown_requested.get() {
+                return Err(Bip157Error::Shutdown);
+            }
             let event = {
                 let runtime = &self.runtime;
                 let event_rx = &mut self.event_rx;
@@ -445,9 +491,16 @@ impl Bip157 {
                     event
                 }
                 Ok(None) => {
-                    return Err(Bip157Error::Client("the BIP157 node is not running".into()))
+                    return if self.shutdown_requested.get() {
+                        Err(Bip157Error::Shutdown)
+                    } else {
+                        Err(Bip157Error::Client("the BIP157 node is not running".into()))
+                    }
                 }
                 Err(_) => {
+                    if self.shutdown_requested.get() {
+                        return Err(Bip157Error::Shutdown);
+                    }
                     idle_retries = idle_retries.saturating_add(1);
                     let added = queue_retryable_peers(&self.requester, &self.bootstrap_peers, 1)?;
                     log::warn!(
@@ -467,13 +520,26 @@ impl Bip157 {
                 }
             };
             match event {
+                Event::FilterHeadersVerified(commitments) => {
+                    for IndexedFilterCommitment {
+                        height,
+                        filter_hash,
+                    } in commitments
+                    {
+                        pending_filter_hashes.insert(height, filter_hash);
+                    }
+                    if pending_filter_hashes.len() >= HEADER_FLUSH_BATCH_SIZE {
+                        flush_filter_hashes(&self.chain_store, &mut pending_filter_hashes)?;
+                    }
+                }
                 Event::IndexedFilter(filter) => {
                     let matches_wallet = filter.contains_any(bdk_wallet.all_spks());
                     let height = filter.height();
                     let block_hash = filter.block_hash();
-                    let filter_contents = filter.into_contents();
-                    pending_filter_hashes
-                        .insert(height, bitcoin::FilterHash::hash(&filter_contents));
+                    pending_checked_heights.insert(height);
+                    if pending_checked_heights.len() >= HEADER_FLUSH_BATCH_SIZE {
+                        flush_checked_heights(&self.chain_store, &mut pending_checked_heights)?;
+                    }
                     if matches_wallet && seen_block_hashes.insert(block_hash) {
                         let block = self
                             .runtime
@@ -483,9 +549,38 @@ impl Bip157 {
                     }
                 }
                 Event::ChainUpdate(BlockHeaderChanges::Connected(header)) => {
+                    let header_height = header.height;
+                    let header_time = header.header.time;
                     pending_headers.push(header);
                     if pending_headers.len() >= HEADER_FLUSH_BATCH_SIZE {
                         flush_connected_headers(&self.chain_store, &mut pending_headers)?;
+                    }
+                    if self
+                        .assumed_checked_to
+                        .get()
+                        .map(|height| header_height <= height)
+                        .unwrap_or(false)
+                    {
+                        pending_checked_heights.insert(header_height);
+                    }
+                    if let Some(timestamp) = automatic_assume_timestamp {
+                        if self.assumed_checked_to.get().is_none() && header_time >= timestamp {
+                            flush_connected_headers(&self.chain_store, &mut pending_headers)?;
+                            let assumed_height = self
+                                .chain_store
+                                .block_before_date(timestamp)?
+                                .map(|tip| height_u32_from_i32(tip.height))
+                                .unwrap_or(0);
+                            self.requester
+                                .assume_filters_checked_to(assumed_height)
+                                .map_err(|e| Bip157Error::Client(e.to_string()))?;
+                            self.assumed_checked_to.set(Some(assumed_height));
+                            self.chain_store
+                                .mark_filters_checked_through(assumed_height)?;
+                        }
+                    }
+                    if pending_checked_heights.len() >= HEADER_FLUSH_BATCH_SIZE {
+                        flush_checked_heights(&self.chain_store, &mut pending_checked_heights)?;
                     }
                 }
                 Event::ChainUpdate(BlockHeaderChanges::Reorganized {
@@ -503,11 +598,18 @@ impl Bip157 {
                         });
                     }
                     flush_connected_headers(&self.chain_store, &mut pending_headers)?;
+                    flush_filter_hashes(&self.chain_store, &mut pending_filter_hashes)?;
+                    flush_checked_heights(&self.chain_store, &mut pending_checked_heights)?;
                     apply_reorg_to_store(&self.chain_store, &accepted, &reorganized)?;
+                    if let Some(assumed_height) = self.assumed_checked_to.get() {
+                        self.chain_store
+                            .mark_filters_checked_through(assumed_height)?;
+                    }
                 }
                 Event::FiltersSynced(update) => {
                     flush_connected_headers(&self.chain_store, &mut pending_headers)?;
                     flush_filter_hashes(&self.chain_store, &mut pending_filter_hashes)?;
+                    flush_checked_heights(&self.chain_store, &mut pending_checked_heights)?;
                     let tip = BlockChainTip {
                         hash: update.tip().hash,
                         height: height_i32_from_u32(update.tip().height),
@@ -572,6 +674,9 @@ impl Bip157 {
     }
 
     fn restart_node(&mut self) -> Result<(), Bip157Error> {
+        if self.shutdown_requested.get() {
+            return Err(Bip157Error::Shutdown);
+        }
         let _ = self.requester.shutdown();
         clear_pending_events(&mut self.event_rx);
         *self.progress.lock().unwrap() = None;
@@ -706,6 +811,9 @@ impl Bip157 {
         if let Some(progress) = *self.progress.lock().unwrap() {
             let height = u64::from(progress.chain_height());
             SyncProgress::new(progress.fraction_complete() as f64, height, height)
+        } else if self.synced_tip.get().is_none() || self.full_scan.get() {
+            let blocks = self.wallet_tip().height.max(0) as u64;
+            SyncProgress::new(0.0, blocks, blocks)
         } else {
             let blocks = self.wallet_tip().height.max(0) as u64;
             SyncProgress::new(1.0, blocks, blocks)
@@ -743,7 +851,11 @@ impl Bip157 {
         };
         let mut peers = peer_info
             .into_iter()
-            .filter_map(|(addr, _)| peer_cache::encode_peer(addr))
+            .filter(|(_, services)| {
+                services.has(bitcoin::p2p::ServiceFlags::COMPACT_FILTERS)
+                    && services.has(bitcoin::p2p::ServiceFlags::NETWORK)
+            })
+            .filter_map(|(addr, services)| peer_cache::encode_peer(addr, services))
             .collect::<Vec<_>>();
         peers.sort();
         peers.dedup();
@@ -758,7 +870,7 @@ impl Bip157 {
 
 impl Drop for Bip157 {
     fn drop(&mut self) {
-        let _ = self.requester.shutdown();
+        self.shutdown();
     }
 }
 
@@ -860,6 +972,15 @@ fn parse_peer(network: bitcoin::Network, peer: &str) -> Result<TrustedPeer, Bip1
     ))
 }
 
+fn parse_cached_peer(
+    network: bitcoin::Network,
+    peer: &peer_cache::CachedPeer,
+) -> Result<TrustedPeer, Bip157Error> {
+    let mut trusted_peer = parse_peer(network, &peer.address)?;
+    trusted_peer.set_services(bitcoin::p2p::ServiceFlags::from(peer.known_services));
+    Ok(trusted_peer)
+}
+
 fn default_port(network: bitcoin::Network) -> u16 {
     match network {
         bitcoin::Network::Bitcoin => 8333,
@@ -912,8 +1033,21 @@ fn chain_state_from(
     db_tip: Option<BlockChainTip>,
     network: bitcoin::Network,
 ) -> Result<Option<ChainState>, Bip157Error> {
-    let headers = chain_store.contiguous_headers()?;
-    if !headers.is_empty() {
+    let filter_states = chain_store.contiguous_filter_states()?;
+    if !filter_states.is_empty() {
+        if filter_states
+            .iter()
+            .any(|state| state.filter_hash.is_some() || state.filter_checked)
+        {
+            return Ok(Some(ChainState::SnapshotWithFilters(filter_states)));
+        }
+        let headers = filter_states
+            .into_iter()
+            .map(|state| IndexedHeader {
+                height: state.height,
+                header: state.header,
+            })
+            .collect::<Vec<_>>();
         return Ok(Some(ChainState::Snapshot(headers)));
     }
     if let Some(snapshot) = snapshot {
@@ -1075,6 +1209,19 @@ fn flush_filter_hashes(
         .collect::<Vec<_>>();
     chain_store.set_filter_hashes(&filter_hashes)?;
     pending_filter_hashes.clear();
+    Ok(())
+}
+
+fn flush_checked_heights(
+    chain_store: &ChainStore,
+    pending_checked_heights: &mut BTreeSet<u32>,
+) -> Result<(), Bip157Error> {
+    if pending_checked_heights.is_empty() {
+        return Ok(());
+    }
+    let heights = pending_checked_heights.iter().copied().collect::<Vec<_>>();
+    chain_store.set_filter_checked(&heights)?;
+    pending_checked_heights.clear();
     Ok(())
 }
 

@@ -208,6 +208,9 @@ impl Node {
                                     self.peer_map.broadcast(response).await;
                                 }
                             },
+                            ClientMessage::AssumeFiltersCheckedTo(height) => {
+                                self.chain.assume_filters_checked_to(height);
+                            }
                             ClientMessage::GetBlock(request) => {
                                 let height_opt = self.chain.header_chain.height_of_hash(request.data());
                                 if height_opt.is_none() {
@@ -492,7 +495,10 @@ impl Node {
         match self.chain.sync_cf_headers(peer_id, cf_headers) {
             Ok(potential_message) => match potential_message {
                 CFHeaderChanges::AddedToQueue => None,
-                CFHeaderChanges::Extended => self.next_stateful_message().await,
+                CFHeaderChanges::Extended(updates) => {
+                    self.dialog.send_event(Event::FilterHeadersVerified(updates));
+                    self.next_stateful_message().await
+                }
                 CFHeaderChanges::Conflict => {
                     self.dialog.send_warning(Warning::UnexpectedSyncError {
                         warning: "Found a conflict while peers are sending filter headers".into(),

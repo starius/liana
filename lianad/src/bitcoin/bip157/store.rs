@@ -1,6 +1,6 @@
 use std::{fs, io, path::PathBuf};
 
-use bip157::chain::IndexedHeader;
+use bip157::{chain::IndexedHeader, IndexedFilterState};
 use miniscript::bitcoin::{
     self,
     consensus::{deserialize, serialize},
@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS chain (
     height INTEGER PRIMARY KEY NOT NULL,
     header BLOB NOT NULL,
     block_time INTEGER NOT NULL,
-    filter_hash BLOB
+    filter_hash BLOB,
+    filter_checked INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS chain_block_time ON chain(block_time);";
 
@@ -153,10 +154,45 @@ impl ChainStore {
         self.tip_segment(Some(limit))
     }
 
+    #[cfg(test)]
     pub fn contiguous_headers(&self) -> Result<Vec<IndexedHeader>, ChainStoreError> {
         self.tip_segment(None)
     }
 
+    pub fn contiguous_filter_states(&self) -> Result<Vec<IndexedFilterState>, ChainStoreError> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT height, header, filter_hash, filter_checked
+             FROM chain
+             ORDER BY height DESC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut states = Vec::new();
+        let mut previous_height = None;
+        while let Some(row) = rows.next()? {
+            let height: u32 = row.get(0)?;
+            let header: Vec<u8> = row.get(1)?;
+            let filter_hash: Option<Vec<u8>> = row.get(2)?;
+            let filter_checked: bool = row.get(3)?;
+            if previous_height
+                .map(|prev_height| height.checked_add(1) != Some(prev_height))
+                .unwrap_or(false)
+            {
+                break;
+            }
+            states.push(IndexedFilterState {
+                height,
+                header: decode_header(&header)?,
+                filter_hash: filter_hash.as_deref().map(decode_filter_hash).transpose()?,
+                filter_checked,
+            });
+            previous_height = Some(height);
+        }
+        states.reverse();
+        Ok(states)
+    }
+
+    #[cfg(test)]
     fn tip_segment(&self, limit: Option<usize>) -> Result<Vec<IndexedHeader>, ChainStoreError> {
         let conn = self.connection()?;
         let query = match limit {
@@ -273,6 +309,42 @@ impl ChainStore {
         filter_hash.as_deref().map(decode_filter_hash).transpose()
     }
 
+    pub fn set_filter_checked(&self, heights: &[u32]) -> Result<(), ChainStoreError> {
+        if heights.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        {
+            let mut update = tx.prepare("UPDATE chain SET filter_checked = 1 WHERE height = ?1")?;
+            for height in heights {
+                update.execute(params![height])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_filters_checked_through(&self, height: u32) -> Result<(), ChainStoreError> {
+        let conn = self.connection()?;
+        conn.execute(
+            "UPDATE chain SET filter_checked = 1 WHERE height <= ?1",
+            params![height],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn filter_checked(&self, height: u32) -> Result<bool, ChainStoreError> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare("SELECT filter_checked FROM chain WHERE height = ?1")?;
+        let mut rows = stmt.query(params![height])?;
+        let Some(row) = rows.next()? else {
+            return Ok(false);
+        };
+        row.get(0).map_err(ChainStoreError::from)
+    }
+
     pub fn block_before_date(
         &self,
         timestamp: u32,
@@ -303,46 +375,77 @@ fn decode_header(bytes: &[u8]) -> Result<bitcoin::block::Header, ChainStoreError
         .map_err(|e| ChainStoreError::Decode(format!("invalid stored block header: {e}")))
 }
 
-#[cfg(test)]
 fn decode_filter_hash(bytes: &[u8]) -> Result<bitcoin::FilterHash, ChainStoreError> {
     deserialize(bytes)
         .map_err(|e| ChainStoreError::Decode(format!("invalid stored filter hash: {e}")))
 }
 
 fn migrate_legacy_schema(conn: &mut Connection) -> Result<(), ChainStoreError> {
-    let has_filter_header = {
+    let (has_table, has_filter_header, has_filter_checked) = {
         let mut stmt = conn.prepare("PRAGMA table_info(chain)")?;
         let mut rows = stmt.query([])?;
+        let mut has_table = false;
         let mut has_filter_header = false;
+        let mut has_filter_checked = false;
         while let Some(row) = rows.next()? {
+            has_table = true;
             let column_name: String = row.get(1)?;
             if column_name == "filter_header" {
                 has_filter_header = true;
-                break;
+            } else if column_name == "filter_checked" {
+                has_filter_checked = true;
             }
         }
-        has_filter_header
+        (has_table, has_filter_header, has_filter_checked)
     };
 
-    if !has_filter_header {
+    if !has_table {
+        return Ok(());
+    }
+
+    if !has_filter_header && has_filter_checked {
         return Ok(());
     }
 
     let tx = conn.transaction()?;
-    tx.execute_batch(
-        "
-        CREATE TABLE chain_new (
-            height INTEGER PRIMARY KEY NOT NULL,
-            header BLOB NOT NULL,
-            block_time INTEGER NOT NULL,
-            filter_hash BLOB
-        );
-        INSERT INTO chain_new (height, header, block_time, filter_hash)
-        SELECT height, header, block_time, filter_hash FROM chain;
-        DROP TABLE chain;
-        ALTER TABLE chain_new RENAME TO chain;
-        ",
-    )?;
+    if has_filter_checked {
+        tx.execute_batch(
+            "
+            CREATE TABLE chain_new (
+                height INTEGER PRIMARY KEY NOT NULL,
+                header BLOB NOT NULL,
+                block_time INTEGER NOT NULL,
+                filter_hash BLOB,
+                filter_checked INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO chain_new (height, header, block_time, filter_hash, filter_checked)
+            SELECT height, header, block_time, filter_hash, filter_checked FROM chain;
+            DROP TABLE chain;
+            ALTER TABLE chain_new RENAME TO chain;
+            ",
+        )?;
+    } else {
+        tx.execute_batch(
+            "
+            CREATE TABLE chain_new (
+                height INTEGER PRIMARY KEY NOT NULL,
+                header BLOB NOT NULL,
+                block_time INTEGER NOT NULL,
+                filter_hash BLOB,
+                filter_checked INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO chain_new (height, header, block_time, filter_hash, filter_checked)
+            SELECT height,
+                   header,
+                   block_time,
+                   filter_hash,
+                   CASE WHEN filter_hash IS NOT NULL THEN 1 ELSE 0 END
+            FROM chain;
+            DROP TABLE chain;
+            ALTER TABLE chain_new RENAME TO chain;
+            ",
+        )?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -440,6 +543,10 @@ mod tests {
             store.filter_hash(0).expect("filter hash"),
             Some(filter_hash)
         );
+        assert!(!store.filter_checked(0).expect("filter checked default"));
+
+        store.set_filter_checked(&[0]).expect("mark filter checked");
+        assert!(store.filter_checked(0).expect("filter checked"));
 
         let _ = fs::remove_file(path);
     }
@@ -496,8 +603,57 @@ mod tests {
         }
         assert_eq!(
             columns,
-            vec!["height", "header", "block_time", "filter_hash"]
+            vec![
+                "height",
+                "header",
+                "block_time",
+                "filter_hash",
+                "filter_checked"
+            ]
         );
+        assert!(store.filter_checked(0).expect("legacy filter checked"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn stores_contiguous_filter_states() {
+        let path = temp_path("chain-store-filter-states");
+        let store = ChainStore::new(path.clone());
+        let genesis = test_header(bitcoin::BlockHash::all_zeros(), 10, 0);
+        let block1 = test_header(genesis.block_hash(), 20, 1);
+        store
+            .replace_from(
+                0,
+                &[
+                    IndexedHeader {
+                        height: 0,
+                        header: genesis,
+                    },
+                    IndexedHeader {
+                        height: 1,
+                        header: block1,
+                    },
+                ],
+            )
+            .expect("store headers");
+
+        let filter_hash = bitcoin::FilterHash::hash(b"filter-1");
+        store
+            .set_filter_hashes(&[(1, filter_hash)])
+            .expect("store filter hash");
+        store
+            .mark_filters_checked_through(1)
+            .expect("mark checked through");
+
+        let states = store
+            .contiguous_filter_states()
+            .expect("contiguous filter states");
+        assert_eq!(states.len(), 2);
+        assert!(states[0].filter_checked);
+        assert_eq!(states[0].filter_hash, None);
+        assert!(states[1].filter_checked);
+        assert_eq!(states[1].filter_hash, Some(filter_hash));
 
         let _ = fs::remove_file(path);
     }

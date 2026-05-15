@@ -81,7 +81,7 @@ use tokio::sync::mpsc::UnboundedSender;
 #[doc(inline)]
 pub use {
     crate::builder::Builder,
-    crate::chain::ChainState,
+    crate::chain::{ChainState, IndexedFilterCommitment, IndexedFilterState},
     crate::client::{Client, Requester},
     crate::error::{ClientError, NodeError},
     crate::messages::{Event, Info, Progress, RejectPayload, SyncUpdate, Warning},

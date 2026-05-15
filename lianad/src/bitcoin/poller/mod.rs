@@ -137,7 +137,7 @@ impl Poller {
                     progress.headers
                 );
                 synced = progress.is_complete();
-                if !synced {
+                if !synced && !self.bit.poll_while_syncing() {
                     continue;
                 }
             }

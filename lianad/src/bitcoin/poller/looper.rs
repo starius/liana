@@ -288,6 +288,10 @@ fn updates(
             return updates(db_conn, bit, descs, secp);
         }
         Err(e) => {
+            if bit.is_shutting_down() {
+                log::info!("Bitcoin backend is shutting down. Stopping poll updates.");
+                return;
+            }
             log::error!("Error syncing wallet: '{}'.", e);
             thread::sleep(time::Duration::from_secs(2));
             return updates(db_conn, bit, descs, secp);

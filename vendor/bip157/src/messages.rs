@@ -5,7 +5,7 @@ use bitcoin::p2p::address::AddrV2;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::{block::Header, p2p::message_network::RejectReason, BlockHash, FeeRate, Wtxid};
 
-use crate::chain::{BlockHeaderChanges, IndexedHeader};
+use crate::chain::{BlockHeaderChanges, IndexedFilterCommitment, IndexedHeader};
 use crate::{chain::checkpoints::HeaderCheckpoint, IndexedBlock, TrustedPeer};
 use crate::{IndexedFilter, Package};
 
@@ -43,6 +43,8 @@ impl core::fmt::Display for Info {
 pub enum Event {
     /// The chain of block headers has been altered in some way.
     ChainUpdate(BlockHeaderChanges),
+    /// A contiguous batch of compact-filter commitments was validated.
+    FilterHeadersVerified(Vec<IndexedFilterCommitment>),
     /// The node is fully synced, having scanned the requested range.
     FiltersSynced(SyncUpdate),
     /// A compact block filter with associated height and block hash.
@@ -141,6 +143,8 @@ pub(crate) enum ClientMessage {
     Broadcast(ClientRequest<Package, Wtxid>),
     /// Starting at the configured anchor checkpoint, re-emit all filters.
     Rescan(Option<u32>),
+    /// Treat filters at or below the given height as already checked.
+    AssumeFiltersCheckedTo(u32),
     /// Explicitly request a block from the node.
     GetBlock(ClientRequest<BlockHash, Result<IndexedBlock, FetchBlockError>>),
     /// Get the chain tip.

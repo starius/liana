@@ -11,7 +11,8 @@ use super::{
     error::{CFHeaderSyncError, CFilterSyncError, HeaderSyncError},
     graph::{AcceptHeaderChanges, BlockTree, HeaderRejection},
     CFHeaderBatch, CFHeaderChanges, ChainState, Filter, FilterCheck, FilterHeaderRequest,
-    FilterRequest, FilterRequestState, HeaderSyncEffect, HeaderValidationExt, PeerId,
+    FilterRequest, FilterRequestState, HeaderSyncEffect, HeaderValidationExt,
+    IndexedFilterCommitment, PeerId,
 };
 use crate::{chain::BlockHeaderChanges, messages::Event, Dialog, Info, Progress};
 use crate::{FilterType, IndexedFilter};
@@ -50,6 +51,7 @@ impl Chain {
                     None => BlockTree::from_genesis(network),
                 }
             }
+            ChainState::SnapshotWithFilters(states) => BlockTree::from_filter_states(states, network),
             ChainState::Checkpoint(cp) => BlockTree::new(cp, network),
         };
         Chain {
@@ -223,8 +225,8 @@ impl Chain {
                     self.request_state.agreement_state.got_agreement();
                     if self.request_state.agreement_state.enough_agree() {
                         self.request_state.agreement_state.reset_agreements();
-                        self.push_cf_header_batch(batch, request.stop_hash);
-                        Ok(CFHeaderChanges::Extended)
+                        let updates = self.push_cf_header_batch(batch, request.stop_hash);
+                        Ok(CFHeaderChanges::Extended(updates))
                     } else {
                         self.request_state.pending_batch = Some((id, batch));
                         Ok(CFHeaderChanges::AddedToQueue)
@@ -235,8 +237,8 @@ impl Chain {
                 self.request_state.agreement_state.got_agreement();
                 if self.request_state.agreement_state.enough_agree() {
                     self.request_state.agreement_state.reset_agreements();
-                    self.push_cf_header_batch(batch, request.stop_hash);
-                    Ok(CFHeaderChanges::Extended)
+                    let updates = self.push_cf_header_batch(batch, request.stop_hash);
+                    Ok(CFHeaderChanges::Extended(updates))
                 } else {
                     self.request_state.pending_batch = Some((peer_id, batch));
                     Ok(CFHeaderChanges::AddedToQueue)
@@ -245,12 +247,21 @@ impl Chain {
         }
     }
 
-    fn push_cf_header_batch(&mut self, mut batch: CFHeaderBatch, stop_hash: BlockHash) {
+    fn push_cf_header_batch(
+        &mut self,
+        mut batch: CFHeaderBatch,
+        stop_hash: BlockHash,
+    ) -> Vec<IndexedFilterCommitment> {
         // Start from the stop hash and work backwards
         let cf_header_iter = batch.take_inner().into_iter().rev();
         let mut curr = stop_hash;
+        let mut updates = Vec::new();
         for commitment in cf_header_iter {
+            let Some(height) = self.header_chain.height_of_hash(curr) else {
+                break;
+            };
             self.header_chain.set_commitment(commitment, curr);
+            updates.push(IndexedFilterCommitment::new(height, commitment.filter_hash));
             match self.header_chain.header_at_hash(curr) {
                 Some(header) => {
                     curr = header.prev_blockhash;
@@ -260,6 +271,8 @@ impl Chain {
                 None => break,
             }
         }
+        updates.reverse();
+        updates
     }
 
     // We need to make this public for new peers that connect to us throughout syncing the filter headers
@@ -390,6 +403,10 @@ impl Chain {
     // Clear the filter header cache to rescan the filters for new scripts.
     pub(crate) fn clear_filters(&mut self) {
         self.header_chain.reset_all_filters();
+    }
+
+    pub(crate) fn assume_filters_checked_to(&mut self, assumed_height: u32) {
+        self.header_chain.assume_checked_to(assumed_height);
     }
 
     pub(crate) async fn send_chain_update(&self) {

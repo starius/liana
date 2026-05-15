@@ -3,10 +3,12 @@ use std::collections::{BTreeMap, HashMap};
 use crate::HeaderCheckpoint;
 
 use bitcoin::{
-    block::Header, constants::genesis_block, BlockHash, CompactTarget, FilterHash, Network, Work,
+    block::Header, constants::genesis_block, hashes::Hash, BlockHash, CompactTarget, FilterHash,
+    Network, Work,
 };
 
 use super::{FilterCommitment, HeightExt, IndexedHeader, ZerolikeExt};
+use super::IndexedFilterState;
 
 type Height = u32;
 
@@ -95,6 +97,7 @@ pub struct BlockTree {
     active_tip: Tip,
     candidate_forks: Vec<Tip>,
     network: Network,
+    assumed_checked_height: Option<Height>,
 }
 
 #[allow(unused)]
@@ -107,6 +110,7 @@ impl BlockTree {
             active_tip: tip,
             candidate_forks: Vec::with_capacity(2),
             network,
+            assumed_checked_height: None,
         }
     }
 
@@ -126,7 +130,23 @@ impl BlockTree {
             active_tip: tip,
             candidate_forks: Vec::with_capacity(2),
             network,
+            assumed_checked_height: None,
         }
+    }
+
+    pub(crate) fn from_filter_states(states: Vec<IndexedFilterState>, network: Network) -> Self {
+        let mut state_iter = states.into_iter();
+        let Some(first) = state_iter.next() else {
+            return Self::from_genesis(network);
+        };
+        let mut block_tree = BlockTree::new(IndexedHeader::new(first.height, first.header), network);
+        let mut previous_filter_header = bitcoin::FilterHeader::all_zeros();
+        block_tree.apply_filter_state(first, &mut previous_filter_header);
+        for state in state_iter {
+            let _ = block_tree.accept_header(state.header);
+            block_tree.apply_filter_state(state, &mut previous_filter_header);
+        }
+        block_tree
     }
 
     pub(crate) fn accept_header(&mut self, new_header: Header) -> AcceptHeaderChanges {
@@ -163,7 +183,14 @@ impl BlockTree {
                 .map(|block| block.acc_work)
                 .unwrap_or(Work::zero());
             let new_work = prev_work + new_header.work();
-            let new_block_node = BlockNode::new(new_height, new_header, new_work);
+            let mut new_block_node = BlockNode::new(new_height, new_header, new_work);
+            if self
+                .assumed_checked_height
+                .map(|height| new_height <= height)
+                .unwrap_or(false)
+            {
+                new_block_node.filter_checked = true;
+            }
             self.headers.insert(new_hash, new_block_node);
             self.active_tip = new_tip;
             self.canonical_hashes.insert(new_height, new_hash);
@@ -207,7 +234,14 @@ impl BlockTree {
                     height: new_height,
                     next_work_required: next_work,
                 };
-                let new_block_node = BlockNode::new(new_height, new_header, acc_work);
+                let mut new_block_node = BlockNode::new(new_height, new_header, acc_work);
+                if self
+                    .assumed_checked_height
+                    .map(|height| new_height <= height)
+                    .unwrap_or(false)
+                {
+                    new_block_node.filter_checked = true;
+                }
                 self.headers.insert(new_hash, new_block_node);
                 if acc_work
                     > self
@@ -260,7 +294,14 @@ impl BlockTree {
                     next_work_required: next_work,
                 };
                 self.candidate_forks.push(new_tip);
-                let new_block_node = BlockNode::new(new_height, new_header, acc_work);
+                let mut new_block_node = BlockNode::new(new_height, new_header, acc_work);
+                if self
+                    .assumed_checked_height
+                    .map(|height| new_height <= height)
+                    .unwrap_or(false)
+                {
+                    new_block_node.filter_checked = true;
+                }
                 self.headers.insert(new_hash, new_block_node);
                 AcceptHeaderChanges::ExtendedFork {
                     connected_at: IndexedHeader::new(new_height, new_header),
@@ -401,6 +442,11 @@ impl BlockTree {
     }
 
     pub(crate) fn assume_checked_to(&mut self, assumed_height: Height) {
+        self.assumed_checked_height = Some(
+            self.assumed_checked_height
+                .map(|height| height.max(assumed_height))
+                .unwrap_or(assumed_height),
+        );
         let mut curr = self.tip_hash();
         while let Some(node) = self.headers.get_mut(&curr) {
             if node.height <= assumed_height {
@@ -498,6 +544,33 @@ impl BlockTree {
             current: self.active_tip.hash,
         }
     }
+
+    fn apply_filter_state(
+        &mut self,
+        state: IndexedFilterState,
+        previous_filter_header: &mut bitcoin::FilterHeader,
+    ) {
+        let block_hash = state.header.block_hash();
+        if let Some(filter_hash) = state.filter_hash {
+            let filter_header = filter_hash.filter_header(previous_filter_header);
+            self.set_commitment(
+                FilterCommitment {
+                    header: filter_header,
+                    filter_hash,
+                },
+                block_hash,
+            );
+            *previous_filter_header = filter_header;
+        }
+        if state.filter_checked {
+            self.check_filter(block_hash);
+            self.assumed_checked_height = Some(
+                self.assumed_checked_height
+                    .map(|height| height.max(state.height))
+                    .unwrap_or(state.height),
+            );
+        }
+    }
 }
 
 pub(crate) struct BlockHeaderIterator<'a> {
@@ -533,6 +606,7 @@ impl<'a> Iterator for BlockNodeIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::hashes::Hash;
     use corepc_node::serde_json;
     use std::fs::File;
     use std::str::FromStr;
@@ -560,6 +634,17 @@ mod tests {
         let file = File::open("./tests/data/graph_scenarios.json").unwrap();
         let graph_cases: GraphTestFile = serde_json::from_reader(&file).unwrap();
         graph_cases.scenarios[index].clone()
+    }
+
+    fn test_header(prev_blockhash: BlockHash, time: u32, nonce: u32) -> Header {
+        Header {
+            version: bitcoin::block::Version::from_consensus(1),
+            prev_blockhash,
+            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+            time,
+            bits: bitcoin::CompactTarget::from_consensus(0x1d00ffff),
+            nonce,
+        }
     }
 
     #[test]
@@ -700,6 +785,52 @@ mod tests {
         chain.assume_checked_to(3);
         assert!(!chain.filters_synced());
         chain.assume_checked_to(4);
+        assert!(chain.filters_synced());
+    }
+
+    #[test]
+    fn assume_checked_height_marks_future_headers() {
+        let genesis = test_header(BlockHash::all_zeros(), 10, 0);
+        let block1 = test_header(genesis.block_hash(), 20, 1);
+        let block2 = test_header(block1.block_hash(), 30, 2);
+
+        let mut chain = BlockTree::new(IndexedHeader::new(0, genesis), Network::Regtest);
+        chain.assume_checked_to(2);
+        let _ = chain.accept_header(block1);
+        let _ = chain.accept_header(block2);
+
+        assert!(chain.is_filter_checked(&block1.block_hash()));
+        assert!(chain.is_filter_checked(&block2.block_hash()));
+    }
+
+    #[test]
+    fn restores_filter_states_with_commitments() {
+        let genesis = test_header(BlockHash::all_zeros(), 10, 0);
+        let block1 = test_header(genesis.block_hash(), 20, 1);
+        let filter_hash = bitcoin::FilterHash::hash(b"filter-1");
+
+        let chain = BlockTree::from_filter_states(
+            vec![
+                IndexedFilterState {
+                    height: 0,
+                    header: genesis,
+                    filter_hash: None,
+                    filter_checked: true,
+                },
+                IndexedFilterState {
+                    height: 1,
+                    header: block1,
+                    filter_hash: Some(filter_hash),
+                    filter_checked: true,
+                },
+            ],
+            Network::Regtest,
+        );
+
+        assert_eq!(chain.height(), 1);
+        assert_eq!(chain.filter_hash(block1.block_hash()), Some(filter_hash));
+        assert!(chain.is_filter_checked(&block1.block_hash()));
+        assert!(chain.filter_headers_synced());
         assert!(chain.filters_synced());
     }
 }

@@ -399,11 +399,13 @@ pub enum DaemonHandle {
     Controller {
         poller_sender: mpsc::SyncSender<poller::PollerMessage>,
         poller_handle: thread::JoinHandle<()>,
+        bitcoin: sync::Arc<sync::Mutex<dyn BitcoinInterface>>,
         control: DaemonControl,
     },
     Server {
         poller_sender: mpsc::SyncSender<poller::PollerMessage>,
         poller_handle: thread::JoinHandle<()>,
+        bitcoin: sync::Arc<sync::Mutex<dyn BitcoinInterface>>,
         rpcserver_shutdown: sync::Arc<sync::atomic::AtomicBool>,
         rpcserver_handle: thread::JoinHandle<Result<(), io::Error>>,
     },
@@ -502,7 +504,7 @@ impl DaemonHandle {
 
         // Create the API the external world will use to talk to us, either directly through the Rust
         // structure or through the JSONRPC server we may setup below.
-        let control = DaemonControl::new(config, bit, poller_sender.clone(), db, secp);
+        let control = DaemonControl::new(config, bit.clone(), poller_sender.clone(), db, secp);
 
         if with_rpc_server {
             let rpcserver_shutdown = sync::Arc::from(sync::atomic::AtomicBool::from(false));
@@ -520,6 +522,7 @@ impl DaemonHandle {
             return Ok(DaemonHandle::Server {
                 poller_sender,
                 poller_handle,
+                bitcoin: bit.clone(),
                 rpcserver_shutdown,
                 rpcserver_handle,
             });
@@ -528,6 +531,7 @@ impl DaemonHandle {
         Ok(DaemonHandle::Controller {
             poller_sender,
             poller_handle,
+            bitcoin: bit.clone(),
             control,
         })
     }
@@ -568,8 +572,10 @@ impl DaemonHandle {
             Self::Controller {
                 poller_sender,
                 poller_handle,
+                bitcoin,
                 ..
             } => {
+                bitcoin.lock().unwrap().shutdown();
                 poller_sender
                     .send(poller::PollerMessage::Shutdown)
                     .expect("The other end should never have hung up before this.");
@@ -579,9 +585,11 @@ impl DaemonHandle {
             Self::Server {
                 poller_sender,
                 poller_handle,
+                bitcoin,
                 rpcserver_shutdown,
                 rpcserver_handle,
             } => {
+                bitcoin.lock().unwrap().shutdown();
                 poller_sender
                     .send(poller::PollerMessage::Shutdown)
                     .expect("The other end should never have hung up before this.");
