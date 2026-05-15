@@ -948,9 +948,12 @@ impl Bip157 {
 
     pub fn sync_status_line(&self) -> Option<String> {
         let verified_headers = self.chain_store.last_height().ok().flatten()?;
+        let connected_peers = self.connected_peer_count().unwrap_or(0);
         let progress = *self.progress.lock().unwrap();
         match progress {
             Some(progress) => Some(format_bip157_sync_status(
+                connected_peers,
+                self.required_peers,
                 verified_headers,
                 progress.chain_height(),
                 self.filter_scan_start_height(progress.chain_height()),
@@ -958,9 +961,10 @@ impl Bip157 {
                 self.sync_matched_blocks.borrow().len(),
                 self.sync_seen_block_hashes.borrow().len(),
             )),
-            None if self.synced_tip.get().is_none() || self.full_scan.get() => {
-                Some(format!("{verified_headers} block headers"))
-            }
+            None if self.synced_tip.get().is_none() || self.full_scan.get() => Some(format!(
+                "{connected_peers}/{} peers, {verified_headers} block headers",
+                self.required_peers
+            )),
             None => None,
         }
     }
@@ -995,6 +999,13 @@ impl Bip157 {
         start.min(chain_height)
     }
 
+    fn connected_peer_count(&self) -> Result<usize, Bip157Error> {
+        self.runtime
+            .block_on(self.requester.peer_info())
+            .map(|peers| peers.len())
+            .map_err(|e| Bip157Error::Client(e.to_string()))
+    }
+
     fn persist_peer_cache(&self) {
         if !self.peer_cache_enabled {
             return;
@@ -1026,6 +1037,8 @@ impl Bip157 {
 }
 
 fn format_bip157_sync_status(
+    connected_peers: usize,
+    required_peers: u8,
     verified_headers: u32,
     chain_height: u32,
     filter_start_height: u32,
@@ -1034,13 +1047,15 @@ fn format_bip157_sync_status(
     matched_blocks: usize,
 ) -> String {
     if verified_headers < chain_height {
-        return format!("{verified_headers}/{chain_height} block headers");
+        return format!(
+            "{connected_peers}/{required_peers} peers, {verified_headers}/{chain_height} block headers"
+        );
     }
 
     let checked_filter_height = filters_synced.saturating_sub(1).min(chain_height);
     let filter_end_height = checked_filter_height.max(filter_start_height);
     format!(
-        "{chain_height} block headers, {filter_start_height}-{filter_end_height}/{chain_height} block filters, {downloaded_blocks}/{matched_blocks} blocks"
+        "{connected_peers}/{required_peers} peers, {chain_height} block headers, {filter_start_height}-{filter_end_height}/{chain_height} block filters, {downloaded_blocks}/{matched_blocks} blocks"
     )
 }
 
@@ -1618,16 +1633,16 @@ mod tests {
     #[test]
     fn sync_status_line_reports_header_sync_progress() {
         assert_eq!(
-            format_bip157_sync_status(100_000, 949_540, 941_000, 0, 0, 0),
-            "100000/949540 block headers"
+            format_bip157_sync_status(1, 2, 100_000, 949_540, 941_000, 0, 0, 0),
+            "1/2 peers, 100000/949540 block headers"
         );
     }
 
     #[test]
     fn sync_status_line_reports_filter_window_and_block_downloads() {
         assert_eq!(
-            format_bip157_sync_status(949_540, 949_540, 941_000, 945_001, 5, 10),
-            "949540 block headers, 941000-945000/949540 block filters, 5/10 blocks"
+            format_bip157_sync_status(1, 1, 949_540, 949_540, 941_000, 945_001, 5, 10),
+            "1/1 peers, 949540 block headers, 941000-945000/949540 block filters, 5/10 blocks"
         );
     }
 
