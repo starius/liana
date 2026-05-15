@@ -946,6 +946,25 @@ impl Bip157 {
         }
     }
 
+    pub fn sync_status_line(&self) -> Option<String> {
+        let verified_headers = self.chain_store.last_height().ok().flatten()?;
+        let progress = *self.progress.lock().unwrap();
+        match progress {
+            Some(progress) => Some(format_bip157_sync_status(
+                verified_headers,
+                progress.chain_height(),
+                self.filter_scan_start_height(progress.chain_height()),
+                progress.filters_synced(),
+                self.sync_matched_blocks.borrow().len(),
+                self.sync_seen_block_hashes.borrow().len(),
+            )),
+            None if self.synced_tip.get().is_none() || self.full_scan.get() => {
+                Some(format!("{verified_headers} block headers"))
+            }
+            None => None,
+        }
+    }
+
     pub fn rescan_progress(&self) -> Option<f64> {
         if self.full_scan.get() {
             Some(
@@ -962,6 +981,18 @@ impl Bip157 {
 
     pub fn tip_time(&self) -> Option<u32> {
         self.tip_time.get()
+    }
+
+    fn filter_scan_start_height(&self, chain_height: u32) -> u32 {
+        let start = if self.full_scan.get() {
+            self.rescan_from_height.get().unwrap_or(0)
+        } else {
+            self.assumed_checked_to
+                .get()
+                .map(|height| height.saturating_add(1))
+                .unwrap_or(0)
+        };
+        start.min(chain_height)
     }
 
     fn persist_peer_cache(&self) {
@@ -992,6 +1023,25 @@ impl Bip157 {
             log::warn!("Failed to persist BIP157 peer cache: {error}");
         }
     }
+}
+
+fn format_bip157_sync_status(
+    verified_headers: u32,
+    chain_height: u32,
+    filter_start_height: u32,
+    filters_synced: u32,
+    downloaded_blocks: usize,
+    matched_blocks: usize,
+) -> String {
+    if verified_headers < chain_height {
+        return format!("{verified_headers}/{chain_height} block headers");
+    }
+
+    let checked_filter_height = filters_synced.saturating_sub(1).min(chain_height);
+    let filter_end_height = checked_filter_height.max(filter_start_height);
+    format!(
+        "{chain_height} block headers, {filter_start_height}-{filter_end_height}/{chain_height} block filters, {downloaded_blocks}/{matched_blocks} blocks"
+    )
 }
 
 impl Drop for Bip157 {
@@ -1563,6 +1613,22 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sync_status_line_reports_header_sync_progress() {
+        assert_eq!(
+            format_bip157_sync_status(100_000, 949_540, 941_000, 0, 0, 0),
+            "100000/949540 block headers"
+        );
+    }
+
+    #[test]
+    fn sync_status_line_reports_filter_window_and_block_downloads() {
+        assert_eq!(
+            format_bip157_sync_status(949_540, 949_540, 941_000, 945_001, 5, 10),
+            "949540 block headers, 941000-945000/949540 block filters, 5/10 blocks"
+        );
     }
 
     #[test]

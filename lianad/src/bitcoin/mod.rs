@@ -59,6 +59,11 @@ pub trait BitcoinInterface: Send {
         false
     }
 
+    /// A backend-specific synchronization status line for logs.
+    fn sync_status_line(&self) -> Option<String> {
+        None
+    }
+
     /// Get the best block info.
     fn chain_tip(&self) -> BlockChainTip;
 
@@ -772,6 +777,10 @@ impl BitcoinInterface for bip157::Bip157 {
         bip157::Bip157::should_poll_while_syncing(self)
     }
 
+    fn sync_status_line(&self) -> Option<String> {
+        bip157::Bip157::sync_status_line(self)
+    }
+
     fn start_rescan(
         &mut self,
         _desc: &descriptors::LianaDescriptor,
@@ -821,6 +830,10 @@ impl BitcoinInterface for sync::Arc<sync::Mutex<dyn BitcoinInterface + 'static>>
 
     fn poll_while_syncing(&self) -> bool {
         self.lock().unwrap().poll_while_syncing()
+    }
+
+    fn sync_status_line(&self) -> Option<String> {
+        self.lock().unwrap().sync_status_line()
     }
 
     fn chain_tip(&self) -> BlockChainTip {

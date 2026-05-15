@@ -98,12 +98,16 @@ impl Poller {
                     // with regular poller behaviour.
                     if !synced {
                         let progress = self.bit.sync_progress();
-                        log::info!(
-                            "Block chain synchronization progress: {:.2}% ({} blocks / {} headers)",
-                            progress.rounded_up_progress() * 100.0,
-                            progress.blocks,
-                            progress.headers
-                        );
+                        if let Some(status) = self.bit.sync_status_line() {
+                            log::info!("Block chain synchronization progress: {status}");
+                        } else {
+                            log::info!(
+                                "Block chain synchronization progress: {:.2}% ({} blocks / {} headers)",
+                                progress.rounded_up_progress() * 100.0,
+                                progress.blocks,
+                                progress.headers
+                            );
+                        }
                         synced = progress.is_complete();
                     }
                     // Update `last_poll` even if we don't poll now so that we don't attempt another
@@ -132,12 +136,16 @@ impl Poller {
             // Don't poll until the Bitcoin backend is fully synced.
             if !synced {
                 let progress = self.bit.sync_progress();
-                log::info!(
-                    "Block chain synchronization progress: {:.2}% ({} blocks / {} headers)",
-                    progress.rounded_up_progress() * 100.0,
-                    progress.blocks,
-                    progress.headers
-                );
+                if let Some(status) = self.bit.sync_status_line() {
+                    log::info!("Block chain synchronization progress: {status}");
+                } else {
+                    log::info!(
+                        "Block chain synchronization progress: {:.2}% ({} blocks / {} headers)",
+                        progress.rounded_up_progress() * 100.0,
+                        progress.blocks,
+                        progress.headers
+                    );
+                }
                 synced = progress.is_complete();
                 if !synced {
                     if self.bit.poll_while_syncing() {

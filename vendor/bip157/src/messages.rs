@@ -112,6 +112,21 @@ impl Progress {
         self.chain_height
     }
 
+    /// The number of compact filter headers already assumed or verified.
+    pub fn filter_headers_synced(&self) -> u32 {
+        self.filter_headers
+    }
+
+    /// The number of compact block filters already assumed or checked.
+    pub fn filters_synced(&self) -> u32 {
+        self.filters
+    }
+
+    /// The total number of filters in the current chain state.
+    pub fn total_to_check(&self) -> u32 {
+        self.total_to_check
+    }
+
     /// The total progress represented as a percent.
     pub fn percentage_complete(&self) -> f32 {
         self.fraction_complete() * 100.0
