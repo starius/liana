@@ -109,11 +109,18 @@ where
     ) {
         let state = tree.state.downcast_mut::<CarouselState>();
         if let Event::Window(window::Event::RedrawRequested(now)) = event {
-            if now.duration_since(state.last_transition) > self.interval {
-                state.last_transition = *now;
-                state.current = (state.current + 1) % self.children.len();
+            if self.children.len() > 1 {
+                let elapsed = now.duration_since(state.last_transition);
+                let interval_nanos = self.interval.as_nanos();
+
+                if elapsed >= self.interval && interval_nanos > 0 {
+                    let steps = (elapsed.as_nanos() / interval_nanos) as usize;
+                    state.last_transition += self.interval * steps as u32;
+                    state.current = (state.current + steps) % self.children.len();
+                }
+
+                shell.request_redraw_at(state.last_transition + self.interval);
             }
-            shell.request_redraw();
         }
     }
 
