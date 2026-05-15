@@ -115,7 +115,7 @@ impl DefineBip157 {
         )
     }
 
-    pub fn ping(&self) -> Result<(), Error> {
+    pub async fn ping(&self) -> Result<(), Error> {
         let config = bip157::config_from_values(
             &self.peers.value,
             &self.required_peers.value,
@@ -123,6 +123,8 @@ impl DefineBip157 {
             &self.proxy_addr.value,
         )
         .map_err(Error::Bip157)?;
-        bip157::ping(self.network, &config).map_err(Error::Bip157)
+        bip157::ping(self.network, &config)
+            .await
+            .map_err(Error::Bip157)
     }
 }

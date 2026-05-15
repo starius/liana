@@ -93,11 +93,11 @@ pub fn config_from_values(
     })
 }
 
-pub fn ping(network: Network, config: &Bip157Config) -> Result<(), String> {
+pub async fn ping(network: Network, config: &Bip157Config) -> Result<(), String> {
     let data_dir = ping_data_dir();
     fs::create_dir_all(&data_dir).map_err(|e| format!("Failed to create temp directory: {e}"))?;
 
-    let result = (|| {
+    let result = async {
         let mut builder = Builder::new(network)
             .data_dir(&data_dir)
             .required_peers(config.required_peers)
@@ -118,10 +118,6 @@ pub fn ping(network: Network, config: &Bip157Config) -> Result<(), String> {
         }
 
         let (node, client) = builder.build();
-        let runtime = bip157::tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
         let Client {
             requester,
             info_rx: _,
@@ -129,20 +125,19 @@ pub fn ping(network: Network, config: &Bip157Config) -> Result<(), String> {
             event_rx: _,
         } = client;
         let shutdown = requester.clone();
-        let handle = runtime.spawn(async move { node.run().await });
-        let result = runtime.block_on(async {
-            bip157::tokio::time::timeout(BIP157_RESPONSE_TIMEOUT, requester.chain_tip()).await
-        });
+        let handle = bip157::tokio::spawn(async move { node.run().await });
+        let result =
+            bip157::tokio::time::timeout(BIP157_RESPONSE_TIMEOUT, requester.chain_tip()).await;
         let _ = shutdown.shutdown();
-        let _ = runtime
-            .block_on(async { bip157::tokio::time::timeout(PING_SHUTDOWN_TIMEOUT, handle).await });
+        let _ = bip157::tokio::time::timeout(PING_SHUTDOWN_TIMEOUT, handle).await;
 
         match result {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(err)) => Err(err.to_string()),
             Err(_) => Err("Timed out while contacting compact-filter peers".into()),
         }
-    })();
+    }
+    .await;
 
     let _ = fs::remove_dir_all(&data_dir);
     result

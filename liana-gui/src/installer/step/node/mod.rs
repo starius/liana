@@ -18,6 +18,7 @@ use crate::{
 
 use iced::Task;
 use liana_ui::widget::Element;
+use tokio::task;
 
 #[derive(Clone)]
 pub enum NodeDefinition {
@@ -83,11 +84,15 @@ impl NodeDefinition {
         }
     }
 
-    fn ping(&self) -> Result<(), Error> {
+    async fn ping(self) -> Result<(), Error> {
         match self {
-            NodeDefinition::Bitcoind(def) => def.ping(),
-            NodeDefinition::Electrum(def) => def.ping(),
-            NodeDefinition::Bip157(def) => def.ping(),
+            NodeDefinition::Bitcoind(def) => task::spawn_blocking(move || def.ping())
+                .await
+                .map_err(|e| Error::Unexpected(format!("Bitcoind ping task failed: {e}")))?,
+            NodeDefinition::Electrum(def) => task::spawn_blocking(move || def.ping())
+                .await
+                .map_err(|e| Error::Unexpected(format!("Electrum ping task failed: {e}")))?,
+            NodeDefinition::Bip157(def) => def.ping().await,
         }
     }
 }
@@ -203,7 +208,7 @@ impl Step for DefineNode {
                         selected.is_running = None;
                         let def = selected.definition.clone();
                         let node_type = def.node_type();
-                        return Task::perform(async move { def.ping() }, move |res| {
+                        return Task::perform(async move { def.ping().await }, move |res| {
                             Message::DefineNode(message::DefineNode::PingResult((node_type, res)))
                         });
                     }
