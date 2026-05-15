@@ -157,15 +157,13 @@ pub struct Bip157 {
     main_descriptor: LianaDescriptor,
     db: sync::Arc<sync::Mutex<dyn DatabaseInterface>>,
     runtime: bip157::tokio::runtime::Runtime,
-    chain_store: ChainStore,
+    shared_storage: sync::Arc<SharedStorage>,
     node_data_dir: PathBuf,
     bootstrap_peers: Vec<TrustedPeer>,
     required_peers: u8,
     whitelist_only: bool,
     proxy_addr: Option<SocketAddr>,
-    peer_cache_path: PathBuf,
     peer_cache_enabled: bool,
-    snapshot_path: PathBuf,
     synced_tip: Cell<Option<BlockChainTip>>,
     tip_time: Cell<Option<u32>>,
     next_seen_at: Cell<u64>,
@@ -184,6 +182,41 @@ pub struct Bip157 {
     network: bitcoin::Network,
 }
 
+#[derive(Debug)]
+struct SharedStorage {
+    chain_store: ChainStore,
+    snapshot_path: PathBuf,
+    peer_cache_path: PathBuf,
+}
+
+impl SharedStorage {
+    fn new(data_dir: &DataDirectory) -> Self {
+        let storage_dir = shared_storage_dir(data_dir);
+        Self {
+            chain_store: ChainStore::new(storage_dir.join(CHAIN_STORE_FILE)),
+            snapshot_path: storage_dir.join(SNAPSHOT_FILE),
+            peer_cache_path: storage_dir.join(PEER_CACHE_FILE),
+        }
+    }
+}
+
+fn shared_storage(data_dir: &DataDirectory) -> sync::Arc<SharedStorage> {
+    static SHARED_STORAGES: sync::OnceLock<
+        sync::Mutex<HashMap<PathBuf, sync::Weak<SharedStorage>>>,
+    > = sync::OnceLock::new();
+
+    let storage_dir = shared_storage_dir(data_dir);
+    let registry = SHARED_STORAGES.get_or_init(|| sync::Mutex::new(HashMap::new()));
+    let mut registry = registry.lock().expect("shared storage registry");
+    if let Some(shared) = registry.get(&storage_dir).and_then(sync::Weak::upgrade) {
+        return shared;
+    }
+
+    let shared = sync::Arc::new(SharedStorage::new(data_dir));
+    registry.insert(storage_dir, sync::Arc::downgrade(&shared));
+    shared
+}
+
 impl Bip157 {
     pub fn new(
         bitcoin_config: &config::BitcoinConfig,
@@ -199,20 +232,18 @@ impl Bip157 {
             let chain_hash = ChainHash::using_genesis_block(network);
             BlockHash::from_byte_array(*chain_hash.as_bytes())
         };
-        let chain_store = ChainStore::new(chain_store_path(data_dir));
-        chain_store.ensure_header(IndexedHeader {
+        let shared_storage = shared_storage(data_dir);
+        shared_storage.chain_store.ensure_header(IndexedHeader {
             height: 0,
             header: genesis_header,
         })?;
-        let peer_cache_path = peer_cache_path(data_dir);
-        let snapshot_path = snapshot_path(data_dir);
-        let snapshot = load_snapshot(&snapshot_path)?;
-        seed_chain_store_from_snapshot(&chain_store, snapshot.as_ref())?;
+        let snapshot = load_snapshot(&shared_storage.snapshot_path)?;
+        seed_chain_store_from_snapshot(&shared_storage.chain_store, snapshot.as_ref())?;
         let bootstrap_peers = bip157_config.peers.clone();
         let mut cached_bootstrap_peers = Vec::new();
         if !bip157_config.whitelist_only {
-            for cached_peer in
-                peer_cache::load(&peer_cache_path).map_err(|e| Bip157Error::Io(e.to_string()))?
+            for cached_peer in peer_cache::load(&shared_storage.peer_cache_path)
+                .map_err(|e| Bip157Error::Io(e.to_string()))?
             {
                 if !bootstrap_peers.contains(&cached_peer.address)
                     && !cached_bootstrap_peers
@@ -237,22 +268,28 @@ impl Bip157 {
             &db,
             main_descriptor,
             genesis_hash,
-            &chain_store,
+            &shared_storage.chain_store,
             snapshot.as_ref(),
             synced_tip,
             None,
             None,
             &HashMap::new(),
         )?;
-        let tip_time = chain_store.tip_time()?;
-        let assumed_checked_to = chain_store
+        let tip_time = shared_storage.chain_store.tip_time()?;
+        let assumed_checked_to = shared_storage
+            .chain_store
             .contiguous_filter_states()?
             .into_iter()
             .filter(|state| state.filter_checked)
             .map(|state| state.height)
             .max();
 
-        let chain_state = chain_state_from(&chain_store, snapshot.as_ref(), synced_tip, network)?;
+        let chain_state = chain_state_from(
+            &shared_storage.chain_store,
+            snapshot.as_ref(),
+            synced_tip,
+            network,
+        )?;
         let node_data_dir = node_data_dir(data_dir);
         let mut bootstrap_peers = if !bootstrap_peers.is_empty() {
             bootstrap_peers
@@ -289,15 +326,13 @@ impl Bip157 {
             main_descriptor: main_descriptor.clone(),
             db,
             runtime,
-            chain_store,
+            shared_storage,
             node_data_dir,
             bootstrap_peers,
             required_peers: bip157_config.required_peers,
             whitelist_only: bip157_config.whitelist_only,
             proxy_addr: bip157_config.proxy_addr,
-            peer_cache_path,
             peer_cache_enabled: !bip157_config.whitelist_only,
-            snapshot_path,
             synced_tip: Cell::new(synced_tip),
             tip_time: Cell::new(tip_time),
             next_seen_at: Cell::new(0),
@@ -345,7 +380,7 @@ impl Bip157 {
     }
 
     pub fn is_in_wallet_chain(&self, tip: BlockChainTip) -> Option<bool> {
-        self.chain_store
+        self.chain_store()
             .contains_tip(tip)
             .ok()
             .or_else(|| self.bdk_wallet.borrow().is_in_chain(tip))
@@ -402,8 +437,8 @@ impl Bip157 {
             }
             Some(header_height)
         } else {
-            flush_connected_headers(&self.chain_store, pending_headers)?;
-            self.chain_store
+            flush_connected_headers(self.chain_store(), pending_headers)?;
+            self.chain_store()
                 .block_before_date(wallet_timestamp)?
                 .map(|tip| height_u32_from_i32(tip.height))
         };
@@ -425,7 +460,7 @@ impl Bip157 {
             .assume_filters_checked_to(desired_height)
             .map_err(|e| Bip157Error::Client(e.to_string()))?;
         self.assumed_checked_to.set(Some(desired_height));
-        self.chain_store
+        self.chain_store()
             .mark_filters_checked_through(desired_height)?;
 
         Ok(())
@@ -436,14 +471,14 @@ impl Bip157 {
         pending_headers: &mut Vec<IndexedHeader>,
         pending_filter_hashes: &mut BTreeMap<u32, bitcoin::FilterHash>,
     ) -> Result<(), Bip157Error> {
-        flush_connected_headers(&self.chain_store, pending_headers)?;
-        flush_filter_hashes(&self.chain_store, pending_filter_hashes)?;
-        self.tip_time.set(self.chain_store.tip_time()?);
+        flush_connected_headers(self.chain_store(), pending_headers)?;
+        flush_filter_hashes(self.chain_store(), pending_filter_hashes)?;
+        self.tip_time.set(self.chain_store().tip_time()?);
         Ok(())
     }
 
     pub fn block_before_date(&self, timestamp: u32) -> Option<BlockChainTip> {
-        self.chain_store
+        self.chain_store()
             .block_before_date(timestamp)
             .ok()
             .flatten()
@@ -512,7 +547,7 @@ impl Bip157 {
         if self.shutdown_requested.get() {
             return Err(Bip157Error::Shutdown);
         }
-        let previous_snapshot = load_snapshot(&self.snapshot_path)?;
+        let previous_snapshot = load_snapshot(&self.shared_storage.snapshot_path)?;
         let (db_tip, wallet_timestamp) = {
             let mut db_conn = self.db.connection();
             (db_conn.chain_tip(), db_conn.timestamp())
@@ -521,7 +556,7 @@ impl Bip157 {
             &self.db,
             &self.main_descriptor,
             self.genesis_hash,
-            &self.chain_store,
+            self.chain_store(),
             previous_snapshot.as_ref(),
             self.synced_tip.get(),
             Some(receive_index),
@@ -570,7 +605,7 @@ impl Bip157 {
         ) == self.synced_tip.get()
         {
             *self.bdk_wallet.borrow_mut() = bdk_wallet;
-            self.tip_time.set(self.chain_store.tip_time()?);
+            self.tip_time.set(self.chain_store().tip_time()?);
             self.persist_peer_cache();
             return Ok(None);
         }
@@ -648,7 +683,7 @@ impl Bip157 {
                         pending_filter_hashes.insert(height, filter_hash);
                     }
                     if pending_filter_hashes.len() >= HEADER_FLUSH_BATCH_SIZE {
-                        flush_filter_hashes(&self.chain_store, &mut pending_filter_hashes)?;
+                        flush_filter_hashes(self.chain_store(), &mut pending_filter_hashes)?;
                     }
                 }
                 Event::IndexedFilter(filter) => {
@@ -672,7 +707,7 @@ impl Bip157 {
                     let header_time = header.header.time;
                     pending_headers.push(header);
                     if pending_headers.len() >= HEADER_FLUSH_BATCH_SIZE {
-                        flush_connected_headers(&self.chain_store, &mut pending_headers)?;
+                        flush_connected_headers(self.chain_store(), &mut pending_headers)?;
                     }
                     if let Some(timestamp) = automatic_assume_timestamp {
                         self.maybe_advance_assumed_filter_height(
@@ -702,9 +737,9 @@ impl Bip157 {
                         ));
                     }
                     self.flush_sync_progress(&mut pending_headers, &mut pending_filter_hashes)?;
-                    apply_reorg_to_store(&self.chain_store, &accepted, &reorganized)?;
+                    apply_reorg_to_store(self.chain_store(), &accepted, &reorganized)?;
                     if let Some(assumed_height) = self.assumed_checked_to.get() {
-                        self.chain_store
+                        self.chain_store()
                             .mark_filters_checked_through(assumed_height)?;
                     }
                 }
@@ -717,7 +752,7 @@ impl Bip157 {
                         .copied()
                         .collect::<Vec<_>>();
                     if !checked_heights.is_empty() {
-                        self.chain_store.set_filter_checked(&checked_heights)?;
+                        self.chain_store().set_filter_checked(&checked_heights)?;
                     }
                     let tip = BlockChainTip {
                         hash: update.tip().hash,
@@ -744,7 +779,7 @@ impl Bip157 {
 
                     let snapshot = StoredSnapshot::from_recent_history(update.recent_history());
                     let initial_headers =
-                        wallet_local_chain_headers(&self.chain_store, Some(&snapshot), tip, &[])?;
+                        wallet_local_chain_headers(self.chain_store(), Some(&snapshot), tip, &[])?;
                     let local_chain =
                         local_chain_from_headers(self.genesis_hash, &initial_headers)?;
                     bdk_wallet.set_local_chain(local_chain);
@@ -754,7 +789,7 @@ impl Bip157 {
                         .into_values()
                         .collect::<Vec<_>>();
                     let wallet_headers = wallet_local_chain_headers(
-                        &self.chain_store,
+                        self.chain_store(),
                         Some(&snapshot),
                         tip,
                         &wallet_coins,
@@ -769,8 +804,8 @@ impl Bip157 {
                             .unwrap_or(true)
                     });
 
-                    save_snapshot(&self.snapshot_path, &snapshot)?;
-                    self.tip_time.set(self.chain_store.tip_time()?);
+                    save_snapshot(&self.shared_storage.snapshot_path, &snapshot)?;
+                    self.tip_time.set(self.chain_store().tip_time()?);
                     self.synced_tip.set(Some(tip));
                     self.full_scan.set(false);
                     self.rescan_from_height.set(None);
@@ -807,9 +842,9 @@ impl Bip157 {
         self.scan_request_inflight.set(false);
         self.reset_transient_sync_state();
 
-        let snapshot = load_snapshot(&self.snapshot_path)?;
+        let snapshot = load_snapshot(&self.shared_storage.snapshot_path)?;
         let chain_state = chain_state_from(
-            &self.chain_store,
+            self.chain_store(),
             snapshot.as_ref(),
             self.synced_tip.get(),
             self.network,
@@ -947,7 +982,7 @@ impl Bip157 {
     }
 
     pub fn sync_status_line(&self) -> Option<String> {
-        let verified_headers = self.chain_store.last_height().ok().flatten()?;
+        let verified_headers = self.chain_store().last_height().ok().flatten()?;
         let connected_peers = self.connected_peer_count().unwrap_or(0);
         let progress = *self.progress.lock().unwrap();
         match progress {
@@ -985,6 +1020,10 @@ impl Bip157 {
 
     pub fn tip_time(&self) -> Option<u32> {
         self.tip_time.get()
+    }
+
+    fn chain_store(&self) -> &ChainStore {
+        &self.shared_storage.chain_store
     }
 
     fn filter_scan_start_height(&self, chain_height: u32) -> u32 {
@@ -1030,7 +1069,7 @@ impl Bip157 {
         if peers.is_empty() {
             return;
         }
-        if let Err(error) = peer_cache::save(&self.peer_cache_path, &peers) {
+        if let Err(error) = peer_cache::save(&self.shared_storage.peer_cache_path, &peers) {
             log::warn!("Failed to persist BIP157 peer cache: {error}");
         }
     }
@@ -1183,20 +1222,26 @@ fn default_port(network: bitcoin::Network) -> u16 {
     }
 }
 
-fn snapshot_path(data_dir: &DataDirectory) -> PathBuf {
-    node_data_dir(data_dir).join(SNAPSHOT_FILE)
-}
-
-fn chain_store_path(data_dir: &DataDirectory) -> PathBuf {
-    node_data_dir(data_dir).join(CHAIN_STORE_FILE)
-}
-
-fn peer_cache_path(data_dir: &DataDirectory) -> PathBuf {
-    node_data_dir(data_dir).join(PEER_CACHE_FILE)
-}
-
 fn node_data_dir(data_dir: &DataDirectory) -> PathBuf {
     data_dir.path().join(BIP157_DATA_DIR)
+}
+
+fn shared_storage_dir(data_dir: &DataDirectory) -> PathBuf {
+    shared_chain_root(data_dir).join(BIP157_DATA_DIR)
+}
+
+fn shared_chain_root(data_dir: &DataDirectory) -> PathBuf {
+    let path = data_dir.path();
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    if parent.file_name().is_some_and(|name| name == "data") {
+        return parent
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.to_path_buf());
+    }
+    path.to_path_buf()
 }
 
 fn load_snapshot(path: &Path) -> Result<Option<StoredSnapshot>, Bip157Error> {
@@ -1709,6 +1754,49 @@ mod tests {
         }
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn shared_chain_root_uses_network_directory_for_gui_wallet_paths() {
+        let data_dir = DataDirectory::new(PathBuf::from("/tmp/liana/bitcoin/data/demo-wallet"));
+
+        assert_eq!(
+            shared_chain_root(&data_dir),
+            PathBuf::from("/tmp/liana/bitcoin")
+        );
+        assert_eq!(
+            shared_storage_dir(&data_dir),
+            PathBuf::from("/tmp/liana/bitcoin/bip157")
+        );
+    }
+
+    #[test]
+    fn shared_chain_root_falls_back_to_wallet_directory_for_custom_layouts() {
+        let data_dir = DataDirectory::new(PathBuf::from("/tmp/custom-wallet"));
+
+        assert_eq!(
+            shared_chain_root(&data_dir),
+            PathBuf::from("/tmp/custom-wallet")
+        );
+        assert_eq!(
+            shared_storage_dir(&data_dir),
+            PathBuf::from("/tmp/custom-wallet/bip157")
+        );
+    }
+
+    #[test]
+    fn shared_storage_registry_reuses_network_level_storage() {
+        let first = DataDirectory::new(PathBuf::from("/tmp/liana/bitcoin/data/wallet-a"));
+        let second = DataDirectory::new(PathBuf::from("/tmp/liana/bitcoin/data/wallet-b"));
+
+        let shared_first = shared_storage(&first);
+        let shared_second = shared_storage(&second);
+
+        assert!(sync::Arc::ptr_eq(&shared_first, &shared_second));
+        assert_eq!(
+            shared_first.snapshot_path,
+            PathBuf::from("/tmp/liana/bitcoin/bip157/snapshot.json")
+        );
     }
 
     #[test]
