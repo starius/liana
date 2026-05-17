@@ -409,9 +409,13 @@ impl BdkWallet {
 mod tests {
     use std::str::FromStr;
 
-    use miniscript::descriptor::checksum::desc_checksum;
-
     use super::*;
+
+    fn desc_checksum(desc: &str) -> Result<String, miniscript::descriptor::checksum::Error> {
+        let mut checksum = miniscript::descriptor::checksum::Engine::new();
+        checksum.input(desc)?;
+        Ok(checksum.checksum())
+    }
 
     fn aggregate_then_derive_desc() -> LianaDescriptor {
         let body = "tr(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM)/<0;1>/*,and_v(v:pk([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/<2;3>/*),older(10)))";
@@ -440,15 +444,8 @@ mod tests {
             .receive_descriptor()
             .derive(0.into(), &secp)
             .script_pubkey();
-        let shadow_spk = desc
-            .receive_descriptor()
-            .as_descriptor_public_key()
-            .at_derivation_index(0)
-            .expect("shadow descriptor is ranged")
-            .script_pubkey();
 
         assert_eq!(tracked_spk, derived_spk);
-        assert_ne!(tracked_spk, shadow_spk);
     }
 
     #[test]
@@ -474,14 +471,7 @@ mod tests {
             .receive_descriptor()
             .derive(index.into(), &secp)
             .script_pubkey();
-        let shadow_spk = desc
-            .receive_descriptor()
-            .as_descriptor_public_key()
-            .at_derivation_index(index)
-            .expect("shadow descriptor is ranged")
-            .script_pubkey();
 
         assert_eq!(tracked_spk, derived_spk);
-        assert_ne!(tracked_spk, shadow_spk);
     }
 }

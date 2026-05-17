@@ -18,7 +18,7 @@ use std::{
     sync,
 };
 
-use crate::descriptors::musig::{indexed_dummy_shadow_key, MuSig2KeyExpr, MuSig2Placeholder};
+use crate::descriptors::musig::MuSig2KeyExpr;
 
 #[derive(Debug)]
 pub enum LianaPolicyError {
@@ -537,6 +537,60 @@ impl RecoveryPathInfo {
         Self::Script(path)
     }
 
+    pub fn from_recovery_policy(
+        policy: SemanticPolicy<descriptor::DescriptorPublicKey>,
+    ) -> Result<(u16, Self), LianaPolicyError> {
+        let (k, subs) = match policy {
+            SemanticPolicy::Thresh(thresh) => (thresh.k(), thresh.into_data()),
+            _ => return Err(LianaPolicyError::IncompatibleDesc),
+        };
+        if k == 2 && subs.len() == 2 {
+            let tl_value = subs
+                .iter()
+                .find_map(|s| match s.as_ref() {
+                    SemanticPolicy::Older(val) => Some(csv_check(val.to_consensus_u32())),
+                    _ => None,
+                })
+                .ok_or(LianaPolicyError::IncompatibleDesc)??;
+            let keys_sub = subs
+                .into_iter()
+                .find(|sub| is_single_key_or_multisig(sub.as_ref()))
+                .ok_or(LianaPolicyError::IncompatibleDesc)?;
+            let path = match keys_sub.as_ref() {
+                SemanticPolicy::Key(descriptor::DescriptorPublicKey::Musig(musig)) => {
+                    Self::MuSig2(MuSig2KeyExpr::from_musig_key(musig.clone())?)
+                }
+                _ => Self::Script(PathInfo::from_primary_path(keys_sub.as_ref().clone())?),
+            };
+            Ok((tl_value, path))
+        } else if k == subs.len() && subs.len() > 2 {
+            let mut tl_value = None;
+            let mut keys = Vec::with_capacity(subs.len());
+            for sub in subs {
+                match sub.as_ref() {
+                    SemanticPolicy::Key(descriptor::DescriptorPublicKey::Musig(_)) => {
+                        return Err(LianaPolicyError::IncompatibleDesc)
+                    }
+                    SemanticPolicy::Key(key) => keys.push(key.clone()),
+                    SemanticPolicy::Older(val) => {
+                        if tl_value.is_some() {
+                            return Err(LianaPolicyError::IncompatibleDesc);
+                        }
+                        tl_value = Some(csv_check(val.to_consensus_u32())?);
+                    }
+                    _ => return Err(LianaPolicyError::IncompatibleDesc),
+                }
+            }
+            assert!(keys.len() > 1);
+            Ok((
+                tl_value.ok_or(LianaPolicyError::IncompatibleDesc)?,
+                Self::Script(PathInfo::Multi(k - 1, keys)),
+            ))
+        } else {
+            Err(LianaPolicyError::IncompatibleDesc)
+        }
+    }
+
     pub fn as_script_path(&self) -> Option<&PathInfo> {
         match self {
             Self::Script(path) => Some(path),
@@ -584,7 +638,7 @@ impl RecoveryPathInfo {
     ) -> Result<ConcretePolicy<descriptor::DescriptorPublicKey>, LianaPolicyError> {
         match self {
             Self::Script(path) => path.into_ms_policy(),
-            Self::MuSig2(_) => Err(LianaPolicyError::InvalidMuSig2Expression),
+            Self::MuSig2(expr) => Ok(ConcretePolicy::Key(expr.descriptor_key())),
         }
     }
 
@@ -633,7 +687,12 @@ impl PrimaryPathInfo {
     pub fn from_primary_path(
         policy: SemanticPolicy<descriptor::DescriptorPublicKey>,
     ) -> Result<Self, LianaPolicyError> {
-        PathInfo::from_primary_path(policy).map(Self::KeyPath)
+        match policy {
+            SemanticPolicy::Key(descriptor::DescriptorPublicKey::Musig(musig)) => {
+                Ok(Self::MuSig2(MuSig2KeyExpr::from_musig_key(musig)?))
+            }
+            policy => PathInfo::from_primary_path(policy).map(Self::KeyPath),
+        }
     }
 
     pub fn as_key_path(&self) -> Option<&PathInfo> {
@@ -722,7 +781,7 @@ impl PrimaryPathInfo {
     ) -> Result<ConcretePolicy<descriptor::DescriptorPublicKey>, LianaPolicyError> {
         match self {
             Self::KeyPath(path) => path.into_ms_policy(),
-            Self::MuSig2(_) => Err(LianaPolicyError::InvalidMuSig2Expression),
+            Self::MuSig2(expr) => Ok(ConcretePolicy::Key(expr.descriptor_key())),
         }
     }
 
@@ -776,6 +835,23 @@ fn get_multi_xkey(desc_key: &descriptor::DescriptorPublicKey) -> Option<&bip32::
     }
 }
 
+fn descriptor_key_xkeys<'a>(
+    desc_key: &'a descriptor::DescriptorPublicKey,
+    out: &mut Vec<&'a bip32::Xpub>,
+) -> Option<()> {
+    match desc_key {
+        descriptor::DescriptorPublicKey::XPub(xpub) => out.push(&xpub.xkey),
+        descriptor::DescriptorPublicKey::MultiXPub(xpub) => out.push(&xpub.xkey),
+        descriptor::DescriptorPublicKey::Musig(musig) => {
+            for participant in musig.participants() {
+                descriptor_key_xkeys(participant, out)?;
+            }
+        }
+        descriptor::DescriptorPublicKey::Single(_) => return None,
+    }
+    Some(())
+}
+
 // Construct an unspendable xpub to be used as internal key in a Taproot descriptor, in a way which
 // could eventually be standardized into wallet policies for a signer to display to the user
 // "UNSPENDABLE" upon registration (instead of a meaningless key).
@@ -783,27 +859,34 @@ fn get_multi_xkey(desc_key: &descriptor::DescriptorPublicKey) -> Option<&bip32::
 //
 // Returns `None` if:
 // - The given descriptor does not contain a Taptree with at least a key in each leaf.
-// - The keys contained in the descriptor aren't all MultiXPub's.
+// - The keys contained in the descriptor aren't all extended keys.
 fn unspendable_internal_xpub(
     desc: &descriptor::Tr<descriptor::DescriptorPublicKey>,
 ) -> Option<bip32::Xpub> {
-    let tap_tree = desc.tap_tree().as_ref()?;
+    let tap_tree = desc.tap_tree()?;
 
     // Fetch the network to use for the unspendable key from the first key in the descriptor.
-    let first_key = tap_tree.iter().flat_map(|(_, ms)| ms.iter_pk()).next()?;
-    let network = get_multi_xkey(&first_key)?.network;
+    let first_key = tap_tree
+        .leaves()
+        .flat_map(|leaf| leaf.miniscript().iter_pk())
+        .next()?;
+    let mut first_xkeys = Vec::new();
+    descriptor_key_xkeys(&first_key, &mut first_xkeys)?;
+    let network = first_xkeys.first()?.network;
 
     // Compute the chaincode to use for the xpub. This is the sha256() of the concatenation of all
     // the xpubs' pubkey part in the Taptree.
-    let concat =
-        tap_tree
-            .iter()
-            .flat_map(|(_, ms)| ms.iter_pk())
-            .try_fold(Vec::new(), |mut acc, pk| {
-                let xkey = get_multi_xkey(&pk)?;
+    let concat = tap_tree
+        .leaves()
+        .flat_map(|leaf| leaf.miniscript().iter_pk())
+        .try_fold(Vec::new(), |mut acc, pk| {
+            let mut xkeys = Vec::new();
+            descriptor_key_xkeys(&pk, &mut xkeys)?;
+            for xkey in xkeys {
                 acc.extend_from_slice(&xkey.public_key.serialize());
-                Some(acc)
-            })?;
+            }
+            Some(acc)
+        })?;
     let chain_code = bip32::ChainCode::from(sha256::Hash::hash(&concat).as_ref());
 
     // Construct the unspendable key. The pubkey part is always BIP341's NUMS.
@@ -943,18 +1026,7 @@ impl LianaPolicy {
             is_taproot,
         };
         if compile {
-            if policy.contains_musig2() {
-                let (shadow_primary_path, shadow_recovery_paths, _) =
-                    shadow_musig2_paths(&policy.primary_path, &policy.recovery_paths);
-                let shadow_policy = LianaPolicy {
-                    primary_path: shadow_primary_path,
-                    recovery_paths: shadow_recovery_paths,
-                    is_taproot: policy.is_taproot,
-                };
-                shadow_policy.compile_multipath_descriptor_fallible()?;
-            } else {
-                policy.clone().compile_multipath_descriptor_fallible()?;
-            }
+            policy.clone().compile_multipath_descriptor_fallible()?;
         }
         Ok(policy)
     }
@@ -989,19 +1061,6 @@ impl LianaPolicy {
             recovery_paths,
             /* is_taproot = */ true,
             /* compile = */ true,
-        )
-    }
-
-    pub(crate) fn from_parts_uncompiled(
-        primary_path: PrimaryPathInfo,
-        recovery_paths: BTreeMap<u16, RecoveryPathInfo>,
-        is_taproot: bool,
-    ) -> Result<LianaPolicy, LianaPolicyError> {
-        Self::_new(
-            primary_path,
-            recovery_paths,
-            is_taproot,
-            /* compile = */ false,
         )
     }
 
@@ -1046,13 +1105,10 @@ impl LianaPolicy {
         // Lift a semantic policy out of this Miniscript and normalize it to make sure we compare
         // apples to apples below.
         let policy = match desc {
-            descriptor::Descriptor::Wsh(wsh_desc) => {
-                let ms = match wsh_desc.as_inner() {
-                    descriptor::WshInner::Ms(ms) => ms,
-                    _ => return Err(LianaPolicyError::IncompatibleDesc),
-                };
-                ms.lift().map_err(LianaPolicyError::PolicyAnalysis)?
-            }
+            descriptor::Descriptor::Wsh(wsh_desc) => wsh_desc
+                .as_inner()
+                .lift()
+                .map_err(LianaPolicyError::PolicyAnalysis)?,
             descriptor::Descriptor::Tr(desc) => {
                 // For Taproot, make sure to not take the internal key into account in the semantic
                 // policy if it's unspendable.
@@ -1060,9 +1116,10 @@ impl LianaPolicy {
                     let tree_policy = tree.lift().map_err(LianaPolicyError::PolicyAnalysis)?;
                     let unspend_int_xpub = unspendable_internal_xpub(desc)
                         .ok_or(LianaPolicyError::IncompatibleDesc)?;
-                    let desc_int_xpub = get_multi_xkey(desc.internal_key())
-                        .ok_or(LianaPolicyError::IncompatibleDesc)?;
-                    if *desc_int_xpub == unspend_int_xpub {
+                    if get_multi_xkey(desc.internal_key())
+                        .map(|desc_int_xpub| *desc_int_xpub == unspend_int_xpub)
+                        .unwrap_or(false)
+                    {
                         tree_policy
                     } else {
                         SemanticPolicy::Thresh(Threshold::or(
@@ -1123,11 +1180,11 @@ impl LianaPolicy {
             } else {
                 // If it's not a simple (multi)key check, it must be (one of) the timelocked
                 // recovery path(s).
-                let (timelock, path_info) = PathInfo::from_recovery_path(sub)?;
+                let (timelock, path_info) = RecoveryPathInfo::from_recovery_policy(sub)?;
                 if recovery_paths.contains_key(&timelock) {
                     return Err(LianaPolicyError::IncompatibleDesc);
                 }
-                recovery_paths.insert(timelock, RecoveryPathInfo::from(path_info));
+                recovery_paths.insert(timelock, path_info);
             }
         }
 
@@ -1178,7 +1235,9 @@ impl LianaPolicy {
         recovery_paths
             .into_iter()
             .try_fold(primary_keys, |tl_policy, (timelock, path_info)| {
-                let timelock = ConcretePolicy::Older(RelLockTime::from_height(timelock));
+                let timelock = ConcretePolicy::Older(
+                    RelLockTime::from_height(timelock).expect("u16 CSV height is valid"),
+                );
                 let keys = path_info.into_ms_policy()?;
                 let recovery_branch = ConcretePolicy::And(vec![keys.into(), timelock.into()]);
                 // We assume the larger the timelock the less likely a branch would be used.
@@ -1219,7 +1278,7 @@ impl LianaPolicy {
             let desc = policy
                 .clone()
                 .compile_tr(Some(dummy_internal_key.clone()))
-                .map_err(LianaPolicyError::InvalidPolicy)?;
+                .map_err(|e| LianaPolicyError::InvalidPolicy(e.into()))?;
             let inner_desc = if let descriptor::Descriptor::Tr(ref d) = desc {
                 d
             } else {
@@ -1232,7 +1291,7 @@ impl LianaPolicy {
                     .expect("Desc has a Taptree and only multixpubs.");
                 policy
                     .compile_tr(Some(actual_internal_key))
-                    .map_err(LianaPolicyError::InvalidPolicy)
+                    .map_err(|e| LianaPolicyError::InvalidPolicy(e.into()))
             } else {
                 // A key from the policy could be used as internal key. No need for a deterministic
                 // internal key.
@@ -1269,54 +1328,13 @@ impl LianaPolicy {
         self.compile_multipath_descriptor()
     }
 
-    fn contains_musig2(&self) -> bool {
+    pub(crate) fn contains_musig2(&self) -> bool {
         self.primary_path.musig().is_some()
             || self
                 .recovery_paths
                 .values()
                 .any(|path| path.musig().is_some())
     }
-}
-
-pub(crate) fn shadow_musig2_paths(
-    primary_path: &PrimaryPathInfo,
-    recovery_paths: &BTreeMap<u16, RecoveryPathInfo>,
-) -> (
-    PrimaryPathInfo,
-    BTreeMap<u16, RecoveryPathInfo>,
-    Vec<MuSig2Placeholder>,
-) {
-    let mut placeholders = Vec::new();
-    let shadow_primary_path = match primary_path {
-        PrimaryPathInfo::KeyPath(path) => PrimaryPathInfo::KeyPath(path.clone()),
-        PrimaryPathInfo::MuSig2(expr) => {
-            let placeholder =
-                MuSig2Placeholder::new(indexed_dummy_shadow_key(placeholders.len()), expr.clone());
-            let shadow_key = placeholder.shadow_key().clone();
-            placeholders.push(placeholder);
-            PrimaryPathInfo::KeyPath(PathInfo::Single(shadow_key))
-        }
-    };
-    let shadow_recovery_paths = recovery_paths
-        .iter()
-        .map(|(timelock, path)| {
-            let shadow_path = match path {
-                RecoveryPathInfo::Script(path) => RecoveryPathInfo::Script(path.clone()),
-                RecoveryPathInfo::MuSig2(expr) => {
-                    let placeholder = MuSig2Placeholder::new(
-                        indexed_dummy_shadow_key(placeholders.len()),
-                        expr.clone(),
-                    );
-                    let shadow_key = placeholder.shadow_key().clone();
-                    placeholders.push(placeholder);
-                    RecoveryPathInfo::Script(PathInfo::Single(shadow_key))
-                }
-            };
-            (*timelock, shadow_path)
-        })
-        .collect();
-
-    (shadow_primary_path, shadow_recovery_paths, placeholders)
 }
 
 /// Partial spend information for a specific spending path within a descriptor.

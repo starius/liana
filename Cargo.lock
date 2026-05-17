@@ -527,7 +527,7 @@ version = "0.16.0"
 source = "git+https://github.com/wizardsardine/bdk?branch=release%2F1.0.0-alpha.13#8936e828861f0f32500c4156b6534238e5154b0f"
 dependencies = [
  "bitcoin",
- "miniscript",
+ "miniscript 12.3.1",
 ]
 
 [[package]]
@@ -624,9 +624,9 @@ dependencies = [
 
 [[package]]
 name = "bitcoin"
-version = "0.32.5"
+version = "0.32.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce6bc65742dea50536e35ad42492b234c27904a27f0abdcbce605015cb4ea026"
+checksum = "0fda569d741b895131a88ee5589a467e73e9c4718e958ac9308e4f7dc44b6945"
 dependencies = [
  "base58ck",
  "base64 0.21.7",
@@ -648,7 +648,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f4e7cfd72b4e1eac651e2908660e90e65b729052bfd5d4004395a402c3e655cc"
 dependencies = [
  "aes-gcm",
- "miniscript",
+ "miniscript 12.3.1",
  "num_enum",
  "rand 0.9.2",
 ]
@@ -812,7 +812,7 @@ dependencies = [
  "liana-connect",
  "liana-gui",
  "liana-ui",
- "miniscript",
+ "miniscript 13.0.0",
  "reqwest",
  "rfd",
  "rustls 0.23.36",
@@ -2331,6 +2331,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hex-conservative"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7289f6b628ce69fb1a371d0fdcf8ff38cd93ec00e3010eb055d1e044998c8d1"
+dependencies = [
+ "arrayvec",
+]
+
+[[package]]
 name = "hex_lit"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3168,7 +3177,7 @@ checksum = "38bb192e14da7725505c49791fde863bafee2b28dede2f37e05559fe72c29416"
 dependencies = [
  "async-trait",
  "bitcoin",
- "miniscript",
+ "miniscript 12.3.1",
 ]
 
 [[package]]
@@ -3179,7 +3188,7 @@ dependencies = [
  "bip39",
  "getrandom 0.3.1",
  "log",
- "miniscript",
+ "miniscript 13.0.0",
  "musig2",
  "rdrand",
  "serde",
@@ -3215,7 +3224,7 @@ dependencies = [
  "bip39",
  "getrandom 0.3.1",
  "liana",
- "miniscript",
+ "miniscript 13.0.0",
  "reqwest",
  "serde",
  "serde_json",
@@ -3301,7 +3310,7 @@ dependencies = [
  "jsonrpc",
  "liana",
  "log",
- "miniscript",
+ "miniscript 13.0.0",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3585,6 +3594,16 @@ checksum = "82911d2fb527bb9aacd2446d2f517aff3f8e3846ace1b3c24258b61ea3cce2bc"
 dependencies = [
  "bech32",
  "bitcoin",
+ "serde",
+]
+
+[[package]]
+name = "miniscript"
+version = "13.0.0"
+dependencies = [
+ "bech32",
+ "bitcoin",
+ "hex-conservative 1.1.0",
  "serde",
 ]
 

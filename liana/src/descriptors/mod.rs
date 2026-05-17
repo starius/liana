@@ -13,12 +13,12 @@ use miniscript::{
     miniscript::satisfy::Placeholder,
     plan::{Assets, CanSign},
     psbt::{PsbtInputExt, PsbtOutputExt},
-    translate_hash_clone, Descriptor, DescriptorPublicKey, TranslatePk, Translator,
+    translate_hash_clone, Descriptor, DescriptorPublicKey, Translator,
 };
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    convert::TryInto,
+    convert::{Infallible, TryInto},
     error, fmt,
     str::{self, FromStr},
 };
@@ -481,38 +481,17 @@ impl str::FromStr for LianaDescriptor {
     type Err = LianaDescError;
 
     fn from_str(s: &str) -> Result<LianaDescriptor, Self::Err> {
-        if s.contains("musig(") {
-            let multi_desc = MuSig2TaprootDescriptor::from_str(s)?;
-            let shadow_policy = LianaPolicy::from_multipath_descriptor(multi_desc.shadow_desc())?;
-            let placeholder_exprs = multi_desc
-                .placeholders()
-                .iter()
-                .map(|placeholder| (placeholder.shadow_key().clone(), placeholder.expr().clone()))
-                .collect::<BTreeMap<_, _>>();
-            let primary_path = match shadow_policy.primary_path().as_key_path() {
-                Some(PathInfo::Single(key)) => placeholder_exprs
-                    .get(key)
-                    .cloned()
-                    .map(PrimaryPathInfo::MuSig2)
-                    .unwrap_or_else(|| shadow_policy.primary_path().clone()),
-                _ => shadow_policy.primary_path().clone(),
-            };
-            let recovery_paths = shadow_policy
-                .recovery_paths()
-                .iter()
-                .map(|(timelock, path)| {
-                    let recovery_path = match path {
-                        RecoveryPathInfo::Script(PathInfo::Single(key)) => placeholder_exprs
-                            .get(key)
-                            .cloned()
-                            .map(RecoveryPathInfo::MuSig2)
-                            .unwrap_or_else(|| path.clone()),
-                        _ => path.clone(),
-                    };
-                    (*timelock, recovery_path)
-                })
-                .collect();
-            let policy = LianaPolicy::from_parts_uncompiled(primary_path, recovery_paths, true)?;
+        // Parse a descriptor and check it is a multipath descriptor corresponding to a valid Liana
+        // spending policy.
+        // Sanity checks are not always performed when calling `Descriptor::from_str`, so we perform
+        // them explicitly. See https://github.com/rust-bitcoin/rust-miniscript/issues/734.
+        let desc = descriptor::Descriptor::<descriptor::DescriptorPublicKey>::from_str(s)
+            .and_then(|desc| desc.sanity_check().map(|_| desc))
+            .map_err(LianaDescError::Miniscript)?;
+        let policy = LianaPolicy::from_multipath_descriptor(&desc)?;
+
+        if descriptor_has_musig(&desc) {
+            let multi_desc = MuSig2TaprootDescriptor::from_descriptor(desc)?;
             let receive_desc = SinglePathLianaDesc::MuSig2(multi_desc.branch_descriptor(0)?);
             let change_desc = SinglePathLianaDesc::MuSig2(multi_desc.branch_descriptor(1)?);
 
@@ -523,15 +502,6 @@ impl str::FromStr for LianaDescriptor {
                 change_desc,
             });
         }
-
-        // Parse a descriptor and check it is a multipath descriptor corresponding to a valid Liana
-        // spending policy.
-        // Sanity checks are not always performed when calling `Descriptor::from_str`, so we perform
-        // them explicitly. See https://github.com/rust-bitcoin/rust-miniscript/issues/734.
-        let desc = descriptor::Descriptor::<descriptor::DescriptorPublicKey>::from_str(s)
-            .and_then(|desc| desc.sanity_check().map(|_| desc))
-            .map_err(LianaDescError::Miniscript)?;
-        let policy = LianaPolicy::from_multipath_descriptor(&desc)?;
 
         // Compute the receive and change "sub" descriptors right away. According to our pubkey
         // check above, there must be only two of those, 0 and 1.
@@ -589,9 +559,6 @@ pub fn canonical_descriptor_string(desc: &str) -> String {
     if let Ok(parsed) = Descriptor::<DescriptorPublicKey>::from_str(desc) {
         return parsed.to_string();
     }
-    if let Ok(parsed) = MuSig2TaprootDescriptor::from_str(desc) {
-        return parsed.to_string();
-    }
     desc.trim().to_owned()
 }
 
@@ -622,31 +589,20 @@ impl ChangeOutput {
 
 impl LianaDescriptor {
     pub fn new(spending_policy: LianaPolicy) -> LianaDescriptor {
-        if spending_policy.primary_path().musig().is_some()
-            || spending_policy
-                .recovery_paths()
-                .values()
-                .any(|path| path.musig().is_some())
-        {
-            let (shadow_primary_path, shadow_recovery_paths, placeholders) = shadow_musig2_paths(
-                spending_policy.primary_path(),
-                spending_policy.recovery_paths(),
-            );
-            let shadow_policy =
-                LianaPolicy::new_with_all_path_info(shadow_primary_path, shadow_recovery_paths)
-                    .expect("dummy shadow policy must be valid");
-            let shadow_desc = shadow_policy.compile_multipath_descriptor();
-            let multi_desc =
-                MuSig2TaprootDescriptor::from_shadow_descriptor(shadow_desc, placeholders);
+        if spending_policy.contains_musig2() {
+            let multi_desc = MuSig2TaprootDescriptor::from_descriptor(
+                spending_policy.clone().compile_multipath_descriptor(),
+            )
+            .expect("MuSig2 policy must compile to a MuSig2 descriptor");
             let receive_desc = SinglePathLianaDesc::MuSig2(
                 multi_desc
                     .branch_descriptor(0)
-                    .expect("shadow descriptor always has two branches"),
+                    .expect("MuSig2 descriptor always has two branches"),
             );
             let change_desc = SinglePathLianaDesc::MuSig2(
                 multi_desc
                     .branch_descriptor(1)
-                    .expect("shadow descriptor always has two branches"),
+                    .expect("MuSig2 descriptor always has two branches"),
             );
 
             return LianaDescriptor {
@@ -746,7 +702,7 @@ impl LianaDescriptor {
     pub fn descriptor(&self) -> Option<&Descriptor<DescriptorPublicKey>> {
         match &self.multi_desc {
             MultipathLianaDesc::Standard(desc) => Some(desc),
-            MultipathLianaDesc::MuSig2(_) => None,
+            MultipathLianaDesc::MuSig2(desc) => Some(desc.descriptor()),
         }
     }
 
@@ -812,6 +768,10 @@ impl LianaDescriptor {
             MultipathLianaDesc::Standard(Descriptor::Tr(tr_descriptor)) => {
                 unspendable_internal_key(tr_descriptor)
             }
+            MultipathLianaDesc::MuSig2(desc) => match desc.descriptor() {
+                Descriptor::Tr(tr_descriptor) => unspendable_internal_key(tr_descriptor),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -867,7 +827,7 @@ impl LianaDescriptor {
                     desc.at_derivation_index(0).expect("unhardened index")
                 }
                 SinglePathLianaDesc::MuSig2(desc) => desc
-                    .shadow_desc()
+                    .descriptor()
                     .at_derivation_index(0)
                     .expect("unhardened index"),
             };
@@ -899,7 +859,7 @@ impl LianaDescriptor {
             // satisfied transaction.
             (match &self.multi_desc {
                 MultipathLianaDesc::Standard(desc) => desc.max_weight_to_satisfy(),
-                MultipathLianaDesc::MuSig2(desc) => desc.shadow_desc().max_weight_to_satisfy(),
+                MultipathLianaDesc::MuSig2(desc) => desc.descriptor().max_weight_to_satisfy(),
             }
             .expect("Always satisfiable")
             .to_wu()
@@ -1270,17 +1230,14 @@ impl SinglePathLianaDesc {
         //
         // So we roll our own translation.
         struct Derivator<'a, C: secp256k1::Verification>(u32, &'a secp256k1::Secp256k1<C>);
-        impl<C: secp256k1::Verification>
-            Translator<
-                descriptor::DescriptorPublicKey,
-                DerivedPublicKey,
-                descriptor::ConversionError,
-            > for Derivator<'_, C>
-        {
+        impl<C: secp256k1::Verification> Translator<descriptor::DescriptorPublicKey> for Derivator<'_, C> {
+            type TargetPk = DerivedPublicKey;
+            type Error = Infallible;
+
             fn pk(
                 &mut self,
                 pk: &descriptor::DescriptorPublicKey,
-            ) -> Result<DerivedPublicKey, descriptor::ConversionError> {
+            ) -> Result<DerivedPublicKey, Infallible> {
                 let definite_key = pk
                     .clone()
                     .at_derivation_index(self.0)
@@ -1291,14 +1248,10 @@ impl SinglePathLianaDesc {
                         .full_derivation_path()
                         .expect("We disallow multipath keys."),
                 );
-                let key = definite_key.derive_public_key(self.1)?;
+                let key = definite_key.derive_public_key(self.1);
                 Ok(DerivedPublicKey { origin, key })
             }
-            translate_hash_clone!(
-                descriptor::DescriptorPublicKey,
-                DerivedPublicKey,
-                descriptor::ConversionError
-            );
+            translate_hash_clone!(descriptor::DescriptorPublicKey);
         }
 
         let Self::Standard(desc) = self else {
@@ -1319,7 +1272,7 @@ impl SinglePathLianaDesc {
     ) -> &descriptor::Descriptor<descriptor::DescriptorPublicKey> {
         match self {
             Self::Standard(desc) => desc,
-            Self::MuSig2(desc) => desc.shadow_desc(),
+            Self::MuSig2(desc) => desc.descriptor(),
         }
     }
 }
@@ -1363,12 +1316,7 @@ impl DerivedSinglePathLianaDesc {
             panic!("Must never be called for a Taproot descriptor.");
         };
         let ms = match desc {
-            descriptor::Descriptor::Wsh(ref wsh) => match wsh.as_inner() {
-                descriptor::WshInner::Ms(ms) => ms,
-                descriptor::WshInner::SortedMulti(_) => {
-                    unreachable!("None of our descriptors is a sorted multi")
-                }
-            },
+            descriptor::Descriptor::Wsh(ref wsh) => wsh.as_inner(),
             _ => unreachable!("Must never be called for a Taproot descriptor."),
         };
 
@@ -1438,9 +1386,14 @@ mod tests {
             bip32::Fingerprint,
             psbt::{raw, Input as PsbtIn, Output as PsbtOut},
         },
-        descriptor::checksum::desc_checksum,
         ToPublicKey,
     };
+
+    fn desc_checksum(desc: &str) -> Result<String, descriptor::checksum::Error> {
+        let mut checksum = descriptor::checksum::Engine::new();
+        checksum.input(desc)?;
+        Ok(checksum.checksum())
+    }
 
     fn random_desc_key(
         secp: &secp256k1::Secp256k1<impl secp256k1::Signing>,
@@ -1936,12 +1889,12 @@ mod tests {
         // for an example spend from this descriptor.
         let desc = LianaDescriptor::from_str("tr(tpubD6NzVbkrYhZ4WUdbVsXDYBCXS8EPSYG1cAN9g4uP6uLQHMHXRvHSFkQBXy7MBeAvV8PDVJJ4o3AwYMKJHp45ci2g69UCAKteVSAJ61CnGEV/<0;1>/*,{and_v(v:pk([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<2;3>/*),older(65535)),multi_a(2,[9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<0;1>/*,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/<0;1>/*)})#ee0r4tw5").unwrap();
         // varint_len(num witness elements) = 1
-        // varint_len(signature) + signature = 1 + 64
+        // varint_len(signature) + signature + sighash suffix = 1 + 65
         // varint_len(script) + script = 1 + 70
         // varint_len(control block) + control block = 1 + 65
         assert_eq!(
             desc.max_sat_weight(true),
-            1 + (1 + 64) + (1 + 64) + (1 + 70) + (1 + 65)
+            1 + (1 + 65) + (1 + 65) + (1 + 70) + (1 + 65)
         );
 
         // See https://mempool.space/signet/tx/63095cf6b5a57e5f3a7f0af0e22c8234cc4a4c1531c3236b00bd2a009f70e801
@@ -1949,10 +1902,7 @@ mod tests {
         // tr(tpubD6NzVbkrYhZ4XcC4HC7TDGrhraymFg9xo31hVtc5sh3dtsXbB5ZXewwMXi6HSmR2PyLeG8VwD3anqavSJVtXYJAAJcaEGCZdkBnnWTmhz3X/<0;1>/*,{and_v(v:pk([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<2;3>/*),older(1)),multi_a(2,[88d8b4b9/48'/1'/0'/2']tpubDENzCJsHPDzX1EAP9eUPumw2hFUyjuUtBK8CWNPkudZTQ1mchX1hiAwog3fd6BKbq1rdZbLW3Q1d79AcvQCCMdehuSZ8GcShDcHaYTosCRa/<0;1>/*,[9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<0;1>/*)})#pepfj0gd
         // Recovery path would use 1 + (1+64) + (1+36) + (1+65), but `max_sat_weight` considers all
         // spending paths when passing `false`. So it currently gives the same as passing `true`.
-        // This `true` branch assumes a Schnorr signature of size 1+64+1, where the final +1 is for the sighash suffix:
-        // https://docs.rs/miniscript/11.0.0/src/miniscript/descriptor/tr.rs.html#254-301
-        // So we need to add 2, 1 for each signature.
-        assert_eq!(desc.max_sat_weight(false), desc.max_sat_weight(true) + 2);
+        assert_eq!(desc.max_sat_weight(false), desc.max_sat_weight(true));
     }
 
     #[test]
@@ -2073,21 +2023,18 @@ mod tests {
         roundtrip("wsh(or_d(pk([aabbccdd]xpub6Eze7yAT3Y1wGrnzedCNVYDXUqa9NmHVWck5emBaTbXtURbe1NWZbK9bsz1TiVE7Cz341PMTfYgFw1KdLWdzcM1UMFTcdQfCYhhXZ2HJvTW/<0;1>/*),and_v(v:pkh([aabbccdd]xpub688Hn4wScQAAiYJLPg9yH27hUpfZAUnmJejRQBCiwfP5PEDzjWMNW1wChcninxr5gyavFqbbDjdV1aK5USJz8NDVjUy7FRQaaqqXHh5SbXe/<0;1>/*),older(52560))))#7437yjrs");
         roundtrip("tr([8344c025]xpub661MyMwAqRbcG2SYC6YSRsUGvcSxXEZm1kjiQRTEaAqart1PQk1N1hVTTEsGfaBx6xQ5gDYXXtbourodE6ZE5qZTnaMgmehNs8GGEEY9YK6/<0;1>/*,and_v(v:pk([158fd0ef]xpub661MyMwAqRbcF2KsCnvJ4mqWXXrwd3799wCyQrLk2iNDC6CfK8UcfnABdeTpXyoJnBhRTybmtBLDAuTuHye1eQMq43BSLtR2miA6t9KqmWU/<0;1>/*),older(4242)))#zy3kddhj");
         let musig_desc = "tr(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<0;1>/*,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/<0;1>/*),and_v(v:pk([1dce71b2/48'/1'/0'/2']tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs/<2;3>/*),older(10)))";
-        let musig_desc = format!(
-            "{musig_desc}#{}",
-            miniscript::descriptor::checksum::desc_checksum(musig_desc).unwrap()
-        );
+        let musig_desc = format!("{musig_desc}#{}", desc_checksum(musig_desc).unwrap());
         roundtrip(&musig_desc);
         let musig_recovery_desc = "tr([8344c025]xpub661MyMwAqRbcG2SYC6YSRsUGvcSxXEZm1kjiQRTEaAqart1PQk1N1hVTTEsGfaBx6xQ5gDYXXtbourodE6ZE5qZTnaMgmehNs8GGEEY9YK6/<0;1>/*,and_v(v:pk(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK/<2;3>/*,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM/<2;3>/*)),older(10)))";
         let musig_recovery_desc = format!(
             "{musig_recovery_desc}#{}",
-            miniscript::descriptor::checksum::desc_checksum(musig_recovery_desc).unwrap()
+            desc_checksum(musig_recovery_desc).unwrap()
         );
         roundtrip(&musig_recovery_desc);
         let musig_recovery_desc = "tr([8344c025]xpub661MyMwAqRbcG2SYC6YSRsUGvcSxXEZm1kjiQRTEaAqart1PQk1N1hVTTEsGfaBx6xQ5gDYXXtbourodE6ZE5qZTnaMgmehNs8GGEEY9YK6/<0;1>/*,and_v(v:pk(musig([9e1c1983/48'/1'/0'/2']tpubDEWCLCMncbStq4BLXkQUAPqzzrh2tQUgYeQPt4NrB5D7gRraMyGbRqzPTmQGvqfdaFsXDVGSQBRgfXuNjDyfU626pxSjpQZszFNY6CzogxK,[3b1913e1/48'/1'/0'/2']tpubDFeZ2ezf4VUuTnjdhxJ1DKhLa2t6vzXZNz8NnEgeT2PN4pPqTCTeWUcaxKHPJcf1C8WzkLA71zSjDwuo4zqu4kkiL91ZUmJydC8f1gx89wM)/<2;3>/*),older(10)))";
         let musig_recovery_desc = format!(
             "{musig_recovery_desc}#{}",
-            miniscript::descriptor::checksum::desc_checksum(musig_recovery_desc).unwrap()
+            desc_checksum(musig_recovery_desc).unwrap()
         );
         roundtrip(&musig_recovery_desc);
         // One with a multisig in both paths
@@ -2921,11 +2868,9 @@ mod tests {
         // The following PSBT was generated from this descriptor.
         // See https://mempool.space/signet/tx/a63c4a69be71fcba0e16f742a2697401fbc47ad7dff10a790b8f961004aa0ab4 for the corresponding tx:
         let psbt = Psbt::from_str("cHNidP8BAF4CAAAAAU2eiiiqTjQHmDarPBbpDO7b/jXeU3ABO20p0sZ3U7SoAAAAAAD9////AaQiAAAAAAAAIlEg+5nFiKkeVa9DFXLNvpIRcDNU7a4hN2QQhb7LHBad+AAVWgMAAAEBK+YjAAAAAAAAIlEgKA3Jqw7wXvY+ggshuLnufWEMZvDvz5fd7guPe74OFr9BFOwaZX+B87gSAqM66+YwA2L5da0h0+PPsDMXht+IcnRsHCjA6OkyoLbI1pYXZBVcKqW6G8fXOBHIUtxyVltu/VVAP8MQWa0ipMEXw6XfBexyPOQfb7TJpX6+KCiz2XA/mnwRyuYibz0aLl5/ZFNFvvgN5D+JYrmGACcafbXZOAtyw0IVwXv1NpDYfRDm2LstW9CzwDg86+y3PAi9ipB5m3acrIhsHCjA6OkyoLbI1pYXZBVcKqW6G8fXOBHIUtxyVltu/VUoIBYAvFRImNeU9Uegt66wQrOOwURL8+t2LjLQLCllgNHOrQP//wCywEIVwXv1NpDYfRDm2LstW9CzwDg86+y3PAi9ipB5m3acrIhsb1/MmmOazbHeRxkVrKn2+tW/CKyAMUbx3oUK+GaB3h1HIMjdaFdS9My6uOk2lBdGjnFLNSfvvRhvUGWk6VdVgyMLrCDsGmV/gfO4EgKjOuvmMANi+XWtIdPjz7AzF4bfiHJ0bLpSnMAhFhYAvFRImNeU9Uegt66wQrOOwURL8+t2LjLQLCllgNHOPQFvX8yaY5rNsd5HGRWsqfb61b8IrIAxRvHehQr4ZoHeHZ4cGYMwAACAAQAAgAAAAIACAACAAgAAAAAAAAAhFnv1NpDYfRDm2LstW9CzwDg86+y3PAi9ipB5m3acrIhsDQB8Rh5dAAAAAAAAAAAhFsjdaFdS9My6uOk2lBdGjnFLNSfvvRhvUGWk6VdVgyMLPQEcKMDo6TKgtsjWlhdkFVwqpbobx9c4EchS3HJWW279VZ4cGYMwAACAAQAAgAAAAIACAACAAAAAAAAAAAAhFuwaZX+B87gSAqM66+YwA2L5da0h0+PPsDMXht+IcnRsPQEcKMDo6TKgtsjWlhdkFVwqpbobx9c4EchS3HJWW279VTsZE+EwAACAAQAAgAAAAIACAACAAAAAAAAAAAABFyB79TaQ2H0Q5ti7LVvQs8A4POvstzwIvYqQeZt2nKyIbAEYIFHdAhNfvRTz8EPSAs+Gf/HrAULFx3vOs18D0PWq9kGwAAEFIDNwiV3+PJcHk97y59EcUfNkHjBBPZjvSN/Hgn0S01LQAQZzAcAnIClBgez9GIlLyjqN3NPltEhBDUjmDbsiVpWlba2IMurdrQP//wCyAcBGIBs6CbrR7SfZwJL6Q4beOPUvPbetXt/T/QmplPDbPQAwrCBGP2ABIvtgyIu7uSrKRE6rIY3VNZOEJ028nuqeWNSqTbpSnCEHGzoJutHtJ9nAkvpDht449S89t61e39P9CamU8Ns9ADA9AY7TqQXjhS0u6aC8jSA+/MN5WjE8uYIs5D4/oTu1eC9PnhwZgzAAAIABAACAAAAAgAIAAIABAAAAAQAAACEHKUGB7P0YiUvKOo3c0+W0SEENSOYNuyJWlaVtrYgy6t09ARHbEQ0ckrM/6qD8+TyaH5SmkKpv4e0rE07oC0VK4TxBnhwZgzAAAIABAACAAAAAgAIAAIADAAAAAQAAACEHM3CJXf48lweT3vLn0RxR82QeMEE9mO9I38eCfRLTUtANAHxGHl0BAAAAAQAAACEHRj9gASL7YMiLu7kqykROqyGN1TWThCdNvJ7qnljUqk09AY7TqQXjhS0u6aC8jSA+/MN5WjE8uYIs5D4/oTu1eC9POxkT4TAAAIABAACAAAAAgAIAAIABAAAAAQAAAAA=").unwrap();
-        assert_eq!(desc.unsigned_tx_max_weight(&psbt.unsigned_tx, true), 646);
-        assert_eq!(desc.unsigned_tx_max_vbytes(&psbt.unsigned_tx, true), 162); // 646/4=161.5
+        assert_eq!(desc.unsigned_tx_max_weight(&psbt.unsigned_tx, true), 648);
+        assert_eq!(desc.unsigned_tx_max_vbytes(&psbt.unsigned_tx, true), 162); // 648/4 = 162
 
-        // If `use_primary_path` is `false`, an extra 2 is added by `max_sat_weight` as it
-        // includes the sighash suffix for each of the two signatures.
         assert_eq!(desc.unsigned_tx_max_weight(&psbt.unsigned_tx, false), 648);
         assert_eq!(desc.unsigned_tx_max_vbytes(&psbt.unsigned_tx, false), 162); // 648/4 = 162
     }
