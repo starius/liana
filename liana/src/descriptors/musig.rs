@@ -9,6 +9,7 @@ use miniscript::{
     },
     descriptor::{
         self, DefiniteDescriptorKey, Descriptor, DescriptorMusigKey, DescriptorPublicKey,
+        MusigDerivationKind,
     },
     psbt::{PsbtInputExt, PsbtOutputExt},
     translate_hash_clone, ToPublicKey, Translator,
@@ -31,27 +32,19 @@ pub struct AggregateKeyDerivation {
 }
 
 impl AggregateKeyDerivation {
-    fn from_musig_key(musig: &DescriptorMusigKey) -> Result<Option<Self>, LianaPolicyError> {
-        let derivation_paths = musig.derivation_paths().clone();
-        let wildcard = musig.wildcard();
-        if !has_aggregate_derivation(&derivation_paths, wildcard) {
-            return Ok(None);
-        }
-
-        if wildcard == descriptor::Wildcard::Hardened
-            || derivation_paths
-                .paths()
-                .iter()
-                .flatten()
-                .any(|step| !step.is_normal())
-        {
-            return Err(LianaPolicyError::InvalidMuSig2Expression);
-        }
-
-        Ok(Some(Self {
+    fn from_musig_key(musig: &DescriptorMusigKey) -> Option<Self> {
+        if let MusigDerivationKind::AggregateThenDerive {
             derivation_paths,
             wildcard,
-        }))
+        } = musig.derivation_kind()
+        {
+            Some(Self {
+                derivation_paths: derivation_paths.clone(),
+                wildcard,
+            })
+        } else {
+            None
+        }
     }
 
     pub fn derivation_paths(&self) -> &descriptor::DerivPaths {
@@ -60,15 +53,6 @@ impl AggregateKeyDerivation {
 
     pub fn wildcard(&self) -> descriptor::Wildcard {
         self.wildcard
-    }
-}
-
-impl fmt::Display for AggregateKeyDerivation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&format_derivation_suffixes(
-            self.derivation_paths.paths(),
-            self.wildcard,
-        ))
     }
 }
 
@@ -87,7 +71,7 @@ impl MuSig2KeyExpr {
             ));
         }
 
-        let aggregate_derivation = AggregateKeyDerivation::from_musig_key(&inner)?;
+        let aggregate_derivation = AggregateKeyDerivation::from_musig_key(&inner);
         Ok(Self {
             inner,
             derivation_mode: if aggregate_derivation.is_some() {
@@ -113,6 +97,78 @@ impl MuSig2KeyExpr {
 
     pub fn descriptor_key(&self) -> DescriptorPublicKey {
         DescriptorPublicKey::Musig(self.inner.clone())
+    }
+
+    fn single_path_musig(&self, path_index: usize) -> Result<DescriptorMusigKey, LianaPolicyError> {
+        match self
+            .descriptor_key()
+            .into_single_keys()
+            .into_iter()
+            .nth(path_index)
+        {
+            Some(DescriptorPublicKey::Musig(musig)) => Ok(musig),
+            _ => Err(LianaPolicyError::InvalidMuSig2Expression),
+        }
+    }
+
+    fn participant_origins(
+        &self,
+        path_index: usize,
+        child_index: u32,
+    ) -> Result<Vec<(secp256k1::PublicKey, bip32::KeySource)>, LianaPolicyError> {
+        self.single_path_musig(path_index)?
+            .derived_participants_at_index(child_index)
+            .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?
+            .into_iter()
+            .map(|definite_key| {
+                let derivation_path = definite_key
+                    .full_derivation_path()
+                    .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
+                Ok((
+                    definite_key.to_public_key().inner,
+                    (definite_key.master_fingerprint(), derivation_path),
+                ))
+            })
+            .collect()
+    }
+
+    fn participant_set_pubkey(
+        &self,
+        path_index: usize,
+        child_index: u32,
+    ) -> Result<secp256k1::PublicKey, LianaPolicyError> {
+        let musig = self.single_path_musig(path_index)?;
+        match self.derivation_mode() {
+            MuSig2DerivationMode::DeriveThenAggregate => {
+                self.output_pubkey(path_index, child_index)
+            }
+            MuSig2DerivationMode::AggregateThenDeriveBip328 => {
+                let secp = secp256k1::Secp256k1::verification_only();
+                musig
+                    .aggregate_public_key(&secp)
+                    .map(|key| key.inner)
+                    .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)
+            }
+        }
+    }
+
+    fn output_pubkey(
+        &self,
+        path_index: usize,
+        child_index: u32,
+    ) -> Result<secp256k1::PublicKey, LianaPolicyError> {
+        let secp = secp256k1::Secp256k1::verification_only();
+        let musig = self.single_path_musig(path_index)?;
+        let definite_key = DescriptorPublicKey::Musig(musig)
+            .at_derivation_index(child_index)
+            .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?;
+        match definite_key.as_descriptor_public_key() {
+            DescriptorPublicKey::Musig(musig) => musig
+                .try_derive_public_key(&secp)
+                .map(|key| key.inner)
+                .map_err(|_| LianaPolicyError::InvalidMuSig2Expression),
+            _ => Err(LianaPolicyError::InvalidMuSig2Expression),
+        }
     }
 }
 
@@ -238,33 +294,15 @@ impl MuSig2SinglePathDescriptor {
             .into_iter()
             .map(|expr| {
                 let mut participant_origins = match expr.derivation_mode() {
-                    MuSig2DerivationMode::DeriveThenAggregate => expr
-                        .participants()
-                        .iter()
-                        .cloned()
-                        .map(|participant| derive_participant_origin(participant, 0, child_index))
-                        .collect::<Result<Vec<_>, _>>()?,
-                    MuSig2DerivationMode::AggregateThenDeriveBip328 => expr
-                        .participants()
-                        .iter()
-                        .cloned()
-                        .map(|participant| derive_participant_origin(participant, 0, 0))
-                        .collect::<Result<Vec<_>, _>>()?,
+                    MuSig2DerivationMode::DeriveThenAggregate => {
+                        expr.participant_origins(0, child_index)?
+                    }
+                    MuSig2DerivationMode::AggregateThenDeriveBip328 => {
+                        expr.participant_origins(0, 0)?
+                    }
                 };
                 participant_origins.sort_by_key(|(participant, _)| *participant);
-                let participant_set_pubkey = match expr.derivation_mode() {
-                    MuSig2DerivationMode::DeriveThenAggregate => {
-                        derive_aggregate_pubkey(&expr, 0, child_index)?
-                    }
-                    MuSig2DerivationMode::AggregateThenDeriveBip328 => aggregate_sorted_pubkey(
-                        participant_origins
-                            .iter()
-                            .map(|(participant, _)| *participant)
-                            .collect::<Vec<_>>()
-                            .into_iter(),
-                    )
-                    .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?,
-                };
+                let participant_set_pubkey = expr.participant_set_pubkey(0, child_index)?;
                 let output_pubkey = derive_aggregate_pubkey(&expr, 0, child_index)?;
                 let output_key_origin =
                     output_key_origin(&expr, participant_set_pubkey, child_index)?;
@@ -495,13 +533,10 @@ fn output_key_origin(
     match expr.derivation_mode() {
         MuSig2DerivationMode::DeriveThenAggregate => Ok(None),
         MuSig2DerivationMode::AggregateThenDeriveBip328 => {
-            let network = participant_network(
-                expr.participants()
-                    .first()
-                    .ok_or(LianaPolicyError::InvalidMuSig2ParticipantCount(0))?,
-            )
-            .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
-            let synthetic_xpub = bip328_synthetic_xpub(aggregate_pubkey, network);
+            let synthetic_xpub = expr
+                .single_path_musig(0)?
+                .synthetic_xpub(bitcoin::PublicKey::new(aggregate_pubkey))
+                .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
             let aggregate_derivation = expr
                 .aggregate_derivation()
                 .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
@@ -548,17 +583,6 @@ where
     Ok(aggregate_pubkey)
 }
 
-fn aggregate_sorted_pubkey<I>(
-    pubkeys: I,
-) -> Result<secp256k1::PublicKey, musig2::errors::KeyAggError>
-where
-    I: IntoIterator<Item = secp256k1::PublicKey>,
-{
-    let mut pubkeys = pubkeys.into_iter().collect::<Vec<_>>();
-    pubkeys.sort();
-    aggregate_plain_pubkey(pubkeys.into_iter())
-}
-
 pub fn bip328_synthetic_xpub(
     aggregate_pubkey: secp256k1::PublicKey,
     network: bitcoin::Network,
@@ -578,145 +602,7 @@ pub fn derive_aggregate_pubkey(
     path_index: usize,
     child_index: u32,
 ) -> Result<secp256k1::PublicKey, LianaPolicyError> {
-    match expr.derivation_mode() {
-        MuSig2DerivationMode::DeriveThenAggregate => aggregate_sorted_pubkey(
-            expr.participants()
-                .iter()
-                .cloned()
-                .map(|participant| derive_participant_pubkey(participant, path_index, child_index))
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter(),
-        )
-        .map_err(|_| LianaPolicyError::InvalidMuSig2Expression),
-        MuSig2DerivationMode::AggregateThenDeriveBip328 => {
-            let participant_pubkeys = expr
-                .participants()
-                .iter()
-                .cloned()
-                .map(|participant| derive_participant_pubkey(participant, 0, 0))
-                .collect::<Result<Vec<_>, _>>()?;
-            let aggregate_pubkey = aggregate_sorted_pubkey(participant_pubkeys.into_iter())
-                .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?;
-            let network = participant_network(
-                expr.participants()
-                    .first()
-                    .ok_or(LianaPolicyError::InvalidMuSig2ParticipantCount(0))?,
-            )
-            .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
-            let aggregate_derivation = expr
-                .aggregate_derivation()
-                .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
-            let branch_path = aggregate_derivation
-                .derivation_paths()
-                .paths()
-                .get(path_index)
-                .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
-            let derivation_path = if aggregate_derivation.wildcard() == descriptor::Wildcard::None {
-                branch_path.clone()
-            } else {
-                branch_path.clone().into_child(
-                    bip32::ChildNumber::from_normal_idx(child_index)
-                        .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?,
-                )
-            };
-            let secp = secp256k1::Secp256k1::verification_only();
-            Ok(bip328_synthetic_xpub(aggregate_pubkey, network)
-                .derive_pub(&secp, &derivation_path)
-                .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?
-                .public_key)
-        }
-    }
-}
-
-fn derive_participant_pubkey(
-    participant: DescriptorPublicKey,
-    path_index: usize,
-    child_index: u32,
-) -> Result<secp256k1::PublicKey, LianaPolicyError> {
-    let participant = participant
-        .into_single_keys()
-        .into_iter()
-        .nth(path_index)
-        .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
-    let definite_key = participant
-        .at_derivation_index(child_index)
-        .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?;
-    Ok(definite_key.to_public_key().inner)
-}
-
-fn derive_participant_origin(
-    participant: DescriptorPublicKey,
-    path_index: usize,
-    child_index: u32,
-) -> Result<(secp256k1::PublicKey, bip32::KeySource), LianaPolicyError> {
-    let participant = participant
-        .into_single_keys()
-        .into_iter()
-        .nth(path_index)
-        .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
-    let definite_key = participant
-        .at_derivation_index(child_index)
-        .map_err(|_| LianaPolicyError::InvalidMuSig2Expression)?;
-    let derivation_path = definite_key
-        .full_derivation_path()
-        .ok_or(LianaPolicyError::InvalidMuSig2Expression)?;
-    Ok((
-        definite_key.to_public_key().inner,
-        (definite_key.master_fingerprint(), derivation_path),
-    ))
-}
-
-fn participant_network(participant: &DescriptorPublicKey) -> Option<bitcoin::Network> {
-    match participant {
-        DescriptorPublicKey::XPub(xpub) => Some(match xpub.xkey.network {
-            bitcoin::NetworkKind::Main => bitcoin::Network::Bitcoin,
-            bitcoin::NetworkKind::Test => bitcoin::Network::Testnet,
-        }),
-        DescriptorPublicKey::MultiXPub(xpub) => Some(match xpub.xkey.network {
-            bitcoin::NetworkKind::Main => bitcoin::Network::Bitcoin,
-            bitcoin::NetworkKind::Test => bitcoin::Network::Testnet,
-        }),
-        _ => None,
-    }
-}
-
-fn has_aggregate_derivation(
-    derivation_paths: &descriptor::DerivPaths,
-    wildcard: descriptor::Wildcard,
-) -> bool {
-    wildcard != descriptor::Wildcard::None
-        || derivation_paths.paths().len() > 1
-        || derivation_paths.paths().iter().any(|path| !path.is_empty())
-}
-
-fn format_derivation_suffixes(
-    paths: &[bip32::DerivationPath],
-    wildcard: descriptor::Wildcard,
-) -> String {
-    let mut suffix = String::new();
-    if let Some(first) = paths.first() {
-        for (index, child) in first.as_ref().iter().enumerate() {
-            if paths.len() > 1 && paths.iter().any(|path| path.as_ref()[index] != *child) {
-                suffix.push_str("/<");
-                for (path_index, path) in paths.iter().enumerate() {
-                    if path_index > 0 {
-                        suffix.push(';');
-                    }
-                    suffix.push_str(&path.as_ref()[index].to_string());
-                }
-                suffix.push('>');
-            } else {
-                suffix.push('/');
-                suffix.push_str(&child.to_string());
-            }
-        }
-    }
-    match wildcard {
-        descriptor::Wildcard::None => {}
-        descriptor::Wildcard::Unhardened => suffix.push_str("/*"),
-        descriptor::Wildcard::Hardened => suffix.push_str("/*'"),
-    }
-    suffix
+    expr.output_pubkey(path_index, child_index)
 }
 
 #[cfg(test)]
@@ -759,12 +645,17 @@ mod tests {
             musig.derivation_mode(),
             MuSig2DerivationMode::AggregateThenDeriveBip328
         );
+        let aggregate_derivation = musig.aggregate_derivation().unwrap();
         assert_eq!(
-            musig
-                .aggregate_derivation()
-                .map(ToString::to_string)
-                .as_deref(),
-            Some("/<0;1>/*")
+            aggregate_derivation.derivation_paths().paths(),
+            &[
+                bip32::DerivationPath::from_str("m/0").unwrap(),
+                bip32::DerivationPath::from_str("m/1").unwrap(),
+            ]
+        );
+        assert_eq!(
+            aggregate_derivation.wildcard(),
+            descriptor::Wildcard::Unhardened
         );
         assert_eq!(musig.to_string(), expr);
     }

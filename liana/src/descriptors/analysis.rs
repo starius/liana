@@ -839,17 +839,22 @@ fn descriptor_key_xkeys<'a>(
     desc_key: &'a descriptor::DescriptorPublicKey,
     out: &mut Vec<&'a bip32::Xpub>,
 ) -> Option<()> {
-    match desc_key {
-        descriptor::DescriptorPublicKey::XPub(xpub) => out.push(&xpub.xkey),
-        descriptor::DescriptorPublicKey::MultiXPub(xpub) => out.push(&xpub.xkey),
-        descriptor::DescriptorPublicKey::Musig(musig) => {
-            for participant in musig.participants() {
-                descriptor_key_xkeys(participant, out)?;
+    desc_key
+        .for_each_leaf_key(|key| match key {
+            descriptor::DescriptorPublicKey::XPub(xpub) => {
+                out.push(&xpub.xkey);
+                true
             }
-        }
-        descriptor::DescriptorPublicKey::Single(_) => return None,
-    }
-    Some(())
+            descriptor::DescriptorPublicKey::MultiXPub(xpub) => {
+                out.push(&xpub.xkey);
+                true
+            }
+            descriptor::DescriptorPublicKey::Single(_) => false,
+            descriptor::DescriptorPublicKey::Musig(_) => {
+                unreachable!("leaf iterator descends into musig participants")
+            }
+        })
+        .then_some(())
 }
 
 // Construct an unspendable xpub to be used as internal key in a Taproot descriptor, in a way which
